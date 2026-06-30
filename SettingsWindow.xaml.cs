@@ -12,6 +12,7 @@ public partial class SettingsWindow : Window
     private AppSettings _cfg;
 
     public AppSettings Result => _cfg;
+    public Action<AppSettings>? ApplyRequested;
 
     public SettingsWindow(AppSettings working)
     {
@@ -36,7 +37,7 @@ public partial class SettingsWindow : Window
         var sp = new StackPanel { Margin = new Thickness(12) };
 
         sp.Children.Add(new TextBlock { Text = "배치" });
-        sp.Children.Add(Combo(new[] { "세로 1열", "2×2 그리드", "가로 1줄" }, (int)_cfg.Arrange,
+        sp.Children.Add(Combo(new[] { "세로 1열", "2×2 그리드", "가로 1줄", "컴팩트", "미니" }, (int)_cfg.Arrange,
             i => _cfg.Arrange = (Arrangement)i));
 
         sp.Children.Add(new TextBlock { Text = "표시할 패널", Margin = new Thickness(0, 12, 0, 2) });
@@ -48,6 +49,18 @@ public partial class SettingsWindow : Window
             grid.Children.Add(Chk(names[i], s.Visible, v => s.Visible = v, marginTop: 2));
         }
         sp.Children.Add(grid);
+
+        sp.Children.Add(new TextBlock { Text = "전체 패널 공통", Margin = new Thickness(0, 12, 0, 4),
+            FontWeight = FontWeights.SemiBold });
+        sp.Children.Add(Chk("레이블 표시",
+            _cfg.Sections.All(s => s.ShowLabel),
+            v => { foreach (var s in _cfg.Sections) s.ShowLabel = v; }));
+        sp.Children.Add(Chk("수치 표시",
+            _cfg.Sections.All(s => s.ShowValues),
+            v => { foreach (var s in _cfg.Sections) s.ShowValues = v; }, marginTop: 4));
+        sp.Children.Add(Chk("텍스트 그래프 겹치기",
+            _cfg.Sections.All(s => s.Overlay),
+            v => { foreach (var s in _cfg.Sections) s.Overlay = v; }, marginTop: 4));
 
         sp.Children.Add(Chk("항상 위 표시", _cfg.AlwaysOnTop, v => _cfg.AlwaysOnTop = v, marginTop: 12));
         sp.Children.Add(Chk("글자도 창 크기에 맞춰 스케일", _cfg.ScaleText, v => _cfg.ScaleText = v));
@@ -76,8 +89,12 @@ public partial class SettingsWindow : Window
         sp.Children.Add(new TextBlock { Text = "그래프 종류", Margin = new Thickness(0, 12, 0, 2) });
         sp.Children.Add(Combo(new[] { "꺾은선", "막대" }, (int)s.Graph, i => s.Graph = (GraphKind)i));
 
-        sp.Children.Add(SliderRow("사이즈 비율", 0.5, 2.0, s.SizeRatio, 0.1,
-            v => $"{v:0.0}x", v => s.SizeRatio = Math.Round(v, 1)));
+        var ratioPanel = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 0) };
+        ratioPanel.Children.Add(new TextBlock { Text = "가로 비율:", VerticalAlignment = VerticalAlignment.Center, Width = 70 });
+        ratioPanel.Children.Add(Combo(new[] { "1", "2", "3" }, s.WidthRatio - 1, i => s.WidthRatio = i + 1));
+        ratioPanel.Children.Add(new TextBlock { Text = "  세로 비율:", VerticalAlignment = VerticalAlignment.Center, Width = 70 });
+        ratioPanel.Children.Add(Combo(new[] { "1", "2", "3" }, s.HeightRatio - 1, i => s.HeightRatio = i + 1));
+        sp.Children.Add(ratioPanel);
 
         return new TabItem { Header = header, Content = sp };
     }
@@ -120,6 +137,7 @@ public partial class SettingsWindow : Window
 
     // ── 버튼 ─────────────────────────────────────────────────────────────
     private void OnOk(object sender, RoutedEventArgs e)     { DialogResult = true;  Close(); }
+    private void OnApply(object sender, RoutedEventArgs e)  { ApplyRequested?.Invoke(_cfg.Clone()); }
     private void OnCancel(object sender, RoutedEventArgs e) { DialogResult = false; Close(); }
 
     private void OnReset(object sender, RoutedEventArgs e)

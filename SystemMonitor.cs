@@ -96,22 +96,35 @@ public sealed class SystemMonitor : IDisposable
     // ── 데이터 수집 ───────────────────────────────────────────────────────
     public PerfData Collect()
     {
-        float cpu    = _cpu      is null ? 0f : _cpu.NextValue();
-        float avail  = _memAvail is null ? 0f : _memAvail.NextValue();
-        float dr     = _diskRead  is null ? 0f : _diskRead.NextValue()  / 1_048_576f;
-        float dw     = _diskWrite is null ? 0f : _diskWrite.NextValue() / 1_048_576f;
+        float cpu = _cpu is null ? 0f : _cpu.NextValue();
+        float dr  = _diskRead  is null ? 0f : _diskRead.NextValue()  / 1_048_576f;
+        float dw  = _diskWrite is null ? 0f : _diskWrite.NextValue() / 1_048_576f;
 
         float netDn = _netDownList.Sum(c => { try { return c.NextValue(); } catch { return 0f; } }) / 1_024f;
         float netUp = _netUpList  .Sum(c => { try { return c.NextValue(); } catch { return 0f; } }) / 1_024f;
 
-        float used   = _totalMemMB - avail;
-        float memPct = _totalMemMB > 0 ? used / _totalMemMB * 100f : 0f;
+        // GlobalMemoryStatusEx 로 정확한 물리 메모리 가용량 조회
+        var ms = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>() };
+        float totalMB, availMB;
+        if (GlobalMemoryStatusEx(ref ms))
+        {
+            totalMB = ms.ullTotalPhys / 1_048_576f;
+            availMB = ms.ullAvailPhys / 1_048_576f;
+        }
+        else
+        {
+            totalMB = _totalMemMB;
+            availMB = _memAvail?.NextValue() ?? 0f;
+        }
+
+        float used   = Math.Max(0f, totalMB - availMB);
+        float memPct = totalMB > 0 ? used / totalMB * 100f : 0f;
 
         return new PerfData(
             Cpu:          cpu,
             MemPct:       Math.Clamp(memPct, 0f, 100f),
             MemUsedGB:    used / 1024f,
-            MemTotalGB:   _totalMemMB / 1024f,
+            MemTotalGB:   totalMB / 1024f,
             DiskReadMBs:  Math.Max(0f, dr),
             DiskWriteMBs: Math.Max(0f, dw),
             NetDownKBs:   Math.Max(0f, netDn),

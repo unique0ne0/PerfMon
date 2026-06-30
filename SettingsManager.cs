@@ -4,7 +4,7 @@ using System.Text.Json.Serialization;
 
 namespace PerfMonCS;
 
-public enum Arrangement { Vertical = 0, Grid2x2 = 1, Horizontal = 2 }
+public enum Arrangement { Vertical = 0, Grid2x2 = 1, Horizontal = 2, Compact = 3, Mini = 4 }
 public enum GraphKind   { Line = 0, Bar = 1 }
 
 public sealed class SectionSettings
@@ -12,9 +12,10 @@ public sealed class SectionSettings
     public bool      Visible    { get; set; } = true;
     public bool      ShowLabel  { get; set; } = true;
     public bool      ShowValues { get; set; } = true;
-    public bool      Overlay    { get; set; } = true;   // true=텍스트가 그래프 위 겹침, false=분리
-    public GraphKind Graph      { get; set; } = GraphKind.Line;
-    public double    SizeRatio  { get; set; } = 1.0;    // 배치 내 상대 크기(가중치)
+    public bool      Overlay     { get; set; } = true;   // true=텍스트가 그래프 위 겹침, false=분리
+    public GraphKind Graph       { get; set; } = GraphKind.Line;
+    public int       WidthRatio  { get; set; } = 1;     // 가로 비율 1-3
+    public int       HeightRatio { get; set; } = 1;     // 세로 비율 1-3
 
     public SectionSettings Clone() => (SectionSettings)MemberwiseClone();
 }

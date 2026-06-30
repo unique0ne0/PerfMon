@@ -145,16 +145,20 @@ public sealed class GraphControl : FrameworkElement
         double barW = w * frac;
         if (barW < 0.5) return;
 
+        // 막대 높이를 공간의 60% 로 제한 (두꺼운 선 느낌)
+        double barH = Math.Max(2.0, h * 0.6);
+        double y    = (h - barH) / 2.0;
+
         var brush = new LinearGradientBrush(
-            Color.FromArgb(180, color.R, color.G, color.B),
-            Color.FromArgb(90,  color.R, color.G, color.B),
+            Color.FromArgb(200, color.R, color.G, color.B),
+            Color.FromArgb(100, color.R, color.G, color.B),
             new Point(0, 0), new Point(1, 0));
         brush.Freeze();
-        dc.DrawRectangle(brush, null, new Rect(0, 0, barW, h));
+        dc.DrawRectangle(brush, null, new Rect(0, y, barW, barH));
 
-        var edgePen = new Pen(new SolidColorBrush(Color.FromArgb(220, color.R, color.G, color.B)), 1.0);
+        var edgePen = new Pen(new SolidColorBrush(Color.FromArgb(230, color.R, color.G, color.B)), 1.0);
         edgePen.Freeze();
-        dc.DrawLine(edgePen, new Point(barW, 0), new Point(barW, h));
+        dc.DrawLine(edgePen, new Point(barW, y), new Point(barW, y + barH));
     }
 
     // 두 개의 가로 막대를 위/아래로 쌓아 그림 (DISK R/W, NET D/U) — 미니 레이아웃용
@@ -169,22 +173,25 @@ public sealed class GraphControl : FrameworkElement
         DrawBarRow(dc, barH + gap,   barH, buf2[HIST - 1] / max, w, c2);
     }
 
-    private static void DrawBarRow(DrawingContext dc, double y, double barH,
+    private static void DrawBarRow(DrawingContext dc, double y, double slotH,
         double frac, double w, Color color)
     {
-        // 트랙(배경)
+        // 슬롯 내에서 60% 높이로 중앙 정렬 (두꺼운 선 느낌)
+        double barH   = Math.Max(2.0, slotH * 0.6);
+        double offset = y + (slotH - barH) / 2.0;
+
         var track = new SolidColorBrush(Color.FromArgb(28, color.R, color.G, color.B));
         track.Freeze();
-        dc.DrawRectangle(track, null, new Rect(0, y, w, barH));
+        dc.DrawRectangle(track, null, new Rect(0, offset, w, barH));
 
         double barW = Math.Clamp(frac, 0, 1) * w;
         if (barW < 0.5) return;
 
         var brush = new LinearGradientBrush(
-            Color.FromArgb(190, color.R, color.G, color.B),
-            Color.FromArgb(95,  color.R, color.G, color.B),
+            Color.FromArgb(200, color.R, color.G, color.B),
+            Color.FromArgb(100, color.R, color.G, color.B),
             new Point(0, 0), new Point(1, 0));
         brush.Freeze();
-        dc.DrawRectangle(brush, null, new Rect(0, y, barW, barH));
+        dc.DrawRectangle(brush, null, new Rect(0, offset, barW, barH));
     }
 }
