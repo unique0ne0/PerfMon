@@ -6,20 +6,25 @@ using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
 using WColor = System.Windows.Media.Color;
+using HAlign = System.Windows.HorizontalAlignment;
 
 namespace PerfMonCS;
 
-public enum LayoutMode { Vertical = 0, Grid2x2 = 1, Compact = 2 }
-
 public partial class MainWindow : Window
 {
+    private const double UNIT       = 38;  // 스케일 모드에서 SizeRatio 1.0 당 디자인 px
+    private const double DESIGN_W   = 110; // 스케일 모드 디자인 폭(세로/2×2)
+    private const double DESIGN_ROW = 60;  // 스케일 모드 가로배치 행 높이
+    private double _designW = DESIGN_W;     // 현재 배치의 스케일 디자인 폭
+
     private readonly SystemMonitor   _monitor;
     private readonly DispatcherTimer _timer;
+    private AppSettings _cfg = new();
     private bool        _savePending;
     private bool        _passThrough;
     private bool        _resizeActive;
-    private LayoutMode  _layoutMode = LayoutMode.Vertical;
-    private MenuItem[]? _layoutMenuItems;
+    private bool        _loaded;
+    private Viewbox?    _viewbox;
 
     [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int n);
     [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int n, int v);
@@ -36,8 +41,16 @@ public partial class MainWindow : Window
         _timer.Tick += OnTick;
         _timer.Start();
 
-        Loaded += (_, _) => { LoadSettings(); ContextMenu = BuildContextMenu(); };
+        Loaded += (_, _) => { LoadSettings(); _loaded = true; };
     }
+
+    // 섹션 인덱스 0=CPU 1=MEM 2=DISK 3=NET 로 매핑되는 UI 요소
+    private SectionSettings[]  Secs   => _cfg.Sections;
+    private Grid[]             Panels => new[] { PanelCpu, PanelMem, PanelDisk, PanelNet };
+    private FrameworkElement[] Hdrs   => new FrameworkElement[] { hdrCpu, hdrMem, hdrDisk, hdrNet };
+    private FrameworkElement[] Labels => new FrameworkElement[] { lblCpu, lblMem, lblDisk, lblNet };
+    private FrameworkElement[] Vals   => new FrameworkElement[] { valsCpu, valsMem, valsDisk, valsNet };
+    private GraphControl[]     Graphs => new[] { gCpu, gMem, gDisk, gNet };
 
     // ── Pass Through ─────────────────────────────────────────────────────
     public bool IsPassThrough => _passThrough;
@@ -51,7 +64,6 @@ public partial class MainWindow : Window
         UpdateBorderHint();
     }
 
-    // ── Resize Mode ──────────────────────────────────────────────────────
     public void SetResizeActive(bool on)
     {
         _resizeActive = on;
@@ -69,47 +81,70 @@ public partial class MainWindow : Window
         };
     }
 
-    // ── 레이아웃 전환 ────────────────────────────────────────────────────
-    public void SetLayout(LayoutMode mode, bool resetSize = true)
+    // ── 전체 렌더 ────────────────────────────────────────────────────────
+    public void RenderAll()
     {
-        _layoutMode = mode;
+        for (int i = 0; i < 4; i++) ConfigurePanel(i);
+        ApplyArrangement();
+        ApplyScale();
 
-        PanelCpu.Visibility = PanelMem.Visibility =
-        PanelDisk.Visibility = PanelNet.Visibility = Visibility.Visible;
+        Opacity = Math.Clamp(_cfg.Opacity, 0.1, 1.0);
+        Topmost = _cfg.AlwaysOnTop;
 
-        MainGrid.RowDefinitions.Clear();
-        MainGrid.ColumnDefinitions.Clear();
+        ContextMenu = BuildContextMenu();
+    }
 
-        switch (mode)
+    private void ConfigurePanel(int i)
+    {
+        var s = Secs[i];
+        Panels[i].Visibility = s.Visible    ? Visibility.Visible : Visibility.Collapsed;
+        Labels[i].Visibility = s.ShowLabel  ? Visibility.Visible : Visibility.Collapsed;
+        Vals[i].Visibility   = s.ShowValues ? Visibility.Visible : Visibility.Collapsed;
+
+        var graph = Graphs[i];
+        graph.BarMode = s.Graph == GraphKind.Bar;
+
+        if (s.Overlay)
         {
-            case LayoutMode.Vertical: ApplyVerticalLayout(resetSize);  break;
-            case LayoutMode.Grid2x2:  ApplyGrid2x2Layout(resetSize);   break;
-            case LayoutMode.Compact:  ApplyCompactLayout(resetSize);   break;
+            RestorePanelOverlay(Panels[i], Hdrs[i], graph);
+            if (s.Graph == GraphKind.Bar)
+            {
+                Hdrs[i].VerticalAlignment = VerticalAlignment.Center;
+                graph.Margin = new Thickness(0, 3, 0, 3);
+            }
         }
-
-        if (_layoutMenuItems != null)
-            for (int i = 0; i < _layoutMenuItems.Length; i++)
-                _layoutMenuItems[i].IsChecked = (LayoutMode)i == mode;
+        else
+        {
+            SplitPanel(Panels[i], Hdrs[i], graph);
+        }
     }
 
-    // 패널 내부를 단일 셀(겹침) 구조로 복원 — Vertical/2x2 용
-    private static void RestorePanelOverlay(Grid panel, FrameworkElement hdr, UIElement graph)
+    // 패널 내부 = 단일 셀(그래프 위에 헤더 겹침)
+    private static void RestorePanelOverlay(Grid panel, FrameworkElement hdr, FrameworkElement graph)
     {
         panel.RowDefinitions.Clear();
-        Grid.SetRow(hdr, 0);
-        Grid.SetRow(graph, 0);
-        hdr.VerticalAlignment = VerticalAlignment.Top;
+        panel.ColumnDefinitions.Clear();
+        Grid.SetRow(hdr, 0);   Grid.SetColumn(hdr, 0);
+        Grid.SetRow(graph, 0); Grid.SetColumn(graph, 0);
+        hdr.VerticalAlignment   = VerticalAlignment.Top;
+        hdr.HorizontalAlignment = HAlign.Stretch;
+        hdr.Margin = new Thickness(0, 0, 0, 2);
+        graph.Margin = new Thickness(0);
     }
 
-    // 패널 내부를 텍스트(Auto) + 그래프(*) 2행으로 분리 — Compact 용
-    private static void SplitPanel(Grid panel, FrameworkElement hdr, UIElement graph)
+    // 패널 내부 = 텍스트(위) + 그래프(아래) 분리
+    private static void SplitPanel(Grid panel, FrameworkElement hdr, FrameworkElement graph)
     {
         panel.RowDefinitions.Clear();
+        panel.ColumnDefinitions.Clear();
         panel.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         panel.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-        Grid.SetRow(hdr, 0);
-        Grid.SetRow(graph, 1);
-        hdr.VerticalAlignment = VerticalAlignment.Top;
+        Grid.SetRow(hdr, 0);   Grid.SetColumn(hdr, 0);
+        Grid.SetRow(graph, 1); Grid.SetColumn(graph, 0);
+        hdr.VerticalAlignment   = VerticalAlignment.Top;
+        hdr.HorizontalAlignment = HAlign.Stretch;
+        hdr.Margin = new Thickness(0);
+        graph.Margin = new Thickness(0);
     }
 
     private static void Pos(UIElement e, int row, int col, int rSpan = 1, int cSpan = 1)
@@ -119,100 +154,141 @@ public partial class MainWindow : Window
     }
 
     private static GridLength GL(double px) => new(px);
-    private static GridLength Star           => new(1, GridUnitType.Star);
+    private static GridLength Star          => new(1, GridUnitType.Star);
 
-    private void ApplyVerticalLayout(bool resetSize)
+    private RowDefinition    Row(double w) => new() { Height = _cfg.ScaleText ? GL(w * UNIT) : new GridLength(w, GridUnitType.Star) };
+    private static ColumnDefinition Col(double w) => new() { Width = new GridLength(w, GridUnitType.Star) };
+
+    private void ApplyArrangement()
     {
-        // 패널 내부 오버레이 구조 복원
-        RestorePanelOverlay(PanelCpu,  hdrCpu,  gCpu);
-        RestorePanelOverlay(PanelMem,  hdrMem,  gMem);
-        RestorePanelOverlay(PanelDisk, hdrDisk, gDisk);
-        RestorePanelOverlay(PanelNet,  hdrNet,  gNet);
-        hdrCpu.Margin = new Thickness(0, 0, 0, 2);
-        hdrMem.Margin = new Thickness(0, 0, 0, 2);
+        MainGrid.RowDefinitions.Clear();
+        MainGrid.ColumnDefinitions.Clear();
+        foreach (var sep in new[] { Sep1, Sep2, Sep3, Sep4 }) sep.Visibility = Visibility.Collapsed;
 
-        // 7 rows: *, 1, *, 1, *, 1, *
-        for (int i = 0; i < 4; i++)
+        var vis = new System.Collections.Generic.List<int>();
+        for (int i = 0; i < 4; i++) if (Secs[i].Visible) vis.Add(i);
+        if (vis.Count == 0) return;
+
+        switch (_cfg.Arrange)
         {
-            MainGrid.RowDefinitions.Add(new RowDefinition { Height = Star });
-            if (i < 3) MainGrid.RowDefinitions.Add(new RowDefinition { Height = GL(1) });
+            case Arrangement.Horizontal: ArrangeHorizontal(vis); break;
+            case Arrangement.Grid2x2:    ArrangeGrid(vis);       break;
+            default:                     ArrangeVertical(vis);   break;
+        }
+    }
+
+    private void ArrangeVertical(System.Collections.Generic.List<int> vis)
+    {
+        _designW = DESIGN_W;
+        MainGrid.ColumnDefinitions.Add(Col(1));
+        var seps = new[] { Sep1, Sep2, Sep3, Sep4 };
+        int row = 0, sep = 0;
+        for (int k = 0; k < vis.Count; k++)
+        {
+            MainGrid.RowDefinitions.Add(Row(Secs[vis[k]].SizeRatio));
+            Pos(Panels[vis[k]], row, 0);
+            row++;
+            if (k < vis.Count - 1)
+            {
+                MainGrid.RowDefinitions.Add(new RowDefinition { Height = GL(1) });
+                Pos(seps[sep], row, 0);
+                seps[sep].Visibility = Visibility.Visible;
+                sep++; row++;
+            }
+        }
+    }
+
+    private void ArrangeHorizontal(System.Collections.Generic.List<int> vis)
+    {
+        _designW = 60 * vis.Count;
+        MainGrid.RowDefinitions.Add(new RowDefinition { Height = _cfg.ScaleText ? GL(DESIGN_ROW) : Star });
+        var seps = new[] { Sep1, Sep2, Sep3, Sep4 };
+        int col = 0, sep = 0;
+        for (int k = 0; k < vis.Count; k++)
+        {
+            MainGrid.ColumnDefinitions.Add(Col(Secs[vis[k]].SizeRatio));
+            Pos(Panels[vis[k]], 0, col);
+            col++;
+            if (k < vis.Count - 1)
+            {
+                MainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GL(1) });
+                Pos(seps[sep], 0, col);
+                seps[sep].Visibility = Visibility.Visible;
+                sep++; col++;
+            }
+        }
+    }
+
+    private void ArrangeGrid(System.Collections.Generic.List<int> vis)
+    {
+        _designW = DESIGN_W;
+        int n = vis.Count;
+        int cols = n >= 2 ? 2 : 1;
+        int rows = (n + cols - 1) / cols;
+
+        var cw = new double[cols];
+        var rw = new double[rows];
+        for (int k = 0; k < n; k++)
+        {
+            int r = k / cols, c = k % cols;
+            double ratio = Secs[vis[k]].SizeRatio;
+            cw[c] = Math.Max(cw[c], ratio);
+            rw[r] = Math.Max(rw[r], ratio);
         }
 
-        Pos(Sep1, 1, 0); Pos(Sep2, 3, 0); Pos(Sep3, 5, 0);
-        Sep1.Visibility = Sep2.Visibility = Sep3.Visibility = Visibility.Visible;
-        Sep4.Visibility = Visibility.Collapsed;
+        for (int c = 0; c < cols; c++)
+        {
+            MainGrid.ColumnDefinitions.Add(Col(cw[c]));
+            if (c < cols - 1) MainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GL(1) });
+        }
+        for (int r = 0; r < rows; r++)
+        {
+            MainGrid.RowDefinitions.Add(Row(rw[r]));
+            if (r < rows - 1) MainGrid.RowDefinitions.Add(new RowDefinition { Height = GL(1) });
+        }
 
-        Pos(PanelCpu, 0, 0); Pos(PanelMem, 2, 0);
-        Pos(PanelDisk, 4, 0); Pos(PanelNet, 6, 0);
+        for (int k = 0; k < n; k++)
+        {
+            int r = k / cols, c = k % cols;
+            Pos(Panels[vis[k]], r * 2, c * 2);
+        }
 
-        gCpu.BarMode = false; gMem.BarMode = false;
-        MinWidth = 62; MinHeight = 120;
-        if (resetSize) { Width = Math.Max(MinWidth, Width); Height = Math.Max(240, Height); }
+        if (cols == 2) { Pos(Sep4, 0, 1, rows * 2 - 1, 1); Sep4.Visibility = Visibility.Visible; }
+        if (rows == 2) { Pos(Sep1, 1, 0, 1, cols * 2 - 1); Sep1.Visibility = Visibility.Visible; }
     }
 
-    private void ApplyGrid2x2Layout(bool resetSize)
+    // 글자 스케일(Viewbox) on/off 에 따라 MainGrid 재배치
+    private void ApplyScale()
     {
-        RestorePanelOverlay(PanelCpu,  hdrCpu,  gCpu);
-        RestorePanelOverlay(PanelMem,  hdrMem,  gMem);
-        RestorePanelOverlay(PanelDisk, hdrDisk, gDisk);
-        RestorePanelOverlay(PanelNet,  hdrNet,  gNet);
-        hdrCpu.Margin = new Thickness(0, 0, 0, 2);
-        hdrMem.Margin = new Thickness(0, 0, 0, 2);
+        DetachMainGrid();
+        HostGrid.Children.Clear();
 
-        // 3 rows: *, 1, *  |  3 cols: *, 1, *
-        MainGrid.RowDefinitions.Add(new RowDefinition { Height = Star });
-        MainGrid.RowDefinitions.Add(new RowDefinition { Height = GL(1) });
-        MainGrid.RowDefinitions.Add(new RowDefinition { Height = Star });
-        MainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = Star });
-        MainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GL(1) });
-        MainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = Star });
-
-        Pos(Sep1, 1, 0, 1, 3); Sep1.Visibility = Visibility.Visible;
-        Pos(Sep4, 0, 1, 3, 1); Sep4.Visibility = Visibility.Visible;
-        Sep2.Visibility = Sep3.Visibility = Visibility.Collapsed;
-
-        Pos(PanelCpu,  0, 0); Pos(PanelMem,  0, 2);
-        Pos(PanelDisk, 2, 0); Pos(PanelNet,  2, 2);
-
-        gCpu.BarMode = false; gMem.BarMode = false;
-        MinWidth = 80; MinHeight = 80;
-        if (resetSize) { Width = Math.Max(MinWidth, Width); Height = 130; }
+        if (_cfg.ScaleText)
+        {
+            MainGrid.Width  = _designW;
+            MainGrid.Height = double.NaN;
+            _viewbox = new Viewbox { Stretch = Stretch.Fill, Child = MainGrid };
+            HostGrid.Children.Add(_viewbox);
+        }
+        else
+        {
+            _viewbox = null;
+            MainGrid.Width  = double.NaN;
+            MainGrid.Height = double.NaN;
+            MainGrid.HorizontalAlignment = HAlign.Stretch;
+            MainGrid.VerticalAlignment   = VerticalAlignment.Stretch;
+            HostGrid.Children.Add(MainGrid);
+        }
     }
 
-    private void ApplyCompactLayout(bool resetSize)
+    private void DetachMainGrid()
     {
-        // CPU/MEM: 텍스트 위 + 막대 아래 (비겹침)
-        SplitPanel(PanelCpu,  hdrCpu,  gCpu);
-        SplitPanel(PanelMem,  hdrMem,  gMem);
-        // DISK/NET: 텍스트 위 + 그래프 아래 (비겹침)
-        SplitPanel(PanelDisk, hdrDisk, gDisk);
-        SplitPanel(PanelNet,  hdrNet,  gNet);
-        hdrCpu.Margin = new Thickness(0);
-        hdrMem.Margin = new Thickness(0);
-
-        // 5 rows: 26, 1, 26, 1, *  |  3 cols: *, 1, *
-        MainGrid.RowDefinitions.Add(new RowDefinition { Height = GL(26) }); // CPU (텍스트+바)
-        MainGrid.RowDefinitions.Add(new RowDefinition { Height = GL(1)  });
-        MainGrid.RowDefinitions.Add(new RowDefinition { Height = GL(26) }); // MEM (텍스트+바)
-        MainGrid.RowDefinitions.Add(new RowDefinition { Height = GL(1)  });
-        MainGrid.RowDefinitions.Add(new RowDefinition { Height = Star   }); // DISK + NET
-        MainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = Star });
-        MainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GL(1) });
-        MainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = Star });
-
-        Pos(Sep1, 1, 0, 1, 3); Sep1.Visibility = Visibility.Visible;
-        Pos(Sep2, 3, 0, 1, 3); Sep2.Visibility = Visibility.Visible;
-        Pos(Sep4, 4, 1, 1, 1); Sep4.Visibility = Visibility.Visible;
-        Sep3.Visibility = Visibility.Collapsed;
-
-        Pos(PanelCpu,  0, 0, 1, 3);
-        Pos(PanelMem,  2, 0, 1, 3);
-        Pos(PanelDisk, 4, 0);
-        Pos(PanelNet,  4, 2);
-
-        gCpu.BarMode = true; gMem.BarMode = true;
-        MinWidth = 80; MinHeight = 80;
-        if (resetSize) { Width = Math.Max(MinWidth, Width); Height = 140; }
+        switch (MainGrid.Parent)
+        {
+            case Viewbox vb:  vb.Child = null;                            break;
+            case System.Windows.Controls.Panel p: p.Children.Remove(MainGrid); break;
+            case Decorator d: d.Child = null;                             break;
+        }
     }
 
     // ── 데이터 수집 ──────────────────────────────────────────────────────
@@ -257,22 +333,23 @@ public partial class MainWindow : Window
 
     private void OnStateChanged(object? sender, EventArgs e)
     {
-        if (_savePending) return;
+        if (!_loaded || _savePending) return;
         _savePending = true;
-        Dispatcher.InvokeAsync(() => { SettingsManager.Save(BuildSettings()); _savePending = false; },
-            DispatcherPriority.Background);
+        Dispatcher.InvokeAsync(() =>
+        {
+            _cfg.X = Left; _cfg.Y = Top; _cfg.W = Width; _cfg.H = Height;
+            SettingsManager.Save(_cfg);
+            _savePending = false;
+        }, DispatcherPriority.Background);
     }
 
-    // ── 설정 로드/저장 ──────────────────────────────────────────────────
+    // ── 설정 로드 ────────────────────────────────────────────────────────
     private void LoadSettings()
     {
-        var s = SettingsManager.Load();
+        _cfg = SettingsManager.Load();
 
-        if (s.Layout.HasValue)
-            SetLayout((LayoutMode)Math.Clamp(s.Layout.Value, 0, 2), resetSize: false);
-
-        double x = s.X ?? (SystemParameters.WorkArea.Right - Width - 10);
-        double y = s.Y ?? 10;
+        double x = _cfg.X ?? (SystemParameters.WorkArea.Right - Width - 10);
+        double y = _cfg.Y ?? 10;
         if (x >= SystemParameters.VirtualScreenLeft &&
             x < SystemParameters.VirtualScreenLeft + SystemParameters.VirtualScreenWidth)
             Left = x;
@@ -280,32 +357,43 @@ public partial class MainWindow : Window
             y < SystemParameters.VirtualScreenTop + SystemParameters.VirtualScreenHeight)
             Top = y;
 
-        if (s.W.HasValue) Width  = Math.Max(MinWidth,  s.W.Value);
-        if (s.H.HasValue) Height = Math.Max(MinHeight, s.H.Value);
-        if (s.Opacity.HasValue) Opacity = Math.Clamp(s.Opacity.Value, 0.1, 1.0);
+        if (_cfg.W.HasValue) Width  = Math.Max(MinWidth,  _cfg.W.Value);
+        if (_cfg.H.HasValue) Height = Math.Max(MinHeight, _cfg.H.Value);
+
+        _timer.Interval = TimeSpan.FromMilliseconds(Math.Clamp(_cfg.UpdateMs, 250, 5000));
+
+        RenderAll();
     }
 
-    private AppSettings BuildSettings() =>
-        new(Left, Top, Width, Height, Opacity, (int)_layoutMode);
-
-    // ── 패널 행 전체 토글 ───────────────────────────────────────────────
-    private void TogglePanel(UIElement panel, bool show, int panelRow, int sepRow)
+    // ── 설정 창 열기 ─────────────────────────────────────────────────────
+    private void OpenSettings()
     {
-        panel.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
-        if (_layoutMode == LayoutMode.Vertical)
+        var dlg = new SettingsWindow(_cfg.Clone()) { Owner = this };
+        if (dlg.ShowDialog() == true)
         {
-            MainGrid.RowDefinitions[panelRow].Height =
-                show ? new GridLength(1, GridUnitType.Star) : new GridLength(0);
-            if (sepRow >= 0)
-                MainGrid.RowDefinitions[sepRow].Height =
-                    show ? new GridLength(1) : new GridLength(0);
+            _cfg = dlg.Result;
+            _timer.Interval = TimeSpan.FromMilliseconds(Math.Clamp(_cfg.UpdateMs, 250, 5000));
+            RenderAll();
+            SettingsManager.Save(_cfg);
         }
     }
 
-    // ── 컨텍스트 메뉴 ────────────────────────────────────────────────────
+    private void QuickApply()
+    {
+        RenderAll();
+        SettingsManager.Save(_cfg);
+    }
+
+    // ── 컨텍스트 메뉴 (빠른 토글 + 설정창) ───────────────────────────────
     public ContextMenu BuildContextMenu()
     {
         var menu = new ContextMenu();
+
+        var settings = new MenuItem { Header = "설정..." };
+        settings.Click += (_, _) => OpenSettings();
+        menu.Items.Add(settings);
+
+        menu.Items.Add(new Separator());
 
         var opHeader = new MenuItem { Header = "투명도", IsEnabled = false };
         menu.Items.Add(opHeader);
@@ -313,60 +401,59 @@ public partial class MainWindow : Window
             { ("30%", 0.3), ("50%", 0.5), ("70%", 0.7), ("85%", 0.85), ("100%", 1.0) })
         {
             double v = val;
-            var item = new MenuItem { Header = label };
-            item.Click += (_, _) => { Opacity = v; SettingsManager.Save(BuildSettings()); };
+            var item = new MenuItem { Header = label, IsCheckable = true, IsChecked = Math.Abs(_cfg.Opacity - v) < 0.001 };
+            item.Click += (_, _) => { _cfg.Opacity = v; Opacity = v; SettingsManager.Save(_cfg); };
             menu.Items.Add(item);
         }
         menu.Items.Add(new Separator());
 
-        var aot = new MenuItem { Header = "항상 위 표시", IsCheckable = true, IsChecked = true };
-        aot.Click += (_, _) => Topmost = aot.IsChecked;
+        var aot = new MenuItem { Header = "항상 위 표시", IsCheckable = true, IsChecked = _cfg.AlwaysOnTop };
+        aot.Click += (_, _) => { _cfg.AlwaysOnTop = aot.IsChecked; Topmost = aot.IsChecked; SettingsManager.Save(_cfg); };
         menu.Items.Add(aot);
 
-        var passItem = new MenuItem { Header = "클릭 무시 (Pass Through)", IsCheckable = true };
+        var passItem = new MenuItem { Header = "클릭 무시 (Pass Through)", IsCheckable = true, IsChecked = _passThrough };
         passItem.Click += (_, _) => SetPassThrough(passItem.IsChecked);
         menu.Items.Add(passItem);
 
-        var resizeItem = new MenuItem { Header = "사이즈 조절 모드", IsCheckable = true };
+        var resizeItem = new MenuItem { Header = "사이즈 조절 모드", IsCheckable = true, IsChecked = _resizeActive };
         resizeItem.Click += (_, _) => SetResizeActive(resizeItem.IsChecked);
         menu.Items.Add(resizeItem);
 
         menu.Items.Add(new Separator());
 
-        var layoutHeader = new MenuItem { Header = "레이아웃", IsEnabled = false };
-        menu.Items.Add(layoutHeader);
-        var layoutDefs = new (string Label, LayoutMode Mode)[]
+        var arrHeader = new MenuItem { Header = "배치", IsEnabled = false };
+        menu.Items.Add(arrHeader);
+        foreach (var (label, mode) in new (string, Arrangement)[]
+            { ("세로 1열", Arrangement.Vertical), ("2×2 그리드", Arrangement.Grid2x2), ("가로 1줄", Arrangement.Horizontal) })
         {
-            ("세로 1열",    LayoutMode.Vertical),
-            ("2×2 그리드",  LayoutMode.Grid2x2),
-            ("컴팩트",      LayoutMode.Compact),
-        };
-        _layoutMenuItems = new MenuItem[layoutDefs.Length];
-        for (int i = 0; i < layoutDefs.Length; i++)
-        {
-            var (label, mode) = layoutDefs[i];
-            var m = mode; int idx = i;
-            var item = new MenuItem { Header = label, IsCheckable = true, IsChecked = _layoutMode == mode };
-            item.Click += (_, _) => { SetLayout(m); SettingsManager.Save(BuildSettings()); };
-            _layoutMenuItems[idx] = item;
+            var m = mode;
+            var item = new MenuItem { Header = label, IsCheckable = true, IsChecked = _cfg.Arrange == mode };
+            item.Click += (_, _) => { _cfg.Arrange = m; QuickApply(); };
             menu.Items.Add(item);
         }
 
         menu.Items.Add(new Separator());
 
-        foreach (var (label, panel, pRow, sRow) in new (string, UIElement, int, int)[]
+        var panelHeader = new MenuItem { Header = "패널 표시", IsEnabled = false };
+        menu.Items.Add(panelHeader);
+        foreach (var (label, idx) in new (string, int)[]
+            { ("CPU", 0), ("메모리", 1), ("디스크", 2), ("네트워크", 3) })
         {
-            ("CPU 패널",      PanelCpu,  0,  1),
-            ("메모리 패널",   PanelMem,  2,  3),
-            ("디스크 패널",   PanelDisk, 4,  5),
-            ("네트워크 패널", PanelNet,  6, -1),
-        })
-        {
-            var el = panel; var pr = pRow; var sr = sRow;
-            var item = new MenuItem { Header = label, IsCheckable = true, IsChecked = true };
-            item.Click += (_, _) => TogglePanel(el, item.IsChecked, pr, sr);
+            int i = idx;
+            var item = new MenuItem { Header = label, IsCheckable = true, IsChecked = Secs[i].Visible };
+            item.Click += (_, _) => { Secs[i].Visible = item.IsChecked; QuickApply(); };
             menu.Items.Add(item);
         }
+
+        bool allVals = _cfg.Sections.All(s => s.ShowValues);
+        var valuesItem = new MenuItem { Header = "수치 보기", IsCheckable = true, IsChecked = allVals };
+        valuesItem.Click += (_, _) =>
+        {
+            bool on = valuesItem.IsChecked;
+            foreach (var s in _cfg.Sections) s.ShowValues = on;
+            QuickApply();
+        };
+        menu.Items.Add(valuesItem);
 
         menu.Items.Add(new Separator());
 
