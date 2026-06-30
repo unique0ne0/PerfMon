@@ -55,7 +55,15 @@ public sealed class GraphControl : FrameworkElement
 
         if (BarMode)
         {
-            DrawBar(dc, _buf1, 100.0, w, h, Color1);
+            if (IsDual)
+            {
+                double max = Math.Max(0.001, Math.Max(_buf1.Max(), _buf2.Max()) * 1.2);
+                DrawBarDual(dc, _buf1, _buf2, max, w, h, Color1, Color2);
+            }
+            else
+            {
+                DrawBar(dc, _buf1, 100.0, w, h, Color1);
+            }
             return;
         }
 
@@ -147,5 +155,36 @@ public sealed class GraphControl : FrameworkElement
         var edgePen = new Pen(new SolidColorBrush(Color.FromArgb(220, color.R, color.G, color.B)), 1.0);
         edgePen.Freeze();
         dc.DrawLine(edgePen, new Point(barW, 0), new Point(barW, h));
+    }
+
+    // 두 개의 가로 막대를 위/아래로 쌓아 그림 (DISK R/W, NET D/U) — 미니 레이아웃용
+    private static void DrawBarDual(DrawingContext dc, double[] buf1, double[] buf2,
+        double max, double w, double h, Color c1, Color c2)
+    {
+        double gap  = Math.Min(2.0, h * 0.12);
+        double barH = (h - gap) / 2.0;
+        if (barH < 1) barH = h / 2.0;
+
+        DrawBarRow(dc, 0,            barH, buf1[HIST - 1] / max, w, c1);
+        DrawBarRow(dc, barH + gap,   barH, buf2[HIST - 1] / max, w, c2);
+    }
+
+    private static void DrawBarRow(DrawingContext dc, double y, double barH,
+        double frac, double w, Color color)
+    {
+        // 트랙(배경)
+        var track = new SolidColorBrush(Color.FromArgb(28, color.R, color.G, color.B));
+        track.Freeze();
+        dc.DrawRectangle(track, null, new Rect(0, y, w, barH));
+
+        double barW = Math.Clamp(frac, 0, 1) * w;
+        if (barW < 0.5) return;
+
+        var brush = new LinearGradientBrush(
+            Color.FromArgb(190, color.R, color.G, color.B),
+            Color.FromArgb(95,  color.R, color.G, color.B),
+            new Point(0, 0), new Point(1, 0));
+        brush.Freeze();
+        dc.DrawRectangle(brush, null, new Rect(0, y, barW, barH));
     }
 }
