@@ -1,5 +1,12 @@
-node_modules/
+bin/
+obj/
 dist/
+node_modules/
+.claude/
+*.user
+.vs/
+*.suo
+*.log
 *.zip
 .DS_Store
 Thumbs.db

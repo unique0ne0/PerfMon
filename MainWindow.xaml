@@ -1,0 +1,103 @@
+<Window x:Class="PerfMonCS.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:PerfMonCS"
+        Title="PerfMon"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        Topmost="True"
+        ShowInTaskbar="False"
+        ResizeMode="NoResize"
+        WindowStartupLocation="Manual"
+        Left="200" Top="200"
+        Width="90" Height="240"
+        MinWidth="62" MinHeight="120"
+        FontFamily="Segoe UI"
+        MouseLeftButtonDown="OnDrag"
+        LocationChanged="OnStateChanged"
+        SizeChanged="OnStateChanged">
+
+    <Border x:Name="RootBorder"
+            Background="#D9080A10"
+            BorderBrush="#12FFFFFF"
+            BorderThickness="1"
+            CornerRadius="5">
+        <Grid x:Name="MainGrid">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="1"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="1"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="1"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+
+            <Rectangle x:Name="Sep1" Grid.Row="1" Fill="#0CFFFFFF"/>
+            <Rectangle x:Name="Sep2" Grid.Row="3" Fill="#0CFFFFFF"/>
+            <Rectangle x:Name="Sep3" Grid.Row="5" Fill="#0CFFFFFF"/>
+            <Rectangle x:Name="Sep4" Fill="#0CFFFFFF" Visibility="Collapsed"/>
+
+            <!-- CPU -->
+            <Grid Grid.Row="0" Margin="4,3,4,2" x:Name="PanelCpu">
+                <local:GraphControl x:Name="gCpu" Color1="#FF00C3FF"/>
+                <Grid x:Name="hdrCpu" Panel.ZIndex="1" VerticalAlignment="Top" Margin="0,0,0,2">
+                    <TextBlock Text="CPU" Foreground="#FF00C3FF" FontSize="8" FontWeight="SemiBold"/>
+                    <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
+                        <TextBlock x:Name="vCpu"  Text="0%"  Foreground="#FF00C3FF" FontSize="8" FontWeight="Bold"/>
+                        <TextBlock x:Name="vTemp" Text=""    Foreground="#FF00C3FF" FontSize="8" Opacity="0.65" Margin="3,0,0,0"/>
+                    </StackPanel>
+                </Grid>
+            </Grid>
+
+            <!-- MEM -->
+            <Grid Grid.Row="2" Margin="4,3,4,2" x:Name="PanelMem">
+                <local:GraphControl x:Name="gMem" Color1="#FFA855F7"/>
+                <Grid x:Name="hdrMem" Panel.ZIndex="1" VerticalAlignment="Top" Margin="0,0,0,2">
+                    <TextBlock Text="MEM" Foreground="#FFA855F7" FontSize="8" FontWeight="SemiBold"/>
+                    <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
+                        <TextBlock x:Name="vMem"   Text="0%"   Foreground="#FFA855F7" FontSize="8" FontWeight="Bold"/>
+                        <TextBlock x:Name="vMemGB" Text=""     Foreground="#FFA855F7" FontSize="8" Opacity="0.65" Margin="3,0,0,0"/>
+                    </StackPanel>
+                </Grid>
+            </Grid>
+
+            <!-- DISK: R=Color1(노랑), W=Color2(주황) — 그래프 선색과 글자색 일치 -->
+            <Grid Grid.Row="4" Margin="4,3,4,1" x:Name="PanelDisk">
+                <local:GraphControl x:Name="gDisk" Color1="#FFFDE047" Color2="#FFF97316" IsDual="True"/>
+                <StackPanel x:Name="hdrDisk" Panel.ZIndex="1" VerticalAlignment="Top">
+                    <TextBlock Text="DISK" Foreground="#FFFDE047" FontSize="8" FontWeight="SemiBold"/>
+                    <StackPanel Margin="0,2,0,0">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="R:" Foreground="#FFFDE047" FontSize="7" FontWeight="SemiBold"/>
+                            <TextBlock x:Name="vDR" Text="0" Foreground="#FFFDE047" FontSize="7" FontWeight="Bold" Margin="1,0,0,0"/>
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="W:" Foreground="#FFF97316" FontSize="7" FontWeight="SemiBold"/>
+                            <TextBlock x:Name="vDW" Text="0" Foreground="#FFF97316" FontSize="7" Margin="1,0,0,0"/>
+                        </StackPanel>
+                    </StackPanel>
+                </StackPanel>
+            </Grid>
+
+            <!-- NET: D=Color1(초록), U=Color2(하늘) — 그래프 선색과 글자색 일치 -->
+            <Grid Grid.Row="6" Margin="4,3,4,2" x:Name="PanelNet">
+                <local:GraphControl x:Name="gNet" Color1="#FF22C55E" Color2="#FF38BDF8" IsDual="True"/>
+                <StackPanel x:Name="hdrNet" Panel.ZIndex="1" VerticalAlignment="Top">
+                    <TextBlock Text="NET" Foreground="#FF22C55E" FontSize="8" FontWeight="SemiBold"/>
+                    <StackPanel Margin="0,2,0,0">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="D:" Foreground="#FF22C55E" FontSize="7" FontWeight="SemiBold"/>
+                            <TextBlock x:Name="vNDn" Text="0" Foreground="#FF22C55E" FontSize="7" FontWeight="Bold" Margin="1,0,0,0"/>
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="U:" Foreground="#FF38BDF8" FontSize="7" FontWeight="SemiBold"/>
+                            <TextBlock x:Name="vNUp" Text="0" Foreground="#FF38BDF8" FontSize="7" Margin="1,0,0,0"/>
+                        </StackPanel>
+                    </StackPanel>
+                </StackPanel>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>
