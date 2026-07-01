@@ -164,9 +164,11 @@ public sealed class GraphControl : FrameworkElement
     private static void DrawBarDual(DrawingContext dc, double[] buf1, double[] buf2,
         double max, double w, double h, Color c1, Color c2)
     {
-        double barH = h / 2.0;
-        DrawBarRow(dc, 0,     barH, buf1[HIST - 1] / max, w, c1);
-        DrawBarRow(dc, barH, barH, buf2[HIST - 1] / max, w, c2);
+        double totalH = Math.Max(2.0, h * 0.4);
+        double barH   = totalH / 2.0;
+        double startY = (h - totalH) / 2.0;
+        DrawBarRow(dc, startY,        barH, buf1[HIST - 1] / max, w, c1);
+        DrawBarRow(dc, startY + barH, barH, buf2[HIST - 1] / max, w, c2);
     }
 
     private static void DrawBarRow(DrawingContext dc, double y, double slotH,
