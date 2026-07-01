@@ -145,8 +145,7 @@ public sealed class GraphControl : FrameworkElement
         double barW = w * frac;
         if (barW < 0.5) return;
 
-        // 막대 높이를 공간의 60% 로 제한 (두꺼운 선 느낌)
-        double barH = Math.Max(2.0, h * 0.6);
+        double barH = Math.Max(2.0, h * 0.4);
         double y    = (h - barH) / 2.0;
 
         var brush = new LinearGradientBrush(
@@ -165,20 +164,16 @@ public sealed class GraphControl : FrameworkElement
     private static void DrawBarDual(DrawingContext dc, double[] buf1, double[] buf2,
         double max, double w, double h, Color c1, Color c2)
     {
-        double gap  = Math.Min(2.0, h * 0.12);
-        double barH = (h - gap) / 2.0;
-        if (barH < 1) barH = h / 2.0;
-
-        DrawBarRow(dc, 0,            barH, buf1[HIST - 1] / max, w, c1);
-        DrawBarRow(dc, barH + gap,   barH, buf2[HIST - 1] / max, w, c2);
+        double barH = h / 2.0;
+        DrawBarRow(dc, 0,     barH, buf1[HIST - 1] / max, w, c1);
+        DrawBarRow(dc, barH, barH, buf2[HIST - 1] / max, w, c2);
     }
 
     private static void DrawBarRow(DrawingContext dc, double y, double slotH,
         double frac, double w, Color color)
     {
-        // 슬롯 내에서 60% 높이로 중앙 정렬 (두꺼운 선 느낌)
-        double barH   = Math.Max(2.0, slotH * 0.6);
-        double offset = y + (slotH - barH) / 2.0;
+        double barH   = Math.Max(1.0, slotH);
+        double offset = y;
 
         var track = new SolidColorBrush(Color.FromArgb(28, color.R, color.G, color.B));
         track.Freeze();
