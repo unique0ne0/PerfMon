@@ -106,6 +106,7 @@ public partial class MainWindow : Window
         Opacity = Math.Clamp(_cfg.Opacity, 0.1, 1.0);
         Topmost = _cfg.AlwaysOnTop;
 
+        ApplyFontSizes();
         ContextMenu = BuildContextMenu();
     }
 
@@ -609,7 +610,54 @@ public partial class MainWindow : Window
         hide.Click += (_, _) => Hide();
         menu.Items.Add(hide);
 
+        menu.Items.Add(new Separator());
+
+        var restart = new MenuItem { Header = "재시작" };
+        restart.Click += (_, _) => ((App)System.Windows.Application.Current).Restart();
+        menu.Items.Add(restart);
+
+        var exit = new MenuItem { Header = "종료" };
+        exit.Click += (_, _) => ((App)System.Windows.Application.Current).FullExit();
+        menu.Items.Add(exit);
+
         return menu;
+    }
+
+    private void ApplyFontSizes()
+    {
+        double lfs = _cfg.LabelFontSize;
+        double vfs = _cfg.ValueFontSize;
+
+        lblCpu.FontSize  = lfs;
+        lblMem.FontSize  = lfs;
+        lblDisk.FontSize = lfs;
+        lblNet.FontSize  = lfs;
+
+        SetChildFontSize(valsCpu,  vfs);
+        SetChildFontSize(valsMem,  vfs);
+        SetChildFontSize(valsDisk, vfs);
+        SetChildFontSize(valsNet,  vfs);
+    }
+
+    private static void SetChildFontSize(FrameworkElement el, double size)
+    {
+        if (el is System.Windows.Controls.TextBlock tb) { tb.FontSize = size; return; }
+        if (el is System.Windows.Controls.Panel p)
+            foreach (UIElement c in p.Children)
+                if (c is FrameworkElement fe) SetChildFontSize(fe, size);
+    }
+
+    public void SavePosition()
+    {
+        _cfg.SavedX = Left;
+        _cfg.SavedY = Top;
+        SettingsManager.Save(_cfg);
+    }
+
+    public void RestorePosition()
+    {
+        if (_cfg.SavedX.HasValue) Left = _cfg.SavedX.Value;
+        if (_cfg.SavedY.HasValue) Top  = _cfg.SavedY.Value;
     }
 
     protected override void OnClosing(System.ComponentModel.CancelEventArgs e)

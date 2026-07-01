@@ -17,8 +17,10 @@ public partial class App : System.Windows.Application
         // 미처리 예외를 로그 파일에 기록
         DispatcherUnhandledException += (_, ex) =>
         {
-            System.IO.File.AppendAllText(@"d:\Git\PerfMonCS\crash.log",
-                $"[{DateTime.Now}] {ex.Exception}\n\n");
+            var log = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "PerfMonCS", "crash.log");
+            System.IO.File.AppendAllText(log, $"[{DateTime.Now}] {ex.Exception}\n\n");
             ex.Handled = true;
         };
 
@@ -52,7 +54,18 @@ public partial class App : System.Windows.Application
         autoStart.CheckedChanged += (_, _) => AutoStartHelper.Set(autoStart.Checked);
         menu.Items.Add(autoStart);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("완전 종료").Click += (_, _) => { _tray?.Dispose(); Shutdown(); };
+        menu.Items.Add(new ToolStripSeparator());
+
+        var savePos = new ToolStripMenuItem("현재 위치 저장");
+        savePos.Click += (_, _) => _window?.SavePosition();
+        menu.Items.Add(savePos);
+
+        var restorePos = new ToolStripMenuItem("위치 복구");
+        restorePos.Click += (_, _) => _window?.RestorePosition();
+        menu.Items.Add(restorePos);
+
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("완전 종료").Click += (_, _) => FullExit();
 
         _tray = new NotifyIcon { Icon = icon, Text = "PerfMon Overlay", Visible = true, ContextMenuStrip = menu };
         _tray.DoubleClick += (_, _) => ToggleWindow();
@@ -89,6 +102,20 @@ public partial class App : System.Windows.Application
         g.FillEllipse(dotBrush, 11f, 2f, 4f, 4f);
 
         return Icon.FromHandle(bmp.GetHicon());
+    }
+
+    public void FullExit()
+    {
+        _tray?.Dispose();
+        Shutdown();
+    }
+
+    public void Restart()
+    {
+        var exe = Environment.ProcessPath;
+        if (exe != null) System.Diagnostics.Process.Start(exe);
+        _tray?.Dispose();
+        Shutdown();
     }
 
     private void ToggleWindow()

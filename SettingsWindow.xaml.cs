@@ -68,13 +68,22 @@ public partial class SettingsWindow : Window
         sp.Children.Add(SliderRow("투명도", 0.1, 1.0, _cfg.Opacity, 0.05,
             v => $"{v * 100:0}%", v => _cfg.Opacity = v));
 
+        sp.Children.Add(SliderRow("레이블 폰트 크기", 7, 20, _cfg.LabelFontSize, 1,
+            v => $"{v:0}px", v => _cfg.LabelFontSize = v));
+        sp.Children.Add(SliderRow("수치 폰트 크기", 7, 20, _cfg.ValueFontSize, 1,
+            v => $"{v:0}px", v => _cfg.ValueFontSize = v));
+
         sp.Children.Add(new TextBlock { Text = "업데이트 주기", Margin = new Thickness(0, 10, 0, 2) });
         var ms = new[] { 500, 1000, 2000 };
         int sel = _cfg.UpdateMs <= 500 ? 0 : _cfg.UpdateMs >= 2000 ? 2 : 1;
         sp.Children.Add(Combo(new[] { "빠름 (0.5초)", "보통 (1초)", "느림 (2초)" }, sel,
             i => _cfg.UpdateMs = ms[i]));
 
-        return new TabItem { Header = "일반", Content = sp };
+        return new TabItem { Header = "일반", Content = new System.Windows.Controls.ScrollViewer
+        {
+            VerticalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Auto,
+            Content = sp,
+        }};
     }
 
     // ── 섹션 탭 ──────────────────────────────────────────────────────────
@@ -89,12 +98,7 @@ public partial class SettingsWindow : Window
         sp.Children.Add(new TextBlock { Text = "그래프 종류", Margin = new Thickness(0, 12, 0, 2) });
         sp.Children.Add(Combo(new[] { "꺾은선", "막대" }, (int)s.Graph, i => s.Graph = (GraphKind)i));
 
-        var ratioPanel = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 0) };
-        ratioPanel.Children.Add(new TextBlock { Text = "가로 비율:", VerticalAlignment = VerticalAlignment.Center, Width = 70 });
-        ratioPanel.Children.Add(Combo(new[] { "1", "2", "3" }, s.WidthRatio - 1, i => s.WidthRatio = i + 1));
-        ratioPanel.Children.Add(new TextBlock { Text = "  세로 비율:", VerticalAlignment = VerticalAlignment.Center, Width = 70 });
-        ratioPanel.Children.Add(Combo(new[] { "1", "2", "3" }, s.HeightRatio - 1, i => s.HeightRatio = i + 1));
-        sp.Children.Add(ratioPanel);
+        sp.Children.Add(RatioRow(s));
 
         return new TabItem { Header = header, Content = sp };
     }
@@ -106,6 +110,36 @@ public partial class SettingsWindow : Window
         c.Checked   += (_, _) => set(true);
         c.Unchecked += (_, _) => set(false);
         return c;
+    }
+
+    private static Grid RatioRow(SectionSettings s)
+    {
+        var g = new Grid { Margin = new Thickness(0, 12, 0, 0) };
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(64) });
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(16) });
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(64) });
+
+        var lblW = new TextBlock { Text = "가로 비율:", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) };
+        var cmbW = MiniCombo(new[] { "1", "2", "3" }, s.WidthRatio - 1, i => s.WidthRatio = i + 1);
+        var lblH = new TextBlock { Text = "세로 비율:", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) };
+        var cmbH = MiniCombo(new[] { "1", "2", "3" }, s.HeightRatio - 1, i => s.HeightRatio = i + 1);
+
+        Grid.SetColumn(lblW, 0); Grid.SetColumn(cmbW, 1);
+        Grid.SetColumn(lblH, 3); Grid.SetColumn(cmbH, 4);
+        g.Children.Add(lblW); g.Children.Add(cmbW);
+        g.Children.Add(lblH); g.Children.Add(cmbH);
+        return g;
+    }
+
+    private static ComboBox MiniCombo(string[] items, int sel, Action<int> set)
+    {
+        var cb = new ComboBox { Width = 64, HorizontalAlignment = HAlign.Left };
+        foreach (var it in items) cb.Items.Add(it);
+        cb.SelectedIndex = Math.Clamp(sel, 0, items.Length - 1);
+        cb.SelectionChanged += (_, _) => { if (cb.SelectedIndex >= 0) set(cb.SelectedIndex); };
+        return cb;
     }
 
     private static ComboBox Combo(string[] items, int sel, Action<int> set)

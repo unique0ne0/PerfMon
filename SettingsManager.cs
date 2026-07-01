@@ -27,13 +27,17 @@ public sealed class AppSettings
     public double? Y { get; set; }
     public double? W { get; set; }
     public double? H { get; set; }
+    public double? SavedX { get; set; }
+    public double? SavedY { get; set; }
 
     // 공통
-    public double      Opacity     { get; set; } = 0.85;
-    public bool        AlwaysOnTop { get; set; } = true;
-    public bool        ScaleText   { get; set; } = true;   // Viewbox 글자 스케일
-    public int         UpdateMs    { get; set; } = 1000;
-    public Arrangement Arrange     { get; set; } = Arrangement.Vertical;
+    public double      Opacity        { get; set; } = 0.85;
+    public bool        AlwaysOnTop    { get; set; } = true;
+    public bool        ScaleText      { get; set; } = true;
+    public int         UpdateMs       { get; set; } = 1000;
+    public Arrangement Arrange        { get; set; } = Arrangement.Vertical;
+    public double      LabelFontSize  { get; set; } = 10;
+    public double      ValueFontSize  { get; set; } = 10;
 
     // 섹션
     public SectionSettings Cpu  { get; set; } = new();
@@ -46,9 +50,10 @@ public sealed class AppSettings
 
     public AppSettings Clone() => new()
     {
-        X = X, Y = Y, W = W, H = H,
+        X = X, Y = Y, W = W, H = H, SavedX = SavedX, SavedY = SavedY,
         Opacity = Opacity, AlwaysOnTop = AlwaysOnTop, ScaleText = ScaleText,
         UpdateMs = UpdateMs, Arrange = Arrange,
+        LabelFontSize = LabelFontSize, ValueFontSize = ValueFontSize,
         Cpu = Cpu.Clone(), Mem = Mem.Clone(), Disk = Disk.Clone(), Net = Net.Clone(),
     };
 }
