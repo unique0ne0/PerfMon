@@ -167,12 +167,24 @@ public partial class MainWindow : Window
         var hdr   = Hdrs[i];
         var graph = Graphs[i];
 
-        panel.Margin     = new Thickness(2, 1, 2, 1);
-        panel.Visibility = Visibility.Visible;
+        bool isBar = Secs[i].Graph == GraphKind.Bar;
 
-        graph.BarMode             = Secs[i].Graph == GraphKind.Bar;
-        graph.Margin              = new Thickness(0);
-        graph.VerticalAlignment   = VerticalAlignment.Stretch;
+        // CPU/MEM 막대: 위아래 여백으로 60% 높이 / DISK·NET: 2px 여백으로 꽉 채움
+        if (i < 2 && isBar)
+        {
+            panel.Margin              = new Thickness(2, 1, 2, 1);
+            graph.VerticalAlignment   = VerticalAlignment.Center;
+            graph.Margin              = new Thickness(0, 3, 0, 3);
+        }
+        else
+        {
+            panel.Margin              = new Thickness(2, 2, 2, 2);
+            graph.VerticalAlignment   = VerticalAlignment.Stretch;
+            graph.Margin              = new Thickness(0);
+        }
+
+        panel.Visibility          = Visibility.Visible;
+        graph.BarMode             = isBar;
         graph.HorizontalAlignment = HAlign.Stretch;
 
         // 패널 내부를 2열로 재구성: [레이블(auto) | 그래프(*)]
