@@ -170,7 +170,7 @@ public partial class MainWindow : Window
         panel.Margin     = new Thickness(2, 1, 2, 1);
         panel.Visibility = Visibility.Visible;
 
-        graph.BarMode             = true;
+        graph.BarMode             = Secs[i].Graph == GraphKind.Bar;
         graph.Margin              = new Thickness(0);
         graph.VerticalAlignment   = VerticalAlignment.Stretch;
         graph.HorizontalAlignment = HAlign.Stretch;
