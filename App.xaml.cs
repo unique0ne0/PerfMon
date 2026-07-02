@@ -41,6 +41,8 @@ public partial class App : System.Windows.Application
         var icon = CreatePulseIcon();
 
         var menu = new ContextMenuStrip();
+        menu.Items.Add("설정...").Click += (_, _) => { _window?.Show(); _window?.OpenSettings(); };
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("보이기 / 숨기기").Click += (_, _) => ToggleWindow();
         menu.Items.Add(new ToolStripSeparator());
 

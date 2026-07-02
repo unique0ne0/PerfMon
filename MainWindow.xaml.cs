@@ -34,10 +34,16 @@ public partial class MainWindow : Window
     private bool        _loaded;
     private Viewbox?    _viewbox;
 
-    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int n);
-    [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int n, int v);
-    private const int GWL_EXSTYLE       = -20;
-    private const int WS_EX_TRANSPARENT = 0x20;
+    [DllImport("user32.dll")] static extern int  GetWindowLong(IntPtr h, int n);
+    [DllImport("user32.dll")] static extern int  SetWindowLong(IntPtr h, int n, int v);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    private const int  GWL_EXSTYLE       = -20;
+    private const int  WS_EX_TRANSPARENT = 0x20;
+    private static readonly IntPtr HWND_TOPMOST   = new(-1);
+    private static readonly IntPtr HWND_NOTOPMOST = new(-2);
+    private const uint SWP_NOMOVE     = 0x0002;
+    private const uint SWP_NOSIZE     = 0x0001;
+    private const uint SWP_NOACTIVATE = 0x0010;
 
     public MainWindow()
     {
@@ -59,6 +65,16 @@ public partial class MainWindow : Window
     private FrameworkElement[] Labels => new FrameworkElement[] { lblCpu, lblMem, lblDisk, lblNet };
     private FrameworkElement[] Vals   => new FrameworkElement[] { valsCpu, valsMem, valsDisk, valsNet };
     private GraphControl[]     Graphs => new[] { gCpu, gMem, gDisk, gNet };
+
+    // ── Always On Top (Win32 직접 호출 — 작업표시줄 위에서도 유지) ──────
+    public void ApplyAlwaysOnTop(bool on)
+    {
+        Topmost = on;
+        var hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd != IntPtr.Zero)
+            SetWindowPos(hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST,
+                0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
 
     // ── Pass Through ─────────────────────────────────────────────────────
     public bool IsPassThrough => _passThrough;
@@ -104,7 +120,7 @@ public partial class MainWindow : Window
         ApplyScale();
 
         Opacity = Math.Clamp(_cfg.Opacity, 0.1, 1.0);
-        Topmost = _cfg.AlwaysOnTop;
+        ApplyAlwaysOnTop(_cfg.AlwaysOnTop);
 
         ApplyFontSizes();
         ContextMenu = BuildContextMenu();
@@ -498,7 +514,7 @@ public partial class MainWindow : Window
     }
 
     // ── 설정 창 열기 ─────────────────────────────────────────────────────
-    private void OpenSettings()
+    public void OpenSettings()
     {
         var original = _cfg.Clone();
         var dlg = new SettingsWindow(_cfg.Clone()) { Owner = this };
@@ -554,7 +570,7 @@ public partial class MainWindow : Window
         menu.Items.Add(new Separator());
 
         var aot = new MenuItem { Header = "항상 위 표시", IsCheckable = true, IsChecked = _cfg.AlwaysOnTop };
-        aot.Click += (_, _) => { _cfg.AlwaysOnTop = aot.IsChecked; Topmost = aot.IsChecked; SettingsManager.Save(_cfg); };
+        aot.Click += (_, _) => { _cfg.AlwaysOnTop = aot.IsChecked; ApplyAlwaysOnTop(aot.IsChecked); SettingsManager.Save(_cfg); };
         menu.Items.Add(aot);
 
         var passItem = new MenuItem { Header = "클릭 무시 (Pass Through)", IsCheckable = true, IsChecked = _passThrough };
