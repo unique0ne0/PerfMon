@@ -40,6 +40,8 @@ public sealed class AppSettings
     public double      LabelFontSize     { get; set; } = 10;
     public double      ValueFontSize     { get; set; } = 10;
     public bool        UseCommonDisplay  { get; set; } = false;
+    public bool        MemShowPercent    { get; set; } = true;
+    public bool        MemShowUsage      { get; set; } = true;
 
     // 섹션
     public SectionSettings Cpu  { get; set; } = new();
@@ -57,6 +59,7 @@ public sealed class AppSettings
         UpdateMs = UpdateMs, Arrange = Arrange,
         LabelFontSize = LabelFontSize, ValueFontSize = ValueFontSize,
         UseCommonDisplay = UseCommonDisplay,
+        MemShowPercent = MemShowPercent, MemShowUsage = MemShowUsage,
         Cpu = Cpu.Clone(), Mem = Mem.Clone(), Disk = Disk.Clone(), Net = Net.Clone(),
     };
 }

@@ -33,6 +33,7 @@ public partial class MainWindow : Window
     private bool        _resizeActive;
     private bool        _loaded;
     private Viewbox?    _viewbox;
+    private double      _labelColW = 30;
 
     [DllImport("user32.dll")] static extern int  GetWindowLong(IntPtr h, int n);
     [DllImport("user32.dll")] static extern int  SetWindowLong(IntPtr h, int n, int v);
@@ -135,6 +136,7 @@ public partial class MainWindow : Window
     {
         bool isCompact = _cfg.Arrange == Arrangement.Compact;
         bool isMini    = _cfg.Arrange == Arrangement.Mini;
+        _labelColW = ComputeLabelColWidth();
         for (int i = 0; i < 4; i++)
         {
             if (isMini)         ConfigurePanelMini(i);
@@ -143,6 +145,7 @@ public partial class MainWindow : Window
         }
         ApplyArrangement();
         ApplyScale();
+        ApplyMemDisplayMode();
 
         Opacity = Math.Clamp(_cfg.Opacity, 0.1, 1.0);
         ApplyAlwaysOnTop(_cfg.AlwaysOnTop);
@@ -210,10 +213,45 @@ public partial class MainWindow : Window
         MinHeight = Math.Max(24, MinHeight);
     }
 
+    // 모든 섹션(CPU/MEM/DISK/NET) 레이블 폭을 동일하게 고정 — 값 시작 X 위치 통일
+    private double ComputeLabelColWidth()
+    {
+        var typeface = new Typeface(new System.Windows.Media.FontFamily(FontFamily.ToString()),
+            FontStyles.Normal, FontWeights.SemiBold, FontStretches.Normal);
+        double dpi = VisualTreeHelper.GetDpi(this).PixelsPerDip;
+        double max = 0;
+        foreach (var name in new[] { "CPU", "MEM", "DISK", "NET" })
+        {
+            var ft = new FormattedText(name, System.Globalization.CultureInfo.CurrentCulture,
+                System.Windows.FlowDirection.LeftToRight, typeface, _cfg.LabelFontSize,
+                System.Windows.Media.Brushes.Black, dpi);
+            max = Math.Max(max, ft.Width);
+        }
+        return max;
+    }
+
+    // 레이블 표시 시 값은 공통 폭만큼 들여쓰기(좌측 정렬), 레이블 없으면 값은 좌측 끝에 밀착
+    private void ApplyLabelValueAlignment(int i, bool showLabel)
+    {
+        Labels[i].MinWidth = showLabel ? _labelColW : 0;
+
+        var vals = Vals[i];
+        var m = vals.Margin;
+        vals.HorizontalAlignment = HAlign.Left;
+        vals.Margin = new Thickness(showLabel ? _labelColW + 4 : 0, m.Top, m.Right, m.Bottom);
+    }
+
+    private void ApplyMemDisplayMode()
+    {
+        vMem.Visibility   = _cfg.MemShowPercent ? Visibility.Visible : Visibility.Collapsed;
+        vMemGB.Visibility = _cfg.MemShowUsage   ? Visibility.Visible : Visibility.Collapsed;
+    }
+
     private void ConfigurePanel(int i)
     {
         var s = Secs[i];
         RestoreIntoHeader(i);
+        ApplyLabelValueAlignment(i, s.ShowLabel);
 
         Panels[i].Margin     = PanelMargin[i];
         Panels[i].Visibility = s.Visible    ? Visibility.Visible : Visibility.Collapsed;
@@ -246,6 +284,7 @@ public partial class MainWindow : Window
     {
         var s = Secs[i];
         RestoreIntoHeader(i);
+        ApplyLabelValueAlignment(i, true);
 
         Panels[i].Margin     = PanelMargin[i];
         Panels[i].Visibility = Visibility.Visible;
@@ -335,7 +374,7 @@ public partial class MainWindow : Window
 
         panel.RowDefinitions.Clear();
         panel.ColumnDefinitions.Clear();
-        panel.ColumnDefinitions.Add(new ColumnDefinition { Width = showLabel ? GridLength.Auto : new GridLength(0) });
+        panel.ColumnDefinitions.Add(new ColumnDefinition { Width = showLabel ? new GridLength(_labelColW) : new GridLength(0) });
         panel.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
         label.Visibility          = showLabel ? Visibility.Visible : Visibility.Collapsed;

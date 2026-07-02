@@ -145,6 +145,13 @@ public partial class SettingsWindow : Window
         sp.Children.Add(chkGraph);
         sp.Children.Add(chkOverlay);
 
+        if (header == "Memory")
+        {
+            sp.Children.Add(new TextBlock { Text = "수치 표시 항목", Margin = new Thickness(0, 12, 0, 2) });
+            sp.Children.Add(Chk("퍼센트(%) 표시",  _cfg.MemShowPercent, v => _cfg.MemShowPercent = v));
+            sp.Children.Add(Chk("사용량(GB) 표시", _cfg.MemShowUsage,  v => _cfg.MemShowUsage  = v, marginTop: 4));
+        }
+
         sp.Children.Add(new TextBlock { Text = "그래프 종류", Margin = new Thickness(0, 12, 0, 2) });
         sp.Children.Add(Combo(new[] { "꺾은선", "막대" }, (int)s.Graph, i => s.Graph = (GraphKind)i));
 
