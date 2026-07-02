@@ -58,6 +58,9 @@ public partial class SettingsWindow : Window
         sp.Children.Add(Chk("수치 표시",
             _cfg.Sections.All(s => s.ShowValues),
             v => { foreach (var s in _cfg.Sections) s.ShowValues = v; }, marginTop: 4));
+        sp.Children.Add(Chk("그래프 표시",
+            _cfg.Sections.All(s => s.ShowGraph),
+            v => { foreach (var s in _cfg.Sections) s.ShowGraph = v; }, marginTop: 4));
         sp.Children.Add(Chk("텍스트 그래프 겹치기",
             _cfg.Sections.All(s => s.Overlay),
             v => { foreach (var s in _cfg.Sections) s.Overlay = v; }, marginTop: 4));
@@ -87,16 +90,38 @@ public partial class SettingsWindow : Window
     }
 
     // ── 섹션 탭 ──────────────────────────────────────────────────────────
-    private static TabItem SectionTab(string header, SectionSettings s)
+    private TabItem SectionTab(string header, SectionSettings s)
     {
         var sp = new StackPanel { Margin = new Thickness(12) };
 
-        sp.Children.Add(Chk("레이블 표시", s.ShowLabel, v => s.ShowLabel = v));
-        sp.Children.Add(Chk("수치 표시", s.ShowValues, v => s.ShowValues = v, marginTop: 4));
-        sp.Children.Add(Chk("텍스트를 그래프 위에 겹치기", s.Overlay, v => s.Overlay = v, marginTop: 4));
+        // 공통 적용 체크박스
+        bool applyAll = false;
+        var chkAll = new CheckBox
+        {
+            Content = "모든 패널에 공통 적용",
+            IsChecked = false,
+            FontWeight = FontWeights.SemiBold,
+            Margin = new Thickness(0, 0, 0, 10),
+        };
+        chkAll.Checked   += (_, _) => applyAll = true;
+        chkAll.Unchecked += (_, _) => applyAll = false;
+        sp.Children.Add(chkAll);
+
+        // applyAll이면 모든 섹션에, 아니면 현재 섹션에만 적용
+        void ForAll(Action<SectionSettings> action)
+        {
+            action(s);
+            if (applyAll) foreach (var sec in _cfg.Sections) action(sec);
+        }
+
+        sp.Children.Add(Chk("레이블 표시",  s.ShowLabel,  v => ForAll(sec => sec.ShowLabel  = v)));
+        sp.Children.Add(Chk("수치 표시",    s.ShowValues, v => ForAll(sec => sec.ShowValues = v), marginTop: 4));
+        sp.Children.Add(Chk("그래프 표시",  s.ShowGraph,  v => ForAll(sec => sec.ShowGraph  = v), marginTop: 4));
+        sp.Children.Add(Chk("텍스트를 그래프 위에 겹치기", s.Overlay, v => ForAll(sec => sec.Overlay = v), marginTop: 4));
 
         sp.Children.Add(new TextBlock { Text = "그래프 종류", Margin = new Thickness(0, 12, 0, 2) });
-        sp.Children.Add(Combo(new[] { "꺾은선", "막대" }, (int)s.Graph, i => s.Graph = (GraphKind)i));
+        sp.Children.Add(Combo(new[] { "꺾은선", "막대" }, (int)s.Graph,
+            i => ForAll(sec => sec.Graph = (GraphKind)i)));
 
         sp.Children.Add(RatioRow(s));
 

@@ -160,7 +160,8 @@ public partial class MainWindow : Window
         Vals[i].Visibility   = s.ShowValues ? Visibility.Visible : Visibility.Collapsed;
 
         var graph = Graphs[i];
-        graph.BarMode = s.Graph == GraphKind.Bar;
+        graph.Visibility = s.ShowGraph ? Visibility.Visible : Visibility.Collapsed;
+        graph.BarMode    = s.Graph == GraphKind.Bar;
 
         if (s.Overlay)
         {
@@ -186,6 +187,7 @@ public partial class MainWindow : Window
         Vals[i].Visibility   = Visibility.Visible;
 
         var graph = Graphs[i];
+        graph.Visibility = Secs[i].ShowGraph ? Visibility.Visible : Visibility.Collapsed;
         if (i < 2)  // CPU, MEM → 막대그래프 + split
         {
             graph.BarMode = true;
@@ -214,6 +216,7 @@ public partial class MainWindow : Window
         // DISK/NET 포함 모두 1px 상하 여백
         panel.Margin              = new Thickness(2, 1, 2, 1);
         panel.Visibility          = Visibility.Visible;
+        graph.Visibility          = Secs[i].ShowGraph ? Visibility.Visible : Visibility.Collapsed;
         graph.BarMode             = isBar;
         graph.Margin              = new Thickness(0);
         graph.VerticalAlignment   = VerticalAlignment.Stretch;
