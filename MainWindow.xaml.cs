@@ -155,6 +155,21 @@ public partial class MainWindow : Window
         ContextMenu = BuildContextMenu();
     }
 
+    // 섹션별 실제 표시 형식을 반영한 최악 케이스 값 텍스트 (최소폭 계산용)
+    private string RealisticValueSample(int i) => i switch
+    {
+        0 => "100%",
+        1 => (_cfg.MemShowPercent, _cfg.MemShowUsage) switch
+        {
+            (true,  true)  => "100% 99.9/99G",
+            (true,  false) => "100%",
+            (false, true)  => "99.9/99G",
+            _              => "",
+        },
+        2 => "W:999M",
+        _ => "U:999K",
+    };
+
     // 레이블/수치 텍스트가 표시될 때 잘리지 않도록 최소 창 크기 계산
     private void ApplyMinSize()
     {
@@ -172,9 +187,11 @@ public partial class MainWindow : Window
         var typeface = new Typeface(new System.Windows.Media.FontFamily(FontFamily.ToString()),
             FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
         double dpi = VisualTreeHelper.GetDpi(this).PixelsPerDip;
+        var labelNames = new[] { "CPU", "MEM", "DISK", "NET" };
         foreach (int i in vis)
         {
-            string sample = (Secs[i].ShowLabel ? "MEM" : "") + (Secs[i].ShowValues ? " 100% 100.0G" : "");
+            string sample = (Secs[i].ShowLabel ? labelNames[i] : "")
+                + (Secs[i].ShowValues ? " " + RealisticValueSample(i) : "");
             if (string.IsNullOrEmpty(sample)) continue;
             var ft = new FormattedText(sample, System.Globalization.CultureInfo.CurrentCulture,
                 System.Windows.FlowDirection.LeftToRight, typeface, Math.Max(lfs, vfs),
