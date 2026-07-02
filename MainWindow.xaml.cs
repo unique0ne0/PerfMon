@@ -542,10 +542,10 @@ public partial class MainWindow : Window
     }
 
     // ── 설정 창 열기 ─────────────────────────────────────────────────────
-    public void OpenSettings()
+    public void OpenSettings(int tabIndex = 0)
     {
         var original = _cfg.Clone();
-        var dlg = new SettingsWindow(_cfg.Clone()) { Owner = this };
+        var dlg = new SettingsWindow(_cfg.Clone(), tabIndex) { Owner = this };
         dlg.ApplyRequested = settings =>
         {
             _cfg = settings;
@@ -656,6 +656,12 @@ public partial class MainWindow : Window
         var hide = new MenuItem { Header = "숨기기" };
         hide.Click += (_, _) => Hide();
         menu.Items.Add(hide);
+
+        menu.Items.Add(new Separator());
+
+        var info = new MenuItem { Header = "정보..." };
+        info.Click += (_, _) => OpenSettings(5);
+        menu.Items.Add(info);
 
         menu.Items.Add(new Separator());
 

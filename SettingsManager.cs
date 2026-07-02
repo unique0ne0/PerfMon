@@ -37,8 +37,9 @@ public sealed class AppSettings
     public bool        ScaleText      { get; set; } = true;
     public int         UpdateMs       { get; set; } = 1000;
     public Arrangement Arrange        { get; set; } = Arrangement.Vertical;
-    public double      LabelFontSize  { get; set; } = 10;
-    public double      ValueFontSize  { get; set; } = 10;
+    public double      LabelFontSize     { get; set; } = 10;
+    public double      ValueFontSize     { get; set; } = 10;
+    public bool        UseCommonDisplay  { get; set; } = false;
 
     // 섹션
     public SectionSettings Cpu  { get; set; } = new();
@@ -55,6 +56,7 @@ public sealed class AppSettings
         Opacity = Opacity, AlwaysOnTop = AlwaysOnTop, ScaleText = ScaleText,
         UpdateMs = UpdateMs, Arrange = Arrange,
         LabelFontSize = LabelFontSize, ValueFontSize = ValueFontSize,
+        UseCommonDisplay = UseCommonDisplay,
         Cpu = Cpu.Clone(), Mem = Mem.Clone(), Disk = Disk.Clone(), Net = Net.Clone(),
     };
 }

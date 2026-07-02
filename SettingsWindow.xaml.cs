@@ -1,6 +1,8 @@
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Media;
+using WColor = System.Windows.Media.Color;
 using CheckBox = System.Windows.Controls.CheckBox;
 using ComboBox = System.Windows.Controls.ComboBox;
 using HAlign = System.Windows.HorizontalAlignment;
@@ -14,21 +16,34 @@ public partial class SettingsWindow : Window
     public AppSettings Result => _cfg;
     public Action<AppSettings>? ApplyRequested;
 
-    public SettingsWindow(AppSettings working)
+    public SettingsWindow(AppSettings working, int initialTab = 0)
     {
         InitializeComponent();
         _cfg = working;
         BuildTabs();
+        if (initialTab > 0 && initialTab < Tabs.Items.Count)
+            Tabs.SelectedIndex = initialTab;
     }
 
     private void BuildTabs()
     {
         Tabs.Items.Clear();
         Tabs.Items.Add(GeneralTab());
-        Tabs.Items.Add(SectionTab("CPU",        _cfg.Cpu));
-        Tabs.Items.Add(SectionTab("Memory",     _cfg.Mem));
-        Tabs.Items.Add(SectionTab("Disk",       _cfg.Disk));
-        Tabs.Items.Add(SectionTab("Network",    _cfg.Net));
+        Tabs.Items.Add(SectionTab("CPU",     _cfg.Cpu));
+        Tabs.Items.Add(SectionTab("Memory",  _cfg.Mem));
+        Tabs.Items.Add(SectionTab("Disk",    _cfg.Disk));
+        Tabs.Items.Add(SectionTab("Network", _cfg.Net));
+        Tabs.Items.Add(InfoTab());
+    }
+
+    // 섹션 탭만 다시 빌드 (일반·정보 탭 유지)
+    private void RefreshSectionTabs()
+    {
+        while (Tabs.Items.Count > 2) Tabs.Items.RemoveAt(1);
+        Tabs.Items.Insert(1, SectionTab("CPU",     _cfg.Cpu));
+        Tabs.Items.Insert(2, SectionTab("Memory",  _cfg.Mem));
+        Tabs.Items.Insert(3, SectionTab("Disk",    _cfg.Disk));
+        Tabs.Items.Insert(4, SectionTab("Network", _cfg.Net));
     }
 
     // ── 일반 탭 ──────────────────────────────────────────────────────────
@@ -41,36 +56,51 @@ public partial class SettingsWindow : Window
             i => _cfg.Arrange = (Arrangement)i));
 
         sp.Children.Add(new TextBlock { Text = "표시할 패널", Margin = new Thickness(0, 12, 0, 2) });
-        var grid = new UniformGrid { Columns = 2, HorizontalAlignment = HAlign.Left };
+        var panelGrid = new UniformGrid { Columns = 2, HorizontalAlignment = HAlign.Left };
         var names = new[] { "CPU", "메모리", "디스크", "네트워크" };
         for (int i = 0; i < 4; i++)
         {
             var s = _cfg.Sections[i];
-            grid.Children.Add(Chk(names[i], s.Visible, v => s.Visible = v, marginTop: 2));
+            panelGrid.Children.Add(Chk(names[i], s.Visible, v => s.Visible = v, marginTop: 2));
         }
-        sp.Children.Add(grid);
+        sp.Children.Add(panelGrid);
 
-        sp.Children.Add(new TextBlock { Text = "전체 패널 공통", Margin = new Thickness(0, 12, 0, 4),
-            FontWeight = FontWeights.SemiBold });
-        sp.Children.Add(Chk("레이블 표시",
-            _cfg.Sections.All(s => s.ShowLabel),
-            v => { foreach (var s in _cfg.Sections) s.ShowLabel = v; }));
-        sp.Children.Add(Chk("수치 표시",
-            _cfg.Sections.All(s => s.ShowValues),
-            v => { foreach (var s in _cfg.Sections) s.ShowValues = v; }, marginTop: 4));
-        sp.Children.Add(Chk("그래프 표시",
-            _cfg.Sections.All(s => s.ShowGraph),
-            v => { foreach (var s in _cfg.Sections) s.ShowGraph = v; }, marginTop: 4));
-        sp.Children.Add(Chk("텍스트 그래프 겹치기",
-            _cfg.Sections.All(s => s.Overlay),
-            v => { foreach (var s in _cfg.Sections) s.Overlay = v; }, marginTop: 4));
+        // 전체 패널 공통 마스터 체크박스
+        var chkMaster = new CheckBox
+        {
+            Content = "전체 패널 공통",
+            IsChecked = _cfg.UseCommonDisplay,
+            FontWeight = FontWeights.SemiBold,
+            Margin = new Thickness(0, 12, 0, 4),
+        };
+
+        var subPanel = new StackPanel { Margin = new Thickness(18, 0, 0, 0) };
+        var chkLabel   = Chk("레이블 표시",         _cfg.Sections.All(s => s.ShowLabel),  v => { foreach (var s in _cfg.Sections) s.ShowLabel  = v; });
+        var chkValues  = Chk("수치 표시",            _cfg.Sections.All(s => s.ShowValues), v => { foreach (var s in _cfg.Sections) s.ShowValues = v; }, marginTop: 4);
+        var chkGraph   = Chk("그래프 표시",          _cfg.Sections.All(s => s.ShowGraph),  v => { foreach (var s in _cfg.Sections) s.ShowGraph  = v; }, marginTop: 4);
+        var chkOverlay = Chk("텍스트 그래프 겹치기", _cfg.Sections.All(s => s.Overlay),    v => { foreach (var s in _cfg.Sections) s.Overlay    = v; }, marginTop: 4);
+        subPanel.Children.Add(chkLabel);
+        subPanel.Children.Add(chkValues);
+        subPanel.Children.Add(chkGraph);
+        subPanel.Children.Add(chkOverlay);
+
+        void UpdateSub(bool on)
+        {
+            chkLabel.IsEnabled = chkValues.IsEnabled = chkGraph.IsEnabled = chkOverlay.IsEnabled = on;
+        }
+        UpdateSub(_cfg.UseCommonDisplay);
+
+        chkMaster.Checked   += (_, _) => { _cfg.UseCommonDisplay = true;  UpdateSub(true);  RefreshSectionTabs(); };
+        chkMaster.Unchecked += (_, _) => { _cfg.UseCommonDisplay = false; UpdateSub(false); RefreshSectionTabs(); };
+
+        sp.Children.Add(chkMaster);
+        sp.Children.Add(subPanel);
 
         sp.Children.Add(Chk("항상 위 표시", _cfg.AlwaysOnTop, v => _cfg.AlwaysOnTop = v, marginTop: 12));
         sp.Children.Add(Chk("글자도 창 크기에 맞춰 스케일", _cfg.ScaleText, v => _cfg.ScaleText = v));
 
         sp.Children.Add(SliderRow("투명도", 0.1, 1.0, _cfg.Opacity, 0.05,
             v => $"{v * 100:0}%", v => _cfg.Opacity = v));
-
         sp.Children.Add(SliderRow("레이블 폰트 크기", 7, 20, _cfg.LabelFontSize, 1,
             v => $"{v:0}px", v => _cfg.LabelFontSize = v));
         sp.Children.Add(SliderRow("수치 폰트 크기", 7, 20, _cfg.ValueFontSize, 1,
@@ -82,9 +112,9 @@ public partial class SettingsWindow : Window
         sp.Children.Add(Combo(new[] { "빠름 (0.5초)", "보통 (1초)", "느림 (2초)" }, sel,
             i => _cfg.UpdateMs = ms[i]));
 
-        return new TabItem { Header = "일반", Content = new System.Windows.Controls.ScrollViewer
+        return new TabItem { Header = "일반", Content = new ScrollViewer
         {
-            VerticalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Auto,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
             Content = sp,
         }};
     }
@@ -94,38 +124,62 @@ public partial class SettingsWindow : Window
     {
         var sp = new StackPanel { Margin = new Thickness(12) };
 
-        // 공통 적용 체크박스
-        bool applyAll = false;
-        var chkAll = new CheckBox
+        sp.Children.Add(new TextBlock
         {
-            Content = "모든 패널에 공통 적용",
-            IsChecked = false,
+            Text = "표시 설정",
             FontWeight = FontWeights.SemiBold,
-            Margin = new Thickness(0, 0, 0, 10),
-        };
-        chkAll.Checked   += (_, _) => applyAll = true;
-        chkAll.Unchecked += (_, _) => applyAll = false;
-        sp.Children.Add(chkAll);
+            Margin = new Thickness(0, 0, 0, 8),
+        });
 
-        // applyAll이면 모든 섹션에, 아니면 현재 섹션에만 적용
-        void ForAll(Action<SectionSettings> action)
-        {
-            action(s);
-            if (applyAll) foreach (var sec in _cfg.Sections) action(sec);
-        }
+        var chkLabel   = Chk("레이블 표시",                  s.ShowLabel,  v => s.ShowLabel  = v);
+        var chkValues  = Chk("수치 표시",                    s.ShowValues, v => s.ShowValues = v, marginTop: 4);
+        var chkGraph   = Chk("그래프 표시",                  s.ShowGraph,  v => s.ShowGraph  = v, marginTop: 4);
+        var chkOverlay = Chk("텍스트를 그래프 위에 겹치기",  s.Overlay,    v => s.Overlay    = v, marginTop: 4);
 
-        sp.Children.Add(Chk("레이블 표시",  s.ShowLabel,  v => ForAll(sec => sec.ShowLabel  = v)));
-        sp.Children.Add(Chk("수치 표시",    s.ShowValues, v => ForAll(sec => sec.ShowValues = v), marginTop: 4));
-        sp.Children.Add(Chk("그래프 표시",  s.ShowGraph,  v => ForAll(sec => sec.ShowGraph  = v), marginTop: 4));
-        sp.Children.Add(Chk("텍스트를 그래프 위에 겹치기", s.Overlay, v => ForAll(sec => sec.Overlay = v), marginTop: 4));
+        // 전체 공통 모드면 개별 패널 표시 설정 비활성화
+        if (_cfg.UseCommonDisplay)
+            chkLabel.IsEnabled = chkValues.IsEnabled = chkGraph.IsEnabled = chkOverlay.IsEnabled = false;
+
+        sp.Children.Add(chkLabel);
+        sp.Children.Add(chkValues);
+        sp.Children.Add(chkGraph);
+        sp.Children.Add(chkOverlay);
 
         sp.Children.Add(new TextBlock { Text = "그래프 종류", Margin = new Thickness(0, 12, 0, 2) });
-        sp.Children.Add(Combo(new[] { "꺾은선", "막대" }, (int)s.Graph,
-            i => ForAll(sec => sec.Graph = (GraphKind)i)));
+        sp.Children.Add(Combo(new[] { "꺾은선", "막대" }, (int)s.Graph, i => s.Graph = (GraphKind)i));
 
         sp.Children.Add(RatioRow(s));
 
         return new TabItem { Header = header, Content = sp };
+    }
+
+    // ── 정보 탭 ──────────────────────────────────────────────────────────
+    private static TabItem InfoTab()
+    {
+        var sp = new StackPanel { Margin = new Thickness(24), HorizontalAlignment = HAlign.Left };
+
+        sp.Children.Add(new TextBlock
+        {
+            Text = "Performance Monitor",
+            FontSize = 15,
+            FontWeight = FontWeights.Bold,
+        });
+        sp.Children.Add(new TextBlock
+        {
+            Text = "v0.8.6",
+            FontSize = 12,
+            Foreground = new SolidColorBrush(WColor.FromRgb(0x88, 0x88, 0x88)),
+            Margin = new Thickness(0, 2, 0, 20),
+        });
+        sp.Children.Add(new TextBlock { Text = "Author", FontWeight = FontWeights.SemiBold });
+        sp.Children.Add(new TextBlock { Text = "멋진독특", Margin = new Thickness(0, 6, 0, 2) });
+        sp.Children.Add(new TextBlock
+        {
+            Text = "blu2tem@gmail.com",
+            Foreground = new SolidColorBrush(WColor.FromRgb(0x00, 0x78, 0xD7)),
+        });
+
+        return new TabItem { Header = "정보", Content = sp };
     }
 
     // ── 공통 컨트롤 헬퍼 ─────────────────────────────────────────────────

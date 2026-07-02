@@ -67,7 +67,10 @@ public partial class App : System.Windows.Application
         menu.Items.Add(restorePos);
 
         menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("재실행").Click   += (_, _) => Restart();
         menu.Items.Add("완전 종료").Click += (_, _) => FullExit();
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("정보...").Click  += (_, _) => { _window?.Show(); _window?.OpenSettings(5); };
 
         _tray = new NotifyIcon { Icon = icon, Text = "PerfMon Overlay", Visible = true, ContextMenuStrip = menu };
         _tray.DoubleClick += (_, _) => ToggleWindow();
