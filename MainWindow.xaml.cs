@@ -45,6 +45,31 @@ public partial class MainWindow : Window
     private const uint SWP_NOSIZE     = 0x0001;
     private const uint SWP_NOACTIVATE = 0x0010;
 
+    // WM_WINDOWPOSCHANGING 후킹 — Windows가 Z-order를 바꾸려 할 때 TOPMOST 강제 유지
+    private const int WM_WINDOWPOSCHANGING = 0x0046;
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WINDOWPOS { public IntPtr hwnd, hwndInsertAfter; public int x, y, cx, cy, flags; }
+
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+        HwndSource.FromHwnd(new WindowInteropHelper(this).Handle)?.AddHook(WndProc);
+    }
+
+    private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (msg == WM_WINDOWPOSCHANGING && _cfg.AlwaysOnTop)
+        {
+            var pos = Marshal.PtrToStructure<WINDOWPOS>(lParam);
+            if (pos.hwndInsertAfter != HWND_TOPMOST)
+            {
+                pos.hwndInsertAfter = HWND_TOPMOST;
+                Marshal.StructureToPtr(pos, lParam, false);
+            }
+        }
+        return IntPtr.Zero;
+    }
+
     public MainWindow()
     {
         InitializeComponent();
