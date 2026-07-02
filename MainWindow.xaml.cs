@@ -375,7 +375,6 @@ public partial class MainWindow : Window
         panel.RowDefinitions.Clear();
         panel.ColumnDefinitions.Clear();
         panel.ColumnDefinitions.Add(new ColumnDefinition { Width = showLabel ? new GridLength(_labelColW) : new GridLength(0) });
-        panel.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
         label.Visibility          = showLabel ? Visibility.Visible : Visibility.Collapsed;
         label.VerticalAlignment   = VerticalAlignment.Center;
@@ -386,24 +385,27 @@ public partial class MainWindow : Window
 
         vals.Visibility          = showVals ? Visibility.Visible : Visibility.Collapsed;
         vals.VerticalAlignment   = VerticalAlignment.Center;
-        vals.Margin              = new Thickness(0);
         System.Windows.Controls.Panel.SetZIndex(vals, 1);
-
-        Grid.SetColumn(graph, 1);
+        Grid.SetRow(vals, 0);
         Grid.SetRow(graph, 0);
 
         if (both && !s.Overlay)
         {
-            // 좌우 분리: [레이블(auto)|그래프(*)|수치(auto)]
+            // 좌우 분리: [레이블(고정폭)|수치(auto)|그래프(*)] — 수치가 그래프보다 좌측
             panel.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            Grid.SetColumn(vals, 2);
+            panel.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            Grid.SetColumn(vals, 1);
             vals.HorizontalAlignment = HAlign.Left;
-            vals.Margin = new Thickness(3, 0, 0, 0);
+            vals.Margin = new Thickness(0, 0, 4, 0);
+            Grid.SetColumn(graph, 2);
         }
         else
         {
-            // 겹치기(둘 다 켜짐+Overlay) 또는 단독 표시: 그래프 칸에 위치
+            // 겹치기(둘 다 켜짐+Overlay) 또는 단독 표시: 같은 칸(그래프 칸) 공유
+            panel.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             Grid.SetColumn(vals, 1);
+            Grid.SetColumn(graph, 1);
+            vals.Margin = new Thickness(0);
             vals.HorizontalAlignment = showGraph ? HAlign.Right : HAlign.Left;
         }
 
