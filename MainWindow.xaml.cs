@@ -148,12 +148,73 @@ public partial class MainWindow : Window
         ApplyAlwaysOnTop(_cfg.AlwaysOnTop);
 
         ApplyFontSizes();
+        ApplyMinSize();
         ContextMenu = BuildContextMenu();
+    }
+
+    // 레이블/수치 텍스트가 표시될 때 잘리지 않도록 최소 창 크기 계산
+    private void ApplyMinSize()
+    {
+        var vis = new System.Collections.Generic.List<int>();
+        for (int i = 0; i < 4; i++) if (Secs[i].Visible) vis.Add(i);
+        if (vis.Count == 0) { MinWidth = 50; MinHeight = 40; return; }
+
+        double lfs = _cfg.LabelFontSize, vfs = _cfg.ValueFontSize;
+        bool anyLabel = vis.Exists(i => Secs[i].ShowLabel);
+        bool anyValue = vis.Exists(i => Secs[i].ShowValues);
+        double textRowH = Math.Max(anyLabel ? lfs : 0, anyValue ? vfs : 0);
+        double minPanelH = textRowH > 0 ? textRowH + 8 : 16;
+
+        double maxTextW = 0;
+        var typeface = new Typeface(new System.Windows.Media.FontFamily(FontFamily.ToString()),
+            FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
+        double dpi = VisualTreeHelper.GetDpi(this).PixelsPerDip;
+        foreach (int i in vis)
+        {
+            string sample = (Secs[i].ShowLabel ? "MEM" : "") + (Secs[i].ShowValues ? " 100% 100.0G" : "");
+            if (string.IsNullOrEmpty(sample)) continue;
+            var ft = new FormattedText(sample, System.Globalization.CultureInfo.CurrentCulture,
+                System.Windows.FlowDirection.LeftToRight, typeface, Math.Max(lfs, vfs),
+                System.Windows.Media.Brushes.Black, dpi);
+            maxTextW = Math.Max(maxTextW, ft.Width);
+        }
+        double minPanelW = Math.Max(40, maxTextW + 12);
+
+        switch (_cfg.Arrange)
+        {
+            case Arrangement.Horizontal:
+                MinWidth  = vis.Count * minPanelW + (vis.Count - 1) + 4;
+                MinHeight = minPanelH + 8;
+                break;
+            case Arrangement.Grid2x2:
+                int cols = vis.Count >= 2 ? 2 : 1;
+                int rows = (vis.Count + cols - 1) / cols;
+                MinWidth  = cols * minPanelW + (cols - 1) + 4;
+                MinHeight = rows * minPanelH + (rows - 1) + 4;
+                break;
+            case Arrangement.Compact:
+                MinWidth  = minPanelW;
+                MinHeight = minPanelH * 3 + 8;
+                break;
+            case Arrangement.Mini:
+                MinWidth  = minPanelW;
+                MinHeight = vis.Count * Math.Max(14, minPanelH * 0.6) + (vis.Count - 1) + 4;
+                break;
+            default: // Vertical
+                MinWidth  = minPanelW;
+                MinHeight = vis.Count * minPanelH + (vis.Count - 1) + 4;
+                break;
+        }
+
+        MinWidth  = Math.Max(30, MinWidth);
+        MinHeight = Math.Max(24, MinHeight);
     }
 
     private void ConfigurePanel(int i)
     {
         var s = Secs[i];
+        RestoreIntoHeader(i);
+
         Panels[i].Margin     = PanelMargin[i];
         Panels[i].Visibility = s.Visible    ? Visibility.Visible : Visibility.Collapsed;
         Labels[i].Visibility = s.ShowLabel  ? Visibility.Visible : Visibility.Collapsed;
@@ -176,80 +237,138 @@ public partial class MainWindow : Window
         {
             SplitPanel(Panels[i], Hdrs[i], graph);
         }
+
+        SetTextBacking(Vals[i], s.Overlay && s.ShowGraph && s.ShowValues);
     }
 
     // ── 컴팩트 모드: CPU/MEM 막대+split, DISK/NET 꺽은선 ─────────────────
     private void ConfigurePanelCompact(int i)
     {
+        var s = Secs[i];
+        RestoreIntoHeader(i);
+
         Panels[i].Margin     = PanelMargin[i];
         Panels[i].Visibility = Visibility.Visible;
         Labels[i].Visibility = Visibility.Visible;
         Vals[i].Visibility   = Visibility.Visible;
 
         var graph = Graphs[i];
-        graph.Visibility = Secs[i].ShowGraph ? Visibility.Visible : Visibility.Collapsed;
+        graph.Visibility = s.ShowGraph ? Visibility.Visible : Visibility.Collapsed;
+        bool overlay;
         if (i < 2)  // CPU, MEM → 막대그래프 + split
         {
             graph.BarMode = true;
             SplitPanel(Panels[i], Hdrs[i], graph);
+            overlay = false;
         }
         else        // DISK, NET → 꺽은선 + 섹션 설정 따름
         {
             graph.BarMode = false;
-            if (Secs[i].Overlay)
+            overlay = s.Overlay;
+            if (overlay)
                 RestorePanelOverlay(Panels[i], Hdrs[i], graph);
             else
                 SplitPanel(Panels[i], Hdrs[i], graph);
         }
+
+        SetTextBacking(Vals[i], overlay && s.ShowGraph);
     }
 
-    // ── 미니 모드: [레이블 | 가로막대] 수평 배치 ────────────────────────
+    // 레이블/수치를 hdr(겹침 컨테이너)로 되돌림 — 미니 모드에서 분리 배치했던 것을 복원
+    private void RestoreIntoHeader(int i)
+    {
+        var hdr = (System.Windows.Controls.Panel)Hdrs[i];
+        hdr.Visibility = Visibility.Visible;
+        ReparentInto(Labels[i], hdr);
+        ReparentInto(Vals[i],   hdr);
+        Vals[i].HorizontalAlignment = HAlign.Right;
+        Vals[i].Margin              = new Thickness(0);
+        System.Windows.Controls.Panel.SetZIndex(Vals[i], 0);
+    }
+
+    private static void ReparentInto(FrameworkElement el, System.Windows.Controls.Panel newParent)
+    {
+        if (ReferenceEquals(el.Parent, newParent)) return;
+        if (el.Parent is System.Windows.Controls.Panel old) old.Children.Remove(el);
+        newParent.Children.Add(el);
+    }
+
+    // 그래프 위에 수치가 겹칠 때 가독성을 위한 반투명 배경
+    private static void SetTextBacking(FrameworkElement el, bool on)
+    {
+        if (!on) { if (el is System.Windows.Controls.Panel p) p.Background = null; return; }
+        var brush = new SolidColorBrush(WColor.FromArgb(140, 0, 0, 0));
+        brush.Freeze();
+        if (el is System.Windows.Controls.Panel panel) panel.Background = brush;
+    }
+
+    // ── 미니 모드: [레이블 | 그래프/수치] 수평 배치 ─────────────────────
+    // 레이블 끄면 해당 칸 폭 0 → 그래프/수치가 전체 폭 사용
+    // 그래프+수치 모두 켜지면 Overlay 설정에 따라 겹치기/좌우분리
     private void ConfigurePanelMini(int i)
     {
+        var s     = Secs[i];
         var panel = Panels[i];
-        var hdr   = Hdrs[i];
+        var hdr   = (System.Windows.Controls.Panel)Hdrs[i];
         var graph = Graphs[i];
+        var label = Labels[i];
+        var vals  = Vals[i];
 
-        bool isBar = Secs[i].Graph == GraphKind.Bar;
+        bool isBar     = s.Graph == GraphKind.Bar;
+        bool showGraph = s.ShowGraph;
+        bool showVals  = s.ShowValues;
+        bool showLabel = s.ShowLabel;
+        bool both      = showGraph && showVals;
 
-        // DrawBar 내부에서 이미 60% 높이로 그리므로 Stretch 유지
-        // DISK/NET 포함 모두 1px 상하 여백
-        bool showGraph = Secs[i].ShowGraph;
-        bool showVals  = Secs[i].ShowValues;
+        panel.Margin     = new Thickness(2, 1, 2, 1);
+        panel.Visibility = Visibility.Visible;
+        hdr.Visibility   = Visibility.Collapsed; // 겹침 컨테이너 대신 레이블/수치를 패널에 직접 배치
 
-        panel.Margin              = new Thickness(2, 1, 2, 1);
-        panel.Visibility          = Visibility.Visible;
+        ReparentInto(label, panel);
+        ReparentInto(vals,  panel);
+
         graph.Visibility          = showGraph ? Visibility.Visible : Visibility.Collapsed;
         graph.BarMode             = isBar;
         graph.Margin              = new Thickness(0);
         graph.VerticalAlignment   = VerticalAlignment.Stretch;
         graph.HorizontalAlignment = HAlign.Stretch;
 
-        // 패널 내부를 2열로 재구성: [레이블(auto) | 그래프/수치(*)]
         panel.RowDefinitions.Clear();
         panel.ColumnDefinitions.Clear();
-        panel.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        panel.ColumnDefinitions.Add(new ColumnDefinition { Width = showLabel ? GridLength.Auto : new GridLength(0) });
         panel.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-        hdr.Visibility          = Visibility.Visible;
-        hdr.VerticalAlignment   = VerticalAlignment.Center;
-        hdr.HorizontalAlignment = HAlign.Left;
-        hdr.Margin              = new Thickness(0, 0, 3, 0);
-        Grid.SetColumn(hdr, 0);
-        Grid.SetRow(hdr, 0);
+        label.Visibility          = showLabel ? Visibility.Visible : Visibility.Collapsed;
+        label.VerticalAlignment   = VerticalAlignment.Center;
+        label.HorizontalAlignment = HAlign.Left;
+        label.Margin              = new Thickness(0, 0, showLabel ? 3 : 0, 0);
+        Grid.SetColumn(label, 0);
+        Grid.SetRow(label, 0);
 
-        Labels[i].Visibility = Visibility.Visible;
-
-        var vals = Vals[i];
         vals.Visibility          = showVals ? Visibility.Visible : Visibility.Collapsed;
-        vals.HorizontalAlignment = showGraph ? HAlign.Right : HAlign.Left;
         vals.VerticalAlignment   = VerticalAlignment.Center;
-        Grid.SetColumn(vals, 1);
-        Grid.SetRow(vals, 0);
+        vals.Margin              = new Thickness(0);
         System.Windows.Controls.Panel.SetZIndex(vals, 1);
 
         Grid.SetColumn(graph, 1);
         Grid.SetRow(graph, 0);
+
+        if (both && !s.Overlay)
+        {
+            // 좌우 분리: [레이블(auto)|그래프(*)|수치(auto)]
+            panel.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            Grid.SetColumn(vals, 2);
+            vals.HorizontalAlignment = HAlign.Left;
+            vals.Margin = new Thickness(3, 0, 0, 0);
+        }
+        else
+        {
+            // 겹치기(둘 다 켜짐+Overlay) 또는 단독 표시: 그래프 칸에 위치
+            Grid.SetColumn(vals, 1);
+            vals.HorizontalAlignment = showGraph ? HAlign.Right : HAlign.Left;
+        }
+
+        SetTextBacking(vals, both && s.Overlay);
     }
 
     // 패널 내부 = 단일 셀(그래프 위에 헤더 겹침)
