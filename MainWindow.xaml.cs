@@ -214,15 +214,18 @@ public partial class MainWindow : Window
 
         // DrawBar 내부에서 이미 60% 높이로 그리므로 Stretch 유지
         // DISK/NET 포함 모두 1px 상하 여백
+        bool showGraph = Secs[i].ShowGraph;
+        bool showVals  = Secs[i].ShowValues;
+
         panel.Margin              = new Thickness(2, 1, 2, 1);
         panel.Visibility          = Visibility.Visible;
-        graph.Visibility          = Secs[i].ShowGraph ? Visibility.Visible : Visibility.Collapsed;
+        graph.Visibility          = showGraph ? Visibility.Visible : Visibility.Collapsed;
         graph.BarMode             = isBar;
         graph.Margin              = new Thickness(0);
         graph.VerticalAlignment   = VerticalAlignment.Stretch;
         graph.HorizontalAlignment = HAlign.Stretch;
 
-        // 패널 내부를 2열로 재구성: [레이블(auto) | 그래프(*)]
+        // 패널 내부를 2열로 재구성: [레이블(auto) | 그래프/수치(*)]
         panel.RowDefinitions.Clear();
         panel.ColumnDefinitions.Clear();
         panel.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -236,7 +239,14 @@ public partial class MainWindow : Window
         Grid.SetRow(hdr, 0);
 
         Labels[i].Visibility = Visibility.Visible;
-        Vals[i].Visibility   = Visibility.Collapsed;
+
+        var vals = Vals[i];
+        vals.Visibility          = showVals ? Visibility.Visible : Visibility.Collapsed;
+        vals.HorizontalAlignment = showGraph ? HAlign.Right : HAlign.Left;
+        vals.VerticalAlignment   = VerticalAlignment.Center;
+        Grid.SetColumn(vals, 1);
+        Grid.SetRow(vals, 0);
+        System.Windows.Controls.Panel.SetZIndex(vals, 1);
 
         Grid.SetColumn(graph, 1);
         Grid.SetRow(graph, 0);
