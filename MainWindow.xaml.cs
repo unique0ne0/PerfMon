@@ -51,10 +51,36 @@ public partial class MainWindow : Window
     [StructLayout(LayoutKind.Sequential)]
     private struct WINDOWPOS { public IntPtr hwnd, hwndInsertAfter; public int x, y, cx, cy, flags; }
 
+    // 작업표시줄 클릭 시 작업표시줄이 topmost 밴드 맨 위로 올라가는데, 이때 우리 창에는
+    // 아무 메시지도 오지 않음 → 전역 포그라운드 전환 이벤트를 받아 즉시 TOPMOST 재주장
+    [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint evMin, uint evMax, IntPtr hmod, WinEventDelegate proc, uint pid, uint tid, uint flags);
+    [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr hHook);
+    private delegate void WinEventDelegate(IntPtr hHook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time);
+    private const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+    private WinEventDelegate? _fgHookProc; // GC 수거 방지용 참조
+    private IntPtr _fgHook;
+
     protected override void OnSourceInitialized(EventArgs e)
     {
         base.OnSourceInitialized(e);
         HwndSource.FromHwnd(new WindowInteropHelper(this).Handle)?.AddHook(WndProc);
+
+        _fgHookProc = OnForegroundChanged;
+        _fgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+            IntPtr.Zero, _fgHookProc, 0, 0, 0 /* WINEVENT_OUTOFCONTEXT */);
+    }
+
+    private void OnForegroundChanged(IntPtr hHook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
+    {
+        if (_cfg.AlwaysOnTop && hwnd != new WindowInteropHelper(this).Handle)
+            AssertTopmost();
+    }
+
+    private void AssertTopmost()
+    {
+        var hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd != IntPtr.Zero)
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
     private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -96,10 +122,10 @@ public partial class MainWindow : Window
     public void ApplyAlwaysOnTop(bool on)
     {
         Topmost = on;
+        if (on) { AssertTopmost(); return; }
         var hwnd = new WindowInteropHelper(this).Handle;
         if (hwnd != IntPtr.Zero)
-            SetWindowPos(hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST,
-                0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
     // ── Pass Through ─────────────────────────────────────────────────────
@@ -657,6 +683,9 @@ public partial class MainWindow : Window
     // ── 데이터 수집 ──────────────────────────────────────────────────────
     private void OnTick(object? sender, EventArgs e)
     {
+        // 포그라운드 이벤트를 놓친 경우(작업표시줄 자동 상승 등) 대비 주기적 재주장
+        if (_cfg.AlwaysOnTop && IsVisible) AssertTopmost();
+
         var d = _monitor.Collect();
 
         vCpu.Text   = $"{d.Cpu:F0}%";
@@ -908,6 +937,7 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        if (_fgHook != IntPtr.Zero) { UnhookWinEvent(_fgHook); _fgHook = IntPtr.Zero; }
         _timer.Stop();
         _monitor.Dispose();
         base.OnClosed(e);
