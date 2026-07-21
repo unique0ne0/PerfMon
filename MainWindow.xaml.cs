@@ -107,6 +107,10 @@ public partial class MainWindow : Window
         _timer.Tick += OnTick;
         _timer.Start();
 
+        // 우클릭 메뉴는 열릴 때마다 통합 모델로 재생성 → 체크 상태 최신 반영
+        ContextMenu = new ContextMenu();
+        ContextMenuOpening += (_, _) => MenuRenderer.FillWpf(ContextMenu, BuildMenuModel());
+
         Loaded += (_, _) => { LoadSettings(); _loaded = true; };
     }
 
@@ -179,7 +183,7 @@ public partial class MainWindow : Window
         ApplyFontSizes();
         ApplyColors();
         ApplyMinSize();
-        ContextMenu = BuildContextMenu();
+        // ContextMenu는 생성자에서 ContextMenuOpening 시 재생성 (여기서 재설정 불필요)
     }
 
     // ── 섹션별 색상 적용 ─────────────────────────────────────────────────
@@ -842,106 +846,85 @@ public partial class MainWindow : Window
         SettingsManager.Save(_cfg);
     }
 
-    // ── 컨텍스트 메뉴 (빠른 토글 + 설정창) ───────────────────────────────
-    public ContextMenu BuildContextMenu()
+    // ── 통합 컨텍스트 메뉴 모델 (트레이·오버레이 공용) ───────────────────
+    // 프레임워크 독립 MenuNode 트리로 정의 → MenuRenderer가 WPF/WinForms로 렌더.
+    public IReadOnlyList<MenuNode> BuildMenuModel()
     {
-        var menu = new ContextMenu();
+        var app = (App)System.Windows.Application.Current;
 
-        var settings = new MenuItem { Header = "설정..." };
-        settings.Click += (_, _) => OpenSettings();
-        menu.Items.Add(settings);
-
-        menu.Items.Add(new Separator());
-
-        var opHeader = new MenuItem { Header = "투명도", IsEnabled = false };
-        menu.Items.Add(opHeader);
-        foreach (var (label, val) in new (string, double)[]
-            { ("30%", 0.3), ("50%", 0.5), ("70%", 0.7), ("85%", 0.85), ("100%", 1.0) })
+        var opacity = new (string, double)[]
+            { ("30%", 0.3), ("50%", 0.5), ("70%", 0.7), ("85%", 0.85), ("100%", 1.0) };
+        var opacityItems = new List<MenuNode>();
+        foreach (var (label, v) in opacity)
         {
-            double v = val;
-            var item = new MenuItem { Header = label, IsCheckable = true, IsChecked = Math.Abs(_cfg.Opacity - v) < 0.001 };
-            item.Click += (_, _) => { _cfg.Opacity = v; Opacity = v; SettingsManager.Save(_cfg); };
-            menu.Items.Add(item);
+            double val = v;
+            opacityItems.Add(new MenuItemNode(label,
+                () => { _cfg.Opacity = val; Opacity = val; SettingsManager.Save(_cfg); },
+                Checkable: true, Checked: () => Math.Abs(_cfg.Opacity - val) < 0.001));
         }
-        menu.Items.Add(new Separator());
 
-        var aot = new MenuItem { Header = "항상 위 표시", IsCheckable = true, IsChecked = _cfg.AlwaysOnTop };
-        aot.Click += (_, _) => { _cfg.AlwaysOnTop = aot.IsChecked; ApplyAlwaysOnTop(aot.IsChecked); SettingsManager.Save(_cfg); };
-        menu.Items.Add(aot);
-
-        var passItem = new MenuItem { Header = "클릭 무시 (Pass Through)", IsCheckable = true, IsChecked = _passThrough };
-        passItem.Click += (_, _) => SetPassThrough(passItem.IsChecked);
-        menu.Items.Add(passItem);
-
-        var resizeItem = new MenuItem { Header = "사이즈 조절 모드", IsCheckable = true, IsChecked = _resizeActive };
-        resizeItem.Click += (_, _) => SetResizeActive(resizeItem.IsChecked);
-        menu.Items.Add(resizeItem);
-
-        menu.Items.Add(new Separator());
-
-        var arrHeader = new MenuItem { Header = "배치", IsEnabled = false };
-        menu.Items.Add(arrHeader);
-        foreach (var (label, mode) in new (string, Arrangement)[]
-            {
-                ("세로 1열",    Arrangement.Vertical),
-                ("2×2 그리드",  Arrangement.Grid2x2),
-                ("가로 1줄",    Arrangement.Horizontal),
-                ("컴팩트 모드", Arrangement.Compact),
-                ("미니 모드",   Arrangement.Mini),
-            })
+        var arrange = new (string, Arrangement)[]
+        {
+            ("세로 1열",    Arrangement.Vertical),
+            ("2×2 그리드",  Arrangement.Grid2x2),
+            ("가로 1줄",    Arrangement.Horizontal),
+            ("컴팩트 모드", Arrangement.Compact),
+            ("미니 모드",   Arrangement.Mini),
+        };
+        var arrangeItems = new List<MenuNode>();
+        foreach (var (label, mode) in arrange)
         {
             var m = mode;
-            var item = new MenuItem { Header = label, IsCheckable = true, IsChecked = _cfg.Arrange == mode };
-            item.Click += (_, _) => { _cfg.Arrange = m; QuickApply(); };
-            menu.Items.Add(item);
+            arrangeItems.Add(new MenuItemNode(label,
+                () => { _cfg.Arrange = m; QuickApply(); },
+                Checkable: true, Checked: () => _cfg.Arrange == m));
         }
 
-        menu.Items.Add(new Separator());
-
-        var panelHeader = new MenuItem { Header = "패널 표시", IsEnabled = false };
-        menu.Items.Add(panelHeader);
-        foreach (var (label, idx) in new (string, int)[]
-            { ("CPU", 0), ("메모리", 1), ("디스크", 2), ("네트워크", 3) })
+        var panels = new (string, int)[]
+            { ("CPU", 0), ("메모리", 1), ("디스크", 2), ("네트워크", 3) };
+        var panelItems = new List<MenuNode>();
+        foreach (var (label, idx) in panels)
         {
             int i = idx;
-            var item = new MenuItem { Header = label, IsCheckable = true, IsChecked = Secs[i].Visible };
-            item.Click += (_, _) => { Secs[i].Visible = item.IsChecked; QuickApply(); };
-            menu.Items.Add(item);
+            panelItems.Add(new MenuItemNode(label,
+                () => { Secs[i].Visible = !Secs[i].Visible; QuickApply(); },
+                Checkable: true, Checked: () => Secs[i].Visible));
         }
 
-        bool allVals = _cfg.Sections.All(s => s.ShowValues);
-        var valuesItem = new MenuItem { Header = "수치 보기", IsCheckable = true, IsChecked = allVals };
-        valuesItem.Click += (_, _) =>
+        return new List<MenuNode>
         {
-            bool on = valuesItem.IsChecked;
-            foreach (var s in _cfg.Sections) s.ShowValues = on;
-            QuickApply();
+            new MenuItemNode("설정...", () => OpenSettings()),
+            new MenuSepNode(),
+            new MenuSubNode("투명도", opacityItems),
+            new MenuSepNode(),
+            new MenuItemNode("항상 위 표시",
+                () => { _cfg.AlwaysOnTop = !_cfg.AlwaysOnTop; ApplyAlwaysOnTop(_cfg.AlwaysOnTop); SettingsManager.Save(_cfg); },
+                Checkable: true, Checked: () => _cfg.AlwaysOnTop),
+            new MenuItemNode("클릭 무시 (Pass Through)",
+                () => SetPassThrough(!_passThrough),
+                Checkable: true, Checked: () => _passThrough),
+            new MenuItemNode("사이즈 조절 모드",
+                () => SetResizeActive(!_resizeActive),
+                Checkable: true, Checked: () => _resizeActive),
+            new MenuSepNode(),
+            new MenuSubNode("배치", arrangeItems),
+            new MenuSubNode("패널 표시", panelItems),
+            new MenuItemNode("수치 보기",
+                () => { bool on = !_cfg.Sections.All(s => s.ShowValues); foreach (var s in _cfg.Sections) s.ShowValues = on; QuickApply(); },
+                Checkable: true, Checked: () => _cfg.Sections.All(s => s.ShowValues)),
+            new MenuSepNode(),
+            new MenuItemNode("보이기 / 숨기기", () => app.ToggleWindow()),
+            new MenuItemNode("시작프로그램 등록",
+                () => AutoStartHelper.Set(!AutoStartHelper.IsEnabled()),
+                Checkable: true, Checked: AutoStartHelper.IsEnabled),
+            new MenuItemNode("현재 위치 저장", () => SavePosition()),
+            new MenuItemNode("위치 복구",     () => RestorePosition()),
+            new MenuSepNode(),
+            new MenuItemNode("정보...", () => OpenSettings(5)),
+            new MenuSepNode(),
+            new MenuItemNode("재실행",   () => app.Restart()),
+            new MenuItemNode("완전 종료", () => app.FullExit()),
         };
-        menu.Items.Add(valuesItem);
-
-        menu.Items.Add(new Separator());
-
-        var hide = new MenuItem { Header = "숨기기" };
-        hide.Click += (_, _) => Hide();
-        menu.Items.Add(hide);
-
-        menu.Items.Add(new Separator());
-
-        var info = new MenuItem { Header = "정보..." };
-        info.Click += (_, _) => OpenSettings(5);
-        menu.Items.Add(info);
-
-        menu.Items.Add(new Separator());
-
-        var restart = new MenuItem { Header = "재시작" };
-        restart.Click += (_, _) => ((App)System.Windows.Application.Current).Restart();
-        menu.Items.Add(restart);
-
-        var exit = new MenuItem { Header = "종료" };
-        exit.Click += (_, _) => ((App)System.Windows.Application.Current).FullExit();
-        menu.Items.Add(exit);
-
-        return menu;
     }
 
     private void ApplyFontSizes()

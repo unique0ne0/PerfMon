@@ -40,37 +40,12 @@ public partial class App : System.Windows.Application
     {
         var icon = CreatePulseIcon();
 
+        // 트레이 메뉴 = 오버레이와 동일한 통합 모델. 열릴 때마다 최신 체크 상태로 재구성.
         var menu = new ContextMenuStrip();
-        menu.Items.Add("설정...").Click += (_, _) => { _window?.Show(); _window?.OpenSettings(); };
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("보이기 / 숨기기").Click += (_, _) => ToggleWindow();
-        menu.Items.Add(new ToolStripSeparator());
-
-        var passThru = new ToolStripMenuItem("클릭 무시 (Pass Through)") { CheckOnClick = true };
-        passThru.CheckedChanged += (_, _) => _window?.SetPassThrough(passThru.Checked);
-        menu.Opening += (_, _) => passThru.Checked = _window?.IsPassThrough ?? false;
-        menu.Items.Add(passThru);
-        menu.Items.Add(new ToolStripSeparator());
-
-        var autoStart = new ToolStripMenuItem("시작프로그램 등록") { CheckOnClick = true, Checked = AutoStartHelper.IsEnabled() };
-        autoStart.CheckedChanged += (_, _) => AutoStartHelper.Set(autoStart.Checked);
-        menu.Items.Add(autoStart);
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(new ToolStripSeparator());
-
-        var savePos = new ToolStripMenuItem("현재 위치 저장");
-        savePos.Click += (_, _) => _window?.SavePosition();
-        menu.Items.Add(savePos);
-
-        var restorePos = new ToolStripMenuItem("위치 복구");
-        restorePos.Click += (_, _) => _window?.RestorePosition();
-        menu.Items.Add(restorePos);
-
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("재실행").Click   += (_, _) => Restart();
-        menu.Items.Add("완전 종료").Click += (_, _) => FullExit();
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("정보...").Click  += (_, _) => { _window?.Show(); _window?.OpenSettings(5); };
+        menu.Opening += (_, _) =>
+        {
+            if (_window != null) MenuRenderer.FillForms(menu, _window.BuildMenuModel());
+        };
 
         _tray = new NotifyIcon { Icon = icon, Text = "PerfMon Overlay", Visible = true, ContextMenuStrip = menu };
         _tray.DoubleClick += (_, _) => ToggleWindow();
@@ -123,7 +98,7 @@ public partial class App : System.Windows.Application
         Shutdown();
     }
 
-    private void ToggleWindow()
+    public void ToggleWindow()
     {
         if (_window == null) return;
         if (_window.IsVisible) _window.Hide();
