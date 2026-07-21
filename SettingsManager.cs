@@ -18,6 +18,17 @@ public sealed class SectionSettings
     public int       WidthRatio  { get; set; } = 1;     // 가로 비율 1-3
     public int       HeightRatio { get; set; } = 1;     // 세로 비율 1-3
 
+    // 색상 (#AARRGGBB / #RRGGBB). null이면 AppSettings.ApplyColorDefaults()가 섹션 기본색으로 채움.
+    // Value2/Graph2는 이중 계열 섹션(DISK R/W, NET D/U)에서만 사용.
+    // 기본적으로 그래프는 수치(Value) 색을 그대로 사용한다. SeparateGraphColor=true일 때만
+    // Graph1/Graph2를 별도 색으로 적용.
+    public bool    SeparateGraphColor { get; set; } = false;
+    public string? LabelColor  { get; set; }
+    public string? Value1Color { get; set; }
+    public string? Value2Color { get; set; }
+    public string? Graph1Color { get; set; }
+    public string? Graph2Color { get; set; }
+
     public SectionSettings Clone() => (SectionSettings)MemberwiseClone();
 }
 
@@ -52,6 +63,28 @@ public sealed class AppSettings
     [JsonIgnore]
     public SectionSettings[] Sections => new[] { Cpu, Mem, Disk, Net };
 
+    public AppSettings() => ApplyColorDefaults();
+
+    // null/빈 색상 필드에만 섹션별 기본색을 채운다(명시 지정된 값은 보존).
+    // 신규 인스턴스·기존 settings.json(색상 필드 없음) 모두 여기서 정규화된다.
+    public void ApplyColorDefaults()
+    {
+        Fill(Cpu,  "#FF00C3FF", "#FF00C3FF", "#FF00C3FF", "#FF00C3FF", "#FF00C3FF");
+        Fill(Mem,  "#FFA855F7", "#FFA855F7", "#FFA855F7", "#FFA855F7", "#FFA855F7");
+        Fill(Disk, "#FFFDE047", "#FFFDE047", "#FFF97316", "#FFFDE047", "#FFF97316");
+        Fill(Net,  "#FFFFFFFF", "#FFFFFFFF", "#FF38BDF8", "#FFFFFFFF", "#FF38BDF8");
+
+        static void Fill(SectionSettings s, string label, string v1, string v2, string g1, string g2)
+        {
+            s.LabelColor  = Def(s.LabelColor,  label);
+            s.Value1Color = Def(s.Value1Color, v1);
+            s.Value2Color = Def(s.Value2Color, v2);
+            s.Graph1Color = Def(s.Graph1Color, g1);
+            s.Graph2Color = Def(s.Graph2Color, g2);
+        }
+        static string Def(string? cur, string d) => string.IsNullOrEmpty(cur) ? d : cur;
+    }
+
     public AppSettings Clone() => new()
     {
         X = X, Y = Y, W = W, H = H, SavedX = SavedX, SavedY = SavedY,
@@ -81,7 +114,9 @@ public static class SettingsManager
         try
         {
             var json = File.ReadAllText(FilePath);
-            return JsonSerializer.Deserialize<AppSettings>(json, Opts) ?? new AppSettings();
+            var s = JsonSerializer.Deserialize<AppSettings>(json, Opts) ?? new AppSettings();
+            s.ApplyColorDefaults();   // 구버전 파일에 없던 색상 필드를 기본색으로 보충
+            return s;
         }
         catch { return new AppSettings(); }
     }

@@ -177,8 +177,60 @@ public partial class MainWindow : Window
         ApplyAlwaysOnTop(_cfg.AlwaysOnTop);
 
         ApplyFontSizes();
+        ApplyColors();
         ApplyMinSize();
         ContextMenu = BuildContextMenu();
+    }
+
+    // ── 섹션별 색상 적용 ─────────────────────────────────────────────────
+    private void ApplyColors()
+    {
+        for (int i = 0; i < 4; i++)
+        {
+            var s = Secs[i];
+            if (Labels[i] is System.Windows.Controls.TextBlock lbl)
+                lbl.Foreground = BrushOf(s.LabelColor);
+            // 그래프는 기본적으로 수치 색을 따라가고, 별도 지정 시에만 Graph 색 사용
+            Graphs[i].Color1 = ColorOf(s.SeparateGraphColor ? s.Graph1Color : s.Value1Color);
+            Graphs[i].Color2 = ColorOf(s.SeparateGraphColor ? s.Graph2Color : s.Value2Color);
+        }
+
+        // 단일 계열: 수치 전체가 Value1
+        SetForegroundAll(valsCpu, BrushOf(_cfg.Cpu.Value1Color));
+        SetForegroundAll(valsMem, BrushOf(_cfg.Mem.Value1Color));
+
+        // 이중 계열: 첫 행(R/D)=Value1, 둘째 행(W/U)=Value2
+        ColorDualRows(valsDisk, _cfg.Disk);
+        ColorDualRows(valsNet,  _cfg.Net);
+    }
+
+    private static void ColorDualRows(System.Windows.Controls.Panel vals, SectionSettings s)
+    {
+        if (vals.Children.Count > 0 && vals.Children[0] is FrameworkElement r0)
+            SetForegroundAll(r0, BrushOf(s.Value1Color));
+        if (vals.Children.Count > 1 && vals.Children[1] is FrameworkElement r1)
+            SetForegroundAll(r1, BrushOf(s.Value2Color));
+    }
+
+    private static void SetForegroundAll(FrameworkElement el, System.Windows.Media.Brush brush)
+    {
+        if (el is System.Windows.Controls.TextBlock tb) { tb.Foreground = brush; return; }
+        if (el is System.Windows.Controls.Panel p)
+            foreach (UIElement c in p.Children)
+                if (c is FrameworkElement fe) SetForegroundAll(fe, brush);
+    }
+
+    private static SolidColorBrush BrushOf(string? hex)
+    {
+        var b = new SolidColorBrush(ColorOf(hex));
+        b.Freeze();
+        return b;
+    }
+
+    private static WColor ColorOf(string? hex)
+    {
+        try { return (WColor)System.Windows.Media.ColorConverter.ConvertFromString(hex); }
+        catch { return System.Windows.Media.Colors.White; }
     }
 
     // 섹션별 실제 표시 형식을 반영한 최악 케이스 값 텍스트 (최소폭 계산용)

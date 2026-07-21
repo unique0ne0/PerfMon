@@ -32,61 +32,63 @@
                 <Rectangle x:Name="Sep3" Fill="#0CFFFFFF" Visibility="Collapsed"/>
                 <Rectangle x:Name="Sep4" Fill="#0CFFFFFF" Visibility="Collapsed"/>
 
+                <!-- 색상은 런타임에 ApplyColors()가 섹션 설정(기본값 포함)으로 채운다 -->
+
                 <!-- CPU -->
                 <Grid Margin="4,3,4,2" x:Name="PanelCpu">
-                    <local:GraphControl x:Name="gCpu" Color1="#FF00C3FF"/>
+                    <local:GraphControl x:Name="gCpu"/>
                     <Grid x:Name="hdrCpu" Panel.ZIndex="1" VerticalAlignment="Top" Margin="0,0,0,2">
-                        <TextBlock x:Name="lblCpu" Text="CPU" Foreground="#FF00C3FF" FontSize="10" FontWeight="SemiBold"/>
+                        <TextBlock x:Name="lblCpu" Text="CPU" FontSize="10" FontWeight="SemiBold"/>
                         <StackPanel x:Name="valsCpu" HorizontalAlignment="Right" Orientation="Horizontal">
-                            <TextBlock x:Name="vCpu"  Text="0%"  Foreground="#FF00C3FF" FontSize="10" FontWeight="Bold"/>
-                            <TextBlock x:Name="vTemp" Text=""    Foreground="#FF00C3FF" FontSize="10" Opacity="0.65" Margin="3,0,0,0"/>
+                            <TextBlock x:Name="vCpu"  Text="0%"  FontSize="10" FontWeight="Bold"/>
+                            <TextBlock x:Name="vTemp" Text=""    FontSize="10" Opacity="0.65" Margin="3,0,0,0"/>
                         </StackPanel>
                     </Grid>
                 </Grid>
 
                 <!-- MEM -->
                 <Grid Margin="4,3,4,2" x:Name="PanelMem">
-                    <local:GraphControl x:Name="gMem" Color1="#FFA855F7"/>
+                    <local:GraphControl x:Name="gMem"/>
                     <Grid x:Name="hdrMem" Panel.ZIndex="1" VerticalAlignment="Top" Margin="0,0,0,2">
-                        <TextBlock x:Name="lblMem" Text="MEM" Foreground="#FFA855F7" FontSize="10" FontWeight="SemiBold"/>
+                        <TextBlock x:Name="lblMem" Text="MEM" FontSize="10" FontWeight="SemiBold"/>
                         <StackPanel x:Name="valsMem" HorizontalAlignment="Right" Orientation="Horizontal">
-                            <TextBlock x:Name="vMem"   Text="0%"   Foreground="#FFA855F7" FontSize="10" FontWeight="Bold"/>
-                            <TextBlock x:Name="vMemGB" Text=""     Foreground="#FFA855F7" FontSize="10" Opacity="0.65" Margin="3,0,0,0"/>
+                            <TextBlock x:Name="vMem"   Text="0%"   FontSize="10" FontWeight="Bold"/>
+                            <TextBlock x:Name="vMemGB" Text=""     FontSize="10" Opacity="0.65" Margin="3,0,0,0"/>
                         </StackPanel>
                     </Grid>
                 </Grid>
 
-                <!-- DISK: R=Color1(노랑), W=Color2(주황) -->
+                <!-- DISK: R=Value1/Graph1, W=Value2/Graph2 -->
                 <Grid Margin="4,3,4,1" x:Name="PanelDisk">
-                    <local:GraphControl x:Name="gDisk" Color1="#FFFDE047" Color2="#FFF97316" IsDual="True"/>
+                    <local:GraphControl x:Name="gDisk" IsDual="True"/>
                     <StackPanel x:Name="hdrDisk" Panel.ZIndex="1" VerticalAlignment="Top">
-                        <TextBlock x:Name="lblDisk" Text="DISK" Foreground="#FFFDE047" FontSize="10" FontWeight="SemiBold"/>
+                        <TextBlock x:Name="lblDisk" Text="DISK" FontSize="10" FontWeight="SemiBold"/>
                         <StackPanel x:Name="valsDisk" Margin="0,2,0,0">
                             <StackPanel Orientation="Horizontal">
-                                <TextBlock Text="R:" Foreground="#FFFDE047" FontSize="10" FontWeight="SemiBold"/>
-                                <TextBlock x:Name="vDR" Text="0" Foreground="#FFFDE047" FontSize="10" FontWeight="Bold" Margin="1,0,0,0"/>
+                                <TextBlock Text="R:" FontSize="10" FontWeight="SemiBold"/>
+                                <TextBlock x:Name="vDR" Text="0" FontSize="10" FontWeight="Bold" Margin="1,0,0,0"/>
                             </StackPanel>
                             <StackPanel Orientation="Horizontal">
-                                <TextBlock Text="W:" Foreground="#FFF97316" FontSize="10" FontWeight="SemiBold"/>
-                                <TextBlock x:Name="vDW" Text="0" Foreground="#FFF97316" FontSize="10" Margin="1,0,0,0"/>
+                                <TextBlock Text="W:" FontSize="10" FontWeight="SemiBold"/>
+                                <TextBlock x:Name="vDW" Text="0" FontSize="10" Margin="1,0,0,0"/>
                             </StackPanel>
                         </StackPanel>
                     </StackPanel>
                 </Grid>
 
-                <!-- NET: D=Color1(초록), U=Color2(하늘) -->
+                <!-- NET: D=Value1/Graph1, U=Value2/Graph2 -->
                 <Grid Margin="4,3,4,2" x:Name="PanelNet">
-                    <local:GraphControl x:Name="gNet" Color1="#FFFFFFFF" Color2="#FF38BDF8" IsDual="True"/>
+                    <local:GraphControl x:Name="gNet" IsDual="True"/>
                     <StackPanel x:Name="hdrNet" Panel.ZIndex="1" VerticalAlignment="Top">
-                        <TextBlock x:Name="lblNet" Text="NET" Foreground="#FFFFFFFF" FontSize="10" FontWeight="SemiBold"/>
+                        <TextBlock x:Name="lblNet" Text="NET" FontSize="10" FontWeight="SemiBold"/>
                         <StackPanel x:Name="valsNet" Margin="0,2,0,0">
                             <StackPanel Orientation="Horizontal">
-                                <TextBlock Text="D:" Foreground="#FFFFFFFF" FontSize="10" FontWeight="SemiBold"/>
-                                <TextBlock x:Name="vNDn" Text="0" Foreground="#FFFFFFFF" FontSize="10" FontWeight="Bold" Margin="1,0,0,0"/>
+                                <TextBlock Text="D:" FontSize="10" FontWeight="SemiBold"/>
+                                <TextBlock x:Name="vNDn" Text="0" FontSize="10" FontWeight="Bold" Margin="1,0,0,0"/>
                             </StackPanel>
                             <StackPanel Orientation="Horizontal">
-                                <TextBlock Text="U:" Foreground="#FF38BDF8" FontSize="10" FontWeight="SemiBold"/>
-                                <TextBlock x:Name="vNUp" Text="0" Foreground="#FF38BDF8" FontSize="10" Margin="1,0,0,0"/>
+                                <TextBlock Text="U:" FontSize="10" FontWeight="SemiBold"/>
+                                <TextBlock x:Name="vNUp" Text="0" FontSize="10" Margin="1,0,0,0"/>
                             </StackPanel>
                         </StackPanel>
                     </StackPanel>

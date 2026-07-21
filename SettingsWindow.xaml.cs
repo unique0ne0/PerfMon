@@ -6,6 +6,11 @@ using WColor = System.Windows.Media.Color;
 using CheckBox = System.Windows.Controls.CheckBox;
 using ComboBox = System.Windows.Controls.ComboBox;
 using HAlign = System.Windows.HorizontalAlignment;
+using TextBox = System.Windows.Controls.TextBox;
+using Button = System.Windows.Controls.Button;
+using Orientation = System.Windows.Controls.Orientation;
+using FontFamily = System.Windows.Media.FontFamily;
+using ColorConverter = System.Windows.Media.ColorConverter;
 
 namespace PerfMonCS;
 
@@ -29,10 +34,10 @@ public partial class SettingsWindow : Window
     {
         Tabs.Items.Clear();
         Tabs.Items.Add(GeneralTab());
-        Tabs.Items.Add(SectionTab("CPU",     _cfg.Cpu));
-        Tabs.Items.Add(SectionTab("Memory",  _cfg.Mem));
-        Tabs.Items.Add(SectionTab("Disk",    _cfg.Disk));
-        Tabs.Items.Add(SectionTab("Network", _cfg.Net));
+        Tabs.Items.Add(SectionTab("CPU",     _cfg.Cpu,  null));
+        Tabs.Items.Add(SectionTab("Memory",  _cfg.Mem,  null));
+        Tabs.Items.Add(SectionTab("Disk",    _cfg.Disk, ("R", "W")));
+        Tabs.Items.Add(SectionTab("Network", _cfg.Net,  ("D", "U")));
         Tabs.Items.Add(InfoTab());
     }
 
@@ -40,10 +45,10 @@ public partial class SettingsWindow : Window
     private void RefreshSectionTabs()
     {
         while (Tabs.Items.Count > 2) Tabs.Items.RemoveAt(1);
-        Tabs.Items.Insert(1, SectionTab("CPU",     _cfg.Cpu));
-        Tabs.Items.Insert(2, SectionTab("Memory",  _cfg.Mem));
-        Tabs.Items.Insert(3, SectionTab("Disk",    _cfg.Disk));
-        Tabs.Items.Insert(4, SectionTab("Network", _cfg.Net));
+        Tabs.Items.Insert(1, SectionTab("CPU",     _cfg.Cpu,  null));
+        Tabs.Items.Insert(2, SectionTab("Memory",  _cfg.Mem,  null));
+        Tabs.Items.Insert(3, SectionTab("Disk",    _cfg.Disk, ("R", "W")));
+        Tabs.Items.Insert(4, SectionTab("Network", _cfg.Net,  ("D", "U")));
     }
 
     // ── 일반 탭 ──────────────────────────────────────────────────────────
@@ -120,7 +125,14 @@ public partial class SettingsWindow : Window
     }
 
     // ── 섹션 탭 ──────────────────────────────────────────────────────────
-    private TabItem SectionTab(string header, SectionSettings s)
+    private TabItem SectionTab(string header, SectionSettings s, (string, string)? series)
+    {
+        var tab = new TabItem { Header = header };
+        tab.Content = SectionContent(header, s, series, tab);
+        return tab;
+    }
+
+    private ScrollViewer SectionContent(string header, SectionSettings s, (string, string)? series, TabItem tab)
     {
         var sp = new StackPanel { Margin = new Thickness(12) };
 
@@ -157,7 +169,120 @@ public partial class SettingsWindow : Window
 
         sp.Children.Add(RatioRow(s));
 
-        return new TabItem { Header = header, Content = sp };
+        // ── 색상 ──
+        sp.Children.Add(new TextBlock
+        {
+            Text = "색상",
+            FontWeight = FontWeights.SemiBold,
+            Margin = new Thickness(0, 16, 0, 6),
+        });
+
+        bool dual = series is not null;
+        string sfx1 = dual ? $" {series!.Value.Item1}" : "";
+        string sfx2 = dual ? $" {series!.Value.Item2}" : "";
+
+        sp.Children.Add(ColorRow("레이블", s.LabelColor!, v => s.LabelColor = v));
+        sp.Children.Add(ColorRow($"수치{sfx1}", s.Value1Color!, v => s.Value1Color = v));
+        if (dual)
+            sp.Children.Add(ColorRow($"수치{sfx2}", s.Value2Color!, v => s.Value2Color = v));
+
+        // 기본은 수치=그래프 한 쌍. 별도 지정 체크 시에만 그래프 색 행 노출.
+        sp.Children.Add(Chk("그래프 색 따로 지정", s.SeparateGraphColor, v =>
+        {
+            s.SeparateGraphColor = v;
+            if (v)   // 켜는 순간 현재 수치 색으로 시작
+            {
+                s.Graph1Color = s.Value1Color;
+                s.Graph2Color = s.Value2Color;
+            }
+            tab.Content = SectionContent(header, s, series, tab);   // 행 추가/제거 반영
+        }, marginTop: 6));
+
+        if (s.SeparateGraphColor)
+        {
+            sp.Children.Add(ColorRow($"그래프{sfx1}", s.Graph1Color!, v => s.Graph1Color = v));
+            if (dual)
+                sp.Children.Add(ColorRow($"그래프{sfx2}", s.Graph2Color!, v => s.Graph2Color = v));
+        }
+
+        return new ScrollViewer
+        {
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            Content = sp,
+        };
+    }
+
+    // ── 색상 선택 (프리셋 팔레트 + HEX 직접입력) ──────────────────────────
+    private static readonly string[] Palette =
+    {
+        "#FFFFFFFF", "#FFB0B0B0", "#FF64748B", "#FF00C3FF", "#FF38BDF8", "#FF22D3EE",
+        "#FF4ADE80", "#FFFDE047", "#FFF97316", "#FFEF4444", "#FFEC4899", "#FFA855F7",
+    };
+
+    private static FrameworkElement ColorRow(string label, string current, Action<string> set)
+    {
+        var outer = new StackPanel { Margin = new Thickness(0, 0, 0, 8) };
+
+        var preview = new Border
+        {
+            Width = 22, Height = 22,
+            BorderBrush = new SolidColorBrush(WColor.FromRgb(0x88, 0x88, 0x88)),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(3),
+            Margin = new Thickness(0, 0, 6, 0),
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var hex = new TextBox
+        {
+            Width = 96,
+            Text = current,
+            VerticalContentAlignment = VerticalAlignment.Center,
+            FontFamily = new FontFamily("Consolas"),
+        };
+
+        void Apply(string val)
+        {
+            try
+            {
+                var c = (WColor)ColorConverter.ConvertFromString(val);
+                preview.Background = new SolidColorBrush(c);
+                set($"#{c.A:X2}{c.R:X2}{c.G:X2}{c.B:X2}");
+            }
+            catch { /* 유효하지 않은 입력은 무시 (미리보기·값 유지) */ }
+        }
+
+        var top = new StackPanel { Orientation = Orientation.Horizontal };
+        top.Children.Add(new TextBlock
+        {
+            Text = label, Width = 60,
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+        top.Children.Add(preview);
+        top.Children.Add(hex);
+
+        var swatches = new WrapPanel { Margin = new Thickness(66, 5, 0, 0), Width = 300 };
+        foreach (var p in Palette)
+        {
+            var col = (WColor)ColorConverter.ConvertFromString(p);
+            var btn = new Button
+            {
+                Width = 20, Height = 20,
+                Margin = new Thickness(0, 0, 4, 4),
+                Background = new SolidColorBrush(col),
+                BorderBrush = new SolidColorBrush(WColor.FromRgb(0x55, 0x55, 0x55)),
+                BorderThickness = new Thickness(0.5),
+                ToolTip = p,
+            };
+            btn.Click += (_, _) => hex.Text = p;   // TextChanged → Apply
+            swatches.Children.Add(btn);
+        }
+
+        hex.TextChanged += (_, _) => Apply(hex.Text);
+        Apply(current);   // 초기 미리보기
+
+        outer.Children.Add(top);
+        outer.Children.Add(swatches);
+        return outer;
     }
 
     // ── 정보 탭 ──────────────────────────────────────────────────────────
