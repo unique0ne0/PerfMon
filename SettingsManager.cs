@@ -105,28 +105,53 @@ public static class SettingsManager
         Converters = { new JsonStringEnumConverter() },
     };
 
-    private static string FilePath => Path.Combine(
+    private static string AppDir => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "PerfMonCS", "settings.json");
+        "PerfMonCS");
+
+    private static string FilePath => Path.Combine(AppDir, "settings.json");
 
     public static AppSettings Load()
     {
         try
         {
+            if (!File.Exists(FilePath)) return new AppSettings();
             var json = File.ReadAllText(FilePath);
             var s = JsonSerializer.Deserialize<AppSettings>(json, Opts) ?? new AppSettings();
             s.ApplyColorDefaults();   // 구버전 파일에 없던 색상 필드를 기본색으로 보충
             return s;
         }
-        catch { return new AppSettings(); }
+        catch (Exception ex)
+        {
+            LogError("Load settings", ex);
+            return new AppSettings();
+        }
     }
 
     public static void Save(AppSettings s)
     {
+        string tmp = FilePath + ".tmp";
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
-            File.WriteAllText(FilePath, JsonSerializer.Serialize(s, Opts));
+            Directory.CreateDirectory(AppDir);
+            File.WriteAllText(tmp, JsonSerializer.Serialize(s, Opts));
+            if (File.Exists(FilePath)) File.Replace(tmp, FilePath, null);
+            else File.Move(tmp, FilePath);
+        }
+        catch (Exception ex)
+        {
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+            LogError("Save settings", ex);
+        }
+    }
+
+    public static void LogError(string context, Exception ex)
+    {
+        try
+        {
+            Directory.CreateDirectory(AppDir);
+            var log = Path.Combine(AppDir, "error.log");
+            File.AppendAllText(log, $"[{DateTime.Now}] {context}: {ex.Message}\n");
         }
         catch { }
     }

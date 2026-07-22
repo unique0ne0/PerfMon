@@ -387,7 +387,7 @@ public partial class SettingsWindow : Window
 
     private void OnReset(object sender, RoutedEventArgs e)
     {
-        var def = new AppSettings { X = _cfg.X, Y = _cfg.Y, W = _cfg.W, H = _cfg.H };
+        var def = new AppSettings { X = _cfg.X, Y = _cfg.Y, W = _cfg.W, H = _cfg.H, SavedX = _cfg.SavedX, SavedY = _cfg.SavedY };
         _cfg = def;
         BuildTabs();
     }

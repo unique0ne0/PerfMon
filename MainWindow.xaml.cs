@@ -27,8 +27,8 @@ public partial class MainWindow : Window
 
     private readonly SystemMonitor   _monitor;
     private readonly DispatcherTimer _timer;
+    private readonly DispatcherTimer _saveDebounce;
     private AppSettings _cfg = new();
-    private bool        _savePending;
     private bool        _passThrough;
     private bool        _resizeActive;
     private bool        _loaded;
@@ -107,6 +107,9 @@ public partial class MainWindow : Window
         _timer.Tick += OnTick;
         _timer.Start();
 
+        _saveDebounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+        _saveDebounce.Tick += (_, _) => SaveWindowStateNow();
+
         // 우클릭 메뉴는 열릴 때마다 통합 모델로 재생성 → 체크 상태 최신 반영
         ContextMenu = new ContextMenu();
         ContextMenuOpening += (_, _) => MenuRenderer.FillWpf(ContextMenu, BuildMenuModel());
@@ -137,6 +140,7 @@ public partial class MainWindow : Window
 
     public void SetPassThrough(bool on)
     {
+        if (on && _resizeActive) SetResizeActive(false);
         _passThrough = on;
         var hwnd = new WindowInteropHelper(this).Handle;
         int style = GetWindowLong(hwnd, GWL_EXSTYLE);
@@ -146,6 +150,7 @@ public partial class MainWindow : Window
 
     public void SetResizeActive(bool on)
     {
+        if (on && _passThrough) SetPassThrough(false);
         _resizeActive = on;
         ResizeMode = on ? ResizeMode.CanResizeWithGrip : ResizeMode.NoResize;
         UpdateBorderHint();
@@ -295,8 +300,12 @@ public partial class MainWindow : Window
                 MinHeight = rows * minPanelH + (rows - 1) + 4;
                 break;
             case Arrangement.Compact:
-                MinWidth  = minPanelW;
-                MinHeight = minPanelH * 3 + 8;
+                int topCount = (Secs[0].Visible ? 1 : 0) + (Secs[1].Visible ? 1 : 0);
+                int bottomCount = (Secs[2].Visible ? 1 : 0) + (Secs[3].Visible ? 1 : 0);
+                int compactBlocks = topCount + (bottomCount > 0 ? 1 : 0);
+                MinWidth  = (bottomCount == 2 ? 2 * minPanelW + 1 : minPanelW) + 4;
+                MinHeight = topCount * minPanelH + (bottomCount > 0 ? 2 * minPanelH : 0)
+                    + Math.Max(0, compactBlocks - 1) + 4;
                 break;
             case Arrangement.Mini:
                 MinWidth  = minPanelW;
@@ -382,6 +391,12 @@ public partial class MainWindow : Window
     private void ConfigurePanelCompact(int i)
     {
         var s = Secs[i];
+        if (!s.Visible)
+        {
+            Panels[i].Visibility = Visibility.Collapsed;
+            return;
+        }
+
         RestoreIntoHeader(i);
         ApplyLabelValueAlignment(i, true);
 
@@ -451,6 +466,12 @@ public partial class MainWindow : Window
         var graph = Graphs[i];
         var label = Labels[i];
         var vals  = Vals[i];
+
+        if (!s.Visible)
+        {
+            panel.Visibility = Visibility.Collapsed;
+            return;
+        }
 
         bool isBar     = s.Graph == GraphKind.Bar;
         bool showGraph = s.ShowGraph;
@@ -557,7 +578,6 @@ public partial class MainWindow : Window
         MainGrid.ColumnDefinitions.Clear();
         foreach (var sep in new[] { Sep1, Sep2, Sep3, Sep4 }) sep.Visibility = Visibility.Collapsed;
 
-        // 컴팩트/미니는 고정 4패널 레이아웃 — vis 필터 없이 바로 처리
         if (_cfg.Arrange == Arrangement.Compact) { ArrangeCompact(); return; }
         if (_cfg.Arrange == Arrangement.Mini)    { ArrangeMini();    return; }
 
@@ -657,25 +677,54 @@ public partial class MainWindow : Window
     {
         _designW = DESIGN_W;
 
-        // 3열: [*, 1px, *]
-        MainGrid.ColumnDefinitions.Add(Col(1));
-        MainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GL(1) });
-        MainGrid.ColumnDefinitions.Add(Col(1));
+        var top = new List<int>();
+        if (Secs[0].Visible) top.Add(0);
+        if (Secs[1].Visible) top.Add(1);
 
-        // 5행: CPU(1*) / sep / MEM(1*) / sep / DISK|NET(2*)
-        MainGrid.RowDefinitions.Add(Row(1));
-        MainGrid.RowDefinitions.Add(new RowDefinition { Height = GL(1) });
-        MainGrid.RowDefinitions.Add(Row(1));
-        MainGrid.RowDefinitions.Add(new RowDefinition { Height = GL(1) });
-        MainGrid.RowDefinitions.Add(Row(2));
+        var bottom = new List<int>();
+        if (Secs[2].Visible) bottom.Add(2);
+        if (Secs[3].Visible) bottom.Add(3);
+        if (top.Count == 0 && bottom.Count == 0) return;
 
-        Pos(PanelCpu,  0, 0, 1, 3);
-        Pos(Sep1,      1, 0, 1, 3); Sep1.Visibility = Visibility.Visible;
-        Pos(PanelMem,  2, 0, 1, 3);
-        Pos(Sep2,      3, 0, 1, 3); Sep2.Visibility = Visibility.Visible;
-        Pos(PanelDisk, 4, 0, 1, 1);
-        Pos(Sep4,      4, 1, 1, 1); Sep4.Visibility = Visibility.Visible;
-        Pos(PanelNet,  4, 2, 1, 1);
+        bool splitBottom = bottom.Count == 2;
+        int colSpan = splitBottom ? 3 : 1;
+        MainGrid.ColumnDefinitions.Add(Col(1));
+        if (splitBottom)
+        {
+            MainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GL(1) });
+            MainGrid.ColumnDefinitions.Add(Col(1));
+        }
+
+        var seps = new[] { Sep1, Sep2, Sep3 };
+        int row = 0, sep = 0;
+        int blocks = top.Count + (bottom.Count > 0 ? 1 : 0);
+
+        foreach (int i in top)
+        {
+            MainGrid.RowDefinitions.Add(Row(1));
+            Pos(Panels[i], row, 0, 1, colSpan);
+            row++;
+            if (--blocks > 0)
+            {
+                MainGrid.RowDefinitions.Add(new RowDefinition { Height = GL(1) });
+                Pos(seps[sep], row, 0, 1, colSpan);
+                seps[sep].Visibility = Visibility.Visible;
+                sep++; row++;
+            }
+        }
+
+        if (bottom.Count == 1)
+        {
+            MainGrid.RowDefinitions.Add(Row(2));
+            Pos(Panels[bottom[0]], row, 0, 1, colSpan);
+        }
+        else if (bottom.Count == 2)
+        {
+            MainGrid.RowDefinitions.Add(Row(2));
+            Pos(Panels[bottom[0]], row, 0);
+            Pos(Sep4, row, 1); Sep4.Visibility = Visibility.Visible;
+            Pos(Panels[bottom[1]], row, 2);
+        }
     }
 
     // 미니: 4행 동일 높이, 패널 내부 [레이블|막대] 수평 배치
@@ -684,15 +733,18 @@ public partial class MainWindow : Window
         _designW = DESIGN_W;
         MainGrid.ColumnDefinitions.Add(Col(1));
 
-        var panels = new[] { PanelCpu, PanelMem, PanelDisk, PanelNet };
         var seps   = new[] { Sep1, Sep2, Sep3, Sep4 };
+        var vis = new List<int>();
+        for (int i = 0; i < 4; i++) if (Secs[i].Visible) vis.Add(i);
+        if (vis.Count == 0) return;
+
         int row = 0, sep = 0;
-        for (int k = 0; k < 4; k++)
+        for (int k = 0; k < vis.Count; k++)
         {
             MainGrid.RowDefinitions.Add(Row(0.5));  // 일반 모드의 절반 높이
-            Pos(panels[k], row, 0);
+            Pos(Panels[vis[k]], row, 0);
             row++;
-            if (k < 3)
+            if (k < vis.Count - 1)
             {
                 MainGrid.RowDefinitions.Add(new RowDefinition { Height = GL(1) });
                 Pos(seps[sep], row, 0);
@@ -781,14 +833,17 @@ public partial class MainWindow : Window
 
     private void OnStateChanged(object? sender, EventArgs e)
     {
-        if (!_loaded || _savePending) return;
-        _savePending = true;
-        Dispatcher.InvokeAsync(() =>
-        {
-            _cfg.X = Left; _cfg.Y = Top; _cfg.W = Width; _cfg.H = Height;
-            SettingsManager.Save(_cfg);
-            _savePending = false;
-        }, DispatcherPriority.Background);
+        if (!_loaded) return;
+        _saveDebounce.Stop();
+        _saveDebounce.Start();
+    }
+
+    private void SaveWindowStateNow()
+    {
+        _saveDebounce.Stop();
+        if (!_loaded) return;
+        _cfg.X = Left; _cfg.Y = Top; _cfg.W = Width; _cfg.H = Height;
+        SettingsManager.Save(_cfg);
     }
 
     // ── 설정 로드 ────────────────────────────────────────────────────────
@@ -796,17 +851,19 @@ public partial class MainWindow : Window
     {
         _cfg = SettingsManager.Load();
 
-        double x = _cfg.X ?? (SystemParameters.WorkArea.Right - Width - 10);
-        double y = _cfg.Y ?? 10;
-        if (x >= SystemParameters.VirtualScreenLeft &&
-            x < SystemParameters.VirtualScreenLeft + SystemParameters.VirtualScreenWidth)
-            Left = x;
-        if (y >= SystemParameters.VirtualScreenTop &&
-            y < SystemParameters.VirtualScreenTop + SystemParameters.VirtualScreenHeight)
-            Top = y;
-
         if (_cfg.W.HasValue) Width  = Math.Max(MinWidth,  _cfg.W.Value);
         if (_cfg.H.HasValue) Height = Math.Max(MinHeight, _cfg.H.Value);
+
+        double fallbackX = Math.Max(SystemParameters.WorkArea.Left, SystemParameters.WorkArea.Right - Width - 10);
+        double fallbackY = SystemParameters.WorkArea.Top + 10;
+        double x = _cfg.X ?? fallbackX;
+        double y = _cfg.Y ?? fallbackY;
+        bool xInRange = x >= SystemParameters.VirtualScreenLeft &&
+            x < SystemParameters.VirtualScreenLeft + SystemParameters.VirtualScreenWidth;
+        bool yInRange = y >= SystemParameters.VirtualScreenTop &&
+            y < SystemParameters.VirtualScreenTop + SystemParameters.VirtualScreenHeight;
+        Left = xInRange ? x : fallbackX;
+        Top  = yInRange ? y : fallbackY;
 
         _timer.Interval = TimeSpan.FromMilliseconds(Math.Clamp(_cfg.UpdateMs, 250, 5000));
 
@@ -837,6 +894,7 @@ public partial class MainWindow : Window
             _cfg = original;
             _timer.Interval = TimeSpan.FromMilliseconds(Math.Clamp(_cfg.UpdateMs, 250, 5000));
             RenderAll();
+            SettingsManager.Save(_cfg);
         }
     }
 
@@ -973,7 +1031,9 @@ public partial class MainWindow : Window
     protected override void OnClosed(EventArgs e)
     {
         if (_fgHook != IntPtr.Zero) { UnhookWinEvent(_fgHook); _fgHook = IntPtr.Zero; }
+        SaveWindowStateNow();
         _timer.Stop();
+        _saveDebounce.Stop();
         _monitor.Dispose();
         base.OnClosed(e);
     }

@@ -6,6 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <RootNamespace>PerfMonCS</RootNamespace>
     <AssemblyName>PerfMonCS</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>

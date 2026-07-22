@@ -43,8 +43,9 @@ public sealed class GraphControl : FrameworkElement
 
     public void Push(double v1, double v2 = 0)
     {
-        Array.Copy(_buf1, 1, _buf1, 0, HIST - 1); _buf1[HIST - 1] = Math.Max(0, v1);
-        Array.Copy(_buf2, 1, _buf2, 0, HIST - 1); _buf2[HIST - 1] = Math.Max(0, v2);
+        static double San(double v) => double.IsFinite(v) ? Math.Max(0, v) : 0;
+        Array.Copy(_buf1, 1, _buf1, 0, HIST - 1); _buf1[HIST - 1] = San(v1);
+        Array.Copy(_buf2, 1, _buf2, 0, HIST - 1); _buf2[HIST - 1] = San(v2);
         InvalidateVisual();
     }
 

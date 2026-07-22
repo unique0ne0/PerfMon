@@ -1,6 +1,7 @@
 using System.Windows;
 using System.Drawing;
 using System.Windows.Forms;
+using System.Runtime.InteropServices;
 
 namespace PerfMonCS;
 
@@ -17,10 +18,15 @@ public partial class App : System.Windows.Application
         // 미처리 예외를 로그 파일에 기록
         DispatcherUnhandledException += (_, ex) =>
         {
-            var log = System.IO.Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                "PerfMonCS", "crash.log");
-            System.IO.File.AppendAllText(log, $"[{DateTime.Now}] {ex.Exception}\n\n");
+            try
+            {
+                var log = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    "PerfMonCS", "crash.log");
+                System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(log)!);
+                System.IO.File.AppendAllText(log, $"[{DateTime.Now}] {ex.Exception}\n\n");
+            }
+            catch { }
             ex.Handled = true;
         };
 
@@ -81,8 +87,20 @@ public partial class App : System.Windows.Application
         using var dotBrush = new SolidBrush(System.Drawing.Color.FromArgb(180, 255, 255));
         g.FillEllipse(dotBrush, 11f, 2f, 4f, 4f);
 
-        return Icon.FromHandle(bmp.GetHicon());
+        IntPtr hicon = bmp.GetHicon();
+        try
+        {
+            using var tmp = Icon.FromHandle(hicon);
+            return (Icon)tmp.Clone();
+        }
+        finally
+        {
+            DestroyIcon(hicon);
+        }
     }
+
+    [DllImport("user32.dll")]
+    private static extern bool DestroyIcon(IntPtr hIcon);
 
     public void FullExit()
     {
@@ -93,6 +111,13 @@ public partial class App : System.Windows.Application
     public void Restart()
     {
         var exe = Environment.ProcessPath;
+        if (_ownsMutex)
+        {
+            try { _mutex?.ReleaseMutex(); } catch { }
+            _mutex?.Dispose();
+            _mutex = null;
+            _ownsMutex = false;
+        }
         if (exe != null) System.Diagnostics.Process.Start(exe);
         _tray?.Dispose();
         Shutdown();
