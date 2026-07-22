@@ -34,6 +34,10 @@ public partial class MainWindow : Window
     private bool        _loaded;
     private Viewbox?    _viewbox;
     private double      _labelColW = 30;
+    private Arrangement? _lastResizeArrange;
+    private double       _lastColUnits;
+    private double       _lastRowUnits;
+    private bool         _sizeInitialized;
 
     [DllImport("user32.dll")] static extern int  GetWindowLong(IntPtr h, int n);
     [DllImport("user32.dll")] static extern int  SetWindowLong(IntPtr h, int n, int v);
@@ -188,7 +192,68 @@ public partial class MainWindow : Window
         ApplyFontSizes();
         ApplyColors();
         ApplyMinSize();
+        ApplyProportionalResize();
         // ContextMenu는 생성자에서 ContextMenuOpening 시 재생성 (여기서 재설정 불필요)
+    }
+
+    private void ApplyProportionalResize()
+    {
+        var (colUnits, rowUnits) = ComputeAxisUnits();
+        bool sameMode = _sizeInitialized && _lastResizeArrange == _cfg.Arrange;
+
+        if (sameMode)
+        {
+            if (_lastColUnits > 0 && colUnits > 0 && Math.Abs(colUnits - _lastColUnits) > 1e-9)
+                Width = Math.Max(MinWidth, Width * (colUnits / _lastColUnits));
+            if (_lastRowUnits > 0 && rowUnits > 0 && Math.Abs(rowUnits - _lastRowUnits) > 1e-9)
+                Height = Math.Max(MinHeight, Height * (rowUnits / _lastRowUnits));
+        }
+
+        _lastResizeArrange = _cfg.Arrange;
+        _lastColUnits = colUnits;
+        _lastRowUnits = rowUnits;
+        _sizeInitialized = true;
+    }
+
+    private (double ColUnits, double RowUnits) ComputeAxisUnits()
+    {
+        var vis = new List<int>();
+        for (int i = 0; i < 4; i++) if (Secs[i].Visible) vis.Add(i);
+        if (vis.Count == 0) return (0, 0);
+
+        return _cfg.Arrange switch
+        {
+            Arrangement.Horizontal => (vis.Sum(i => Math.Max(0, Secs[i].WidthRatio)), 1),
+            Arrangement.Grid2x2    => ComputeGridAxisUnits(vis),
+            Arrangement.Compact    => (1, ComputeCompactRowUnits()),
+            Arrangement.Mini       => (1, vis.Count),
+            _                      => (1, vis.Sum(i => Math.Max(0, Secs[i].HeightRatio))),
+        };
+    }
+
+    private (double ColUnits, double RowUnits) ComputeGridAxisUnits(List<int> vis)
+    {
+        int n = vis.Count;
+        int cols = n >= 2 ? 2 : 1;
+        int rows = (n + cols - 1) / cols;
+        var cw = new int[cols];
+        var rh = new int[rows];
+
+        for (int k = 0; k < n; k++)
+        {
+            int r = k / cols, c = k % cols;
+            cw[c] = Math.Max(cw[c], Math.Max(0, Secs[vis[k]].WidthRatio));
+            rh[r] = Math.Max(rh[r], Math.Max(0, Secs[vis[k]].HeightRatio));
+        }
+
+        return (cw.Sum(), rh.Sum());
+    }
+
+    private double ComputeCompactRowUnits()
+    {
+        int topCount = (Secs[0].Visible ? 1 : 0) + (Secs[1].Visible ? 1 : 0);
+        int bottomCount = (Secs[2].Visible ? 1 : 0) + (Secs[3].Visible ? 1 : 0);
+        return topCount + (bottomCount > 0 ? 2 : 0);
     }
 
     // ── 섹션별 색상 적용 ─────────────────────────────────────────────────

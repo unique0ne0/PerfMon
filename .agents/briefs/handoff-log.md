@@ -11,5 +11,6 @@
 | ID | 제목 | 상태 | 다음 단계(담당) | Blocked by | 갱신일 |
 |----|------|------|----------------|-----------|--------|
 | PF001 | 4개 팀 리뷰 findings 종합 수정 | DONE | 완료 — ⑤ 최종 리뷰 + Integration(기획팀/Claude) | - | 2026-07-22 |
+| PF002 | 패널 토글 시 창 비례 리사이즈 | DONE | 완료 — ⑤ 최종 리뷰 + Integration(기획팀/Claude) | - | 2026-07-22 |
 
-> 주: PF001은 사용자 지정 ID(기본 프리픽스 PM과 별개로 이번 작업에 한해 사용). 완료 패킷: `archive/PF001-team-review-fixes.md`
+> 주: PF001/PF002는 사용자 지정 ID(기본 프리픽스 PM과 별개). 완료 패킷: `archive/PF001-team-review-fixes.md`, `archive/PF002-panel-toggle-proportional-resize.md`
