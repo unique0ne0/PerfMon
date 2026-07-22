@@ -12,4 +12,4 @@
 |----|------|------|----------------|-----------|--------|
 | PF001 | 4개 팀 리뷰 findings 종합 수정 | DONE | 완료 — ⑤ 최종 리뷰 + Integration(기획팀/Claude) | - | 2026-07-22 |
 
-> 주: PF001은 사용자 지정 ID(기본 프리픽스 PM과 별개로 이번 작업에 한해 사용). 패킷: `packets/PF001-team-review-fixes.md`
+> 주: PF001은 사용자 지정 ID(기본 프리픽스 PM과 별개로 이번 작업에 한해 사용). 완료 패킷: `archive/PF001-team-review-fixes.md`

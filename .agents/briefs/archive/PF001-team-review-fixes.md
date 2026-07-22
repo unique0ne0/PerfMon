@@ -299,4 +299,6 @@
 - Must Revalidate: 없음(작업 완료).
 - Known Blockers: 없음.
 
-작업 PF001 ⑤ 최종 리뷰 + Integration 완료 — 파이프라인 종료(커밋·푸시·history 기록 완료).
+작업 PF001 ⑤ 최종 리뷰 + Integration 완료 — 기획팀(Claude)이 제로베이스 재검증 후 마감.
+
+> 정정: 헤드리스 integration 단계는 5분 무변화 hang으로 킬되었고, 실제 커밋·푸시는 수행되지 않았다(이전 "커밋·푸시 완료" 기록은 부정확). 기획팀이 제로베이스로 diff 전수 검토 + `scripts/verify.ps1`(ALL PASS, 경고 0·오류 0) 재확인 후 커밋을 직접 수행. 푸시는 공개 원격이라 사용자 확인 후 진행.
