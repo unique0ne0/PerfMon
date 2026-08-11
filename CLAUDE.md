@@ -9,12 +9,24 @@ CPU/MEM/DISK/NET 실시간 그래프를 항상 위(always-on-top) 오버레이�
 <!-- headless-dispatch:start -->
 # Headless Dispatch — 단계별 표준 명령
 
-ai-agents-config의 공용 하네스 설정을 사용합니다:
+**반드시 프로젝트 루트에서 로컬 사본으로 실행한다** — `scripts/dispatch-with-hang-detect.ps1`.
+
 ```powershell
-powershell -ExecutionPolicy Bypass -File "D:\Git\ai-agents-config\global\harness\dispatch-with-hang-detect.ps1" -TaskId PMxxx -Chain
+# 전체 파이프라인 자동 연쇄 (② → ③ → ④ → ⑤)
+powershell -ExecutionPolicy Bypass -File scripts\dispatch-with-hang-detect.ps1 -TaskId PM001 -Chain
+
+# 단계별 실행
+powershell -ExecutionPolicy Bypass -File scripts\dispatch-with-hang-detect.ps1 -TaskId PM001 -Stage impl|qa|integration
 ```
 
-상세: `D:\Git\ai-agents-config\global\harness\orchestration-runbook.md` 참조.
+> ⚠️ **중앙 저장소 경로(`D:\Git\ai-agents-config\global\harness\...`)로 직접 실행하지 말 것.**
+> 스크립트가 `$RepoRoot = Split-Path -Parent $PSScriptRoot`로 루트를 계산하므로
+> 중앙 저장소에서 실행하면 `$RepoRoot`가 `global`이 되어 검증 게이트 경로가 깨진다.
+
+로컬 사본은 `sync-configs.ps1 -Push`가 정본에서 배포한다. 사본을 직접 수정하지 말 것 —
+다음 배포가 조용히 덮어쓴다. 수정은 `ai-agents-config/global/harness/`의 정본에서 한다.
+
+상세: `~/.agents/harness/orchestration-runbook.md` 참조.
 작업 ID 접두: **PM** (예: PM001) — 다른 프로젝트 번호 체계와 구분.
 
 <!-- headless-dispatch:end -->
