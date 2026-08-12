@@ -356,11 +356,16 @@ function Get-TreeState {
         finally { $sha.Dispose() }
     } catch {
         # git 저장소가 아니거나 git이 없는 경우 — 변경 감지는 건너뛴다(경고 전용 기능).
+        # 다만 조용히 넘기지 않는다(CFG-BL-014): 지문이 비면 뒤의 비교가 "$null -eq $null"로 성립해
+        # 실제로는 판정에 실패한 실행을 "변경 없음"으로 단정한다. 실패는 실패로 남긴다.
+        Write-Log "[$($MyInvocation.MyCommand.Name)] 작업트리 지문 계산 실패 — 변경 판정을 건너뜁니다: $($_.Exception.Message)" WARN
     } finally {
         Pop-Location
     }
     if ([string]::IsNullOrEmpty($head)) { return $null }
-    return @{ Head = $head; Dirty = $dirty; Fingerprint = $fingerprint }
+    # 지문이 비었으면 "동일"이 아니라 "판정 불가"다. 호출부가 구분할 수 있도록 명시한다.
+    return @{ Head = $head; Dirty = $dirty; Fingerprint = $fingerprint
+              FingerprintOk = (-not [string]::IsNullOrEmpty($fingerprint)) }
 }
 
 # ── 동시 디스패치 락 (§3.9 강제) ─────────────────────────────────────────────
@@ -580,6 +585,8 @@ function Write-KilledLeftover {
         Write-Log "⚠️ [$Stage] $Context — 반쯤 편집된 작업트리가 남았습니다:" WARN
         @($after.Dirty -split "`n") | Where-Object { $_ } | Select-Object -First 20 | ForEach-Object { Write-Host "    $_" }
         Write-Log "복구: 기준점(§3.1)으로 되돌리려면 git checkout -- <경로> / 보존하려면 git stash push -m '$TaskId $Stage 중단분'" WARN
+    } elseif (-not $Before.FingerprintOk -or -not $after.FingerprintOk) {
+        Write-Log "[$Stage] $Context — 작업트리 변경 여부 판정 불가(지문 계산 실패). 남은 변경을 직접 확인할 것" WARN
     } else {
         Write-Log "[$Stage] $Context — 작업트리 변경 없음(깨끗한 상태에서 중단)" INFO
     }
@@ -1128,11 +1135,16 @@ function Dispatch-Stage {
     # 작업트리 변경 유무 — 경고만 한다(차단하지 않음).
     # 게이트는 손대지 않은 트리에서도 통과하므로, "성공했지만 아무것도 안 한" 단계를 게이트만으로는 걸러낼 수 없다.
     # 실제 수행 여부 판단은 다음 리뷰 단계(④ QA · ⑤ 최종리뷰)의 몫이다.
+    # 지문이 없으면 "동일"이 아니라 "판정 불가"다(CFG-BL-014). Dirty 문자열은 이미 수정 상태인 파일을
+    # 더 수정해도 변하지 않으므로, 지문이 죽은 채 비교하면 실제 작업을 무변경으로 단정하게 된다.
     $after = Get-TreeState
-    if ($null -ne $before -and $null -ne $after -and
-        $before.Head -eq $after.Head -and $before.Dirty -eq $after.Dirty -and
-        $before.Fingerprint -eq $after.Fingerprint) {
-        Write-Log "⚠️ [$Stage] 작업트리 변경 없음 (HEAD·미커밋 파일 모두 동일) — 이 단계가 실제로 무엇을 했는지 다음 리뷰 단계에서 확인할 것" WARN
+    if ($null -ne $before -and $null -ne $after) {
+        if (-not $before.FingerprintOk -or -not $after.FingerprintOk) {
+            Write-Log "[$Stage] 작업트리 변경 여부 판정 불가 (지문 계산 실패) — 무변경 경고를 생략합니다" WARN
+        } elseif ($before.Head -eq $after.Head -and $before.Dirty -eq $after.Dirty -and
+                  $before.Fingerprint -eq $after.Fingerprint) {
+            Write-Log "⚠️ [$Stage] 작업트리 변경 없음 (HEAD·미커밋 파일 모두 동일) — 이 단계가 실제로 무엇을 했는지 다음 리뷰 단계에서 확인할 것" WARN
+        }
     }
 
     Write-Log "✅ [$Stage] 성공 + 검증 통과" SUCCESS
