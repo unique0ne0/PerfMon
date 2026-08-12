@@ -933,6 +933,62 @@ function Invoke-VerifyGate {
     return $true
 }
 
+# 역할 판정은 Pipeline Status 섹션에만 한정한다. 다른 체크박스는 검증·인수인계 목록일 수 있다.
+function Get-PacketPipelineStatus {
+    param([string]$PacketPath)
+    $result = @{ Items = @(); FirstUnchecked = $null; HasPipelineStatus = $false }
+    if (-not $PacketPath -or -not (Test-Path -LiteralPath $PacketPath)) { return $result }
+    $inSection = $false
+    foreach ($line in Get-Content -LiteralPath $PacketPath -Encoding UTF8) {
+        if ($line -match '^##\s+Pipeline Status\s*$') { $inSection = $true; $result.HasPipelineStatus = $true; continue }
+        if ($inSection -and $line -match '^##\s+') { break }
+        if (-not $inSection -or $line -notmatch '^\s*-\s*\[([ xX])\]') { continue }
+        $stageMatch = [regex]::Match($line, '[①②③④⑤]')
+        if (-not $stageMatch.Success) { continue }
+        $checked = $Matches[1] -match '[xX]'
+        $item = @{ Index = '①②③④⑤'.IndexOf($stageMatch.Value) + 1; Label = $line.Trim(); Checked = $checked }
+        $result.Items += $item
+        if ($null -eq $result.FirstUnchecked -and -not $item.Checked) { $result.FirstUnchecked = $item }
+    }
+    return $result
+}
+
+function Get-StagePipelineIndexes {
+    param([string]$Stage)
+    switch ($Stage) {
+        'impl' { return @(2, 3) }
+        'qa' { return @(4) }
+        'integration' { return @(5) }
+    }
+}
+
+function Test-RequestedPipelineStage {
+    param([string]$Stage, [string]$PacketPath)
+    $status = Get-PacketPipelineStatus -PacketPath $PacketPath
+    if (-not $status.HasPipelineStatus -or $status.Items.Count -eq 0) { return }
+    $expected = Get-StagePipelineIndexes -Stage $Stage
+    if ($null -eq $status.FirstUnchecked) {
+        Write-Log "⚠️ [$Stage] 패킷 상태 경고 — 이미 완료된 단계를 재실행합니다" WARN
+        return
+    }
+    if ($expected -contains $status.FirstUnchecked.Index) { return }
+    $requested = @($status.Items | Where-Object { $expected -contains $_.Index } | Select-Object -First 1)
+    if ($requested.Count -gt 0 -and $requested[0].Checked) {
+        Write-Log "⚠️ [$Stage] 패킷 상태 경고 — 이미 완료된 단계를 재실행합니다: $($requested[0].Label)" WARN
+    } else {
+        Write-Log "⚠️ [$Stage] 패킷 상태 경고 — 선행 단계 $($status.FirstUnchecked.Index) 미완료: $($status.FirstUnchecked.Label)" WARN
+    }
+}
+
+function Test-PipelineStageUpdated {
+    param([string]$Stage, [string]$PacketPath)
+    $status = Get-PacketPipelineStatus -PacketPath $PacketPath
+    if (-not $status.HasPipelineStatus -or $status.Items.Count -eq 0) { return }
+    $expected = Get-StagePipelineIndexes -Stage $Stage
+    $unchecked = @($status.Items | Where-Object { $expected -contains $_.Index -and -not $_.Checked } | Select-Object -First 1)
+    if ($unchecked.Count -gt 0) { Write-Log "⚠️ [$Stage] 성공했지만 패킷 Pipeline Status가 갱신되지 않았습니다: $($unchecked[0].Label)" WARN }
+}
+
 # 한 단계 디스패치 + hang 감지 + 판정. 성공(종료 코드 정상 + verify 통과) 시 $true.
 # ModelFallback이 있는 단계(impl)는 모델을 바꿔가며 순서대로 시도한다 — 같은 모델을 두 번 부르지 않는다.
 function Dispatch-Stage {
@@ -1093,8 +1149,10 @@ function Invoke-StageWithLock {
     if (-not (Enter-DispatchLock -Stage $Stage)) { return $false }
     $script:LastFailureReason = $null
     try {
+        if ($script:CheckPipelineBefore) { Test-RequestedPipelineStage -Stage $Stage -PacketPath $script:CheckPipelinePacket }
         # 성공/실패 어느 쪽이든 마커 상태를 확정한다 — 실패는 다음 실행까지 눈에 남고, 성공은 즉시 지운다.
         $ok = Dispatch-Stage -Stage $Stage -PromptOverride $PromptOverride
+        if ($ok) { Test-PipelineStageUpdated -Stage $Stage -PacketPath $script:CheckPipelinePacket }
         if ($ok) { Clear-FailureMarker -Stage $Stage }
         else { Write-FailureMarker -Stage $Stage -Reason $script:LastFailureReason }
         return $ok
@@ -1168,6 +1226,8 @@ $archiveMatches = @(Get-ChildItem -Path (Join-Path $RepoRoot '.agents\briefs\arc
 if ($packetMatches.Count -eq 0 -and $archiveMatches.Count -eq 0) {
     Write-Log "작업 패킷을 찾지 못했습니다: $TaskId (저장소별 패킷 경로가 다를 수 있어 경고만 남기고 진행)" WARN
 }
+$script:CheckPipelinePacket = if ($packetMatches.Count -eq 1) { $packetMatches[0].FullName } else { $null }
+$script:CheckPipelineBefore = $false
 
 trap {
     Invoke-DispatcherCleanup
@@ -1209,6 +1269,7 @@ if (-not $DryRun -and -not $script:BashExe) {
 if ($Chain) {
     Write-Log "📋 자동 연쇄 모드 시작 (TaskId: $TaskId): ②③ → ④ → ⑤" INFO
     foreach ($stage in @('impl','qa','integration')) {
+        $script:CheckPipelineBefore = ($stage -eq 'impl')
         if (-not (Invoke-StageWithLock -Stage $stage -PromptOverride '')) {
             Write-Log "❌ [$stage] 실패로 파이프라인 중단 (로그: $($StageConfig[$stage].LogFile))" ERROR
             exit 1
@@ -1233,6 +1294,7 @@ if ($Chain) {
             exit 1
         }
     }
+    $script:CheckPipelineBefore = $true
     $ok = Invoke-StageWithLock -Stage $Stage -PromptOverride $Prompt
     # -Chain has its existing verdict gate above. A standalone QA dispatch must enforce
     # the same fresh pass verdict before its process can exit successfully.
