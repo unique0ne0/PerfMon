@@ -494,6 +494,10 @@ function Exit-DispatchLock {
     if ($lock -and $lock.ProcId -eq $PID -and $lock.TaskId -eq $TaskId) {
         Remove-Item $p -Force -ErrorAction SilentlyContinue
     }
+    # 락 해제 시 자기 TaskId/Stage의 blocked 마커도 함께 지운다. 실행 도중 재귀·다른 경로에서
+    # 같은 TaskId/Stage로 디스패치를 시도해 blocked 마커가 찍히면, Clear-BlockedMarker는
+    # 락 획득 시점에만 도므로 그 이후에 생긴 마커는 성공 후에도 잔존한다(CFG-BL-013).
+    Clear-BlockedMarker -Stage $Stage
     if ($script:ActiveLockStage -eq $Stage) { $script:ActiveLockStage = $null }
 }
 
