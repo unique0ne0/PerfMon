@@ -79,7 +79,9 @@ $script:QaDispatchedAt = $null
 $script:WatcherLogAbs = $null
 $script:ActiveChildProcessId = $null
 $script:ActiveChildStage = $null
+$script:ActiveLockStage = $null
 $script:CimFailureCount = 0
+$script:CleanupStarted = $false
 
 # ── 단계별 설정 (모델·프롬프트는 CLAUDE.md verbatim) ─────────────────────────
 # 개발1팀 기준 모델: openai/gpt-5.6-terra + reasoning medium(= opencode auth login으로 붙인 사용자
@@ -437,6 +439,7 @@ function Enter-DispatchLock {
                 Write-Log "스테일 락 정리: [$s] PID $($lock.ProcId) 는 이미 종료됨" INFO
             } else {
                 Write-Log "⛔ [$s] 락 상태가 정리 중 변경되었습니다. 새 소유자를 지우지 않도록 중단하고 재시도를 요구합니다." ERROR
+                Write-BlockedMarker -Stage $Stage -Reason '스테일 락 정리 중 상태 변경' -OwnerTaskId '-' -OwnerProcessId '-'
                 return $false
             }
             continue
@@ -444,11 +447,13 @@ function Enter-DispatchLock {
         if ($s -eq $Stage) {
             Write-Log "⛔ [$Stage]가 이 저장소에서 이미 실행 중 — 작업 $($lock.TaskId), PID $($lock.ProcId), 시작 $($lock.StartedAt)" ERROR
             Write-Log "§3.9: 같은 저장소에서 한 팀에 두 패킷을 동시에 디스패치하지 않는다. 먼저 끝난 뒤 실행하세요." ERROR
+            Write-BlockedMarker -Stage $Stage -Reason "[$Stage] 단계가 이미 실행 중" -OwnerTaskId $lock.TaskId -OwnerProcessId $lock.ProcId
             return $false
         }
         if ($s -eq 'integration' -or $Stage -eq 'integration') {
             Write-Log "⛔ ⑤ Integration은 저장소당 하나 — 현재 [$s] 실행 중(작업 $($lock.TaskId), PID $($lock.ProcId))" ERROR
             Write-Log "§3.9: 커밋·푸시·history.md·라우터를 공유하므로 동시 실행 시 병합 충돌·기록 유실이 난다." ERROR
+            Write-BlockedMarker -Stage $Stage -Reason 'Integration 단계가 실행 중이라 배타적으로 차단됨' -OwnerTaskId $lock.TaskId -OwnerProcessId $lock.ProcId
             return $false
         }
         Write-Log "⚠️ 같은 저장소에서 [$s](작업 $($lock.TaskId))가 병행 중 — §3.9 상한표상 N=2 조건부 구간" WARN
@@ -457,6 +462,7 @@ function Enter-DispatchLock {
 
     # 재실행은 이전 실패 판정을 무효화한다 — 대시보드가 RUNNING 옆에 낡은 FAILED를 같이 들고 있지 않도록.
     Clear-FailureMarker -Stage $Stage
+    Clear-BlockedMarker -Stage $Stage
 
     $processStartedAt = (Get-Process -Id $PID -ErrorAction Stop).StartTime.ToString('o')
     $body = "$PID|$TaskId|$([datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))|$env:COMPUTERNAME|$processStartedAt"
@@ -466,14 +472,17 @@ function Enter-DispatchLock {
             $writer = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
             try { $writer.Write($body) } finally { $writer.Dispose() }
         } finally { $stream.Dispose() }
+        $script:ActiveLockStage = $Stage
         return $true
     } catch [System.IO.IOException] {
         $lock = Read-DispatchLock $Stage
         if ($lock -and $lock.Alive) {
             Write-Log "⛔ [$Stage] 락 획득 경합 — 작업 $($lock.TaskId), PID $($lock.ProcId)가 먼저 시작됨" ERROR
+            Write-BlockedMarker -Stage $Stage -Reason '락 파일 생성 경합' -OwnerTaskId $lock.TaskId -OwnerProcessId $lock.ProcId
             return $false
         }
         Write-Log "⛔ [$Stage] 락 파일 생성 경합 후 상태를 확정할 수 없습니다. 재시도하세요." ERROR
+        Write-BlockedMarker -Stage $Stage -Reason '락 파일 생성 경합 후 점유자 상태를 확정할 수 없음' -OwnerTaskId '-' -OwnerProcessId '-'
         return $false
     }
 }
@@ -485,6 +494,7 @@ function Exit-DispatchLock {
     if ($lock -and $lock.ProcId -eq $PID -and $lock.TaskId -eq $TaskId) {
         Remove-Item $p -Force -ErrorAction SilentlyContinue
     }
+    if ($script:ActiveLockStage -eq $Stage) { $script:ActiveLockStage = $null }
 }
 
 # ── 실패 마커 ────────────────────────────────────────────────────────────────
@@ -519,6 +529,36 @@ function Write-FailureMarker {
         Write-Log "실패 마커 기록: $FailedPrefix-$TaskId-$Stage ($safeReason)" WARN
     } catch {
         # 마커를 못 써도 단계 결과 자체를 뒤집지 않는다 — 사유는 이미 워처 로그에 남아 있다.
+    }
+}
+
+# ── 차단 마커 ────────────────────────────────────────────────────────────────
+# 차단은 실패와 해소 방법이 다르다. 실패 마커와 합치지 않아 대시보드가 재시도 판단을 보존한다.
+$BlockedPrefix = "$LogDir/.dispatch-blocked"
+
+function Get-BlockedMarkerPath {
+    param([string]$Stage)
+    return (Resolve-RepoPath "$BlockedPrefix-$TaskId-$Stage")
+}
+
+function Clear-BlockedMarker {
+    param([string]$Stage)
+    $p = Get-BlockedMarkerPath $Stage
+    if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+}
+
+function Write-BlockedMarker {
+    param([string]$Stage, [string]$Reason, [string]$OwnerTaskId, [string]$OwnerProcessId)
+    $safeReason = ($Reason -replace '\|', '/').Trim()
+    if ([string]::IsNullOrWhiteSpace($safeReason)) { $safeReason = '알 수 없는 차단' }
+    if ([string]::IsNullOrWhiteSpace($OwnerTaskId)) { $OwnerTaskId = '-' }
+    if ([string]::IsNullOrWhiteSpace($OwnerProcessId)) { $OwnerProcessId = '-' }
+    $body = "$TaskId|$Stage|$([datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))|$safeReason|$OwnerTaskId|$OwnerProcessId"
+    try {
+        [System.IO.File]::WriteAllText((Get-BlockedMarkerPath $Stage), $body, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Log "차단 마커 기록: $BlockedPrefix-$TaskId-$Stage ($safeReason)" WARN
+    } catch {
+        # 차단 마커를 못 써도 실제 락 판정은 바꾸지 않는다.
     }
 }
 
@@ -606,6 +646,10 @@ function Invoke-StageProcess {
 
     $shPath = New-DispatchScript -ToolCmd $ToolCmd -LogFile $logRel -Suffix ([guid]::NewGuid().ToString("N"))
     $startedAt = $null
+    # hang·하드 상한으로 "정책상" 끊은 경우를 표시한다. taskkill은 종료를 요청만 하므로 직후
+    # $proc.HasExited가 아직 $false일 수 있어, 생존 여부로 중단을 판정하면 정상 종료 경로에서
+    # 중단 로그가 뜨고 이미 죽은(재활용됐을 수도 있는) PID를 한 번 더 죽이게 된다.
+    $policyKilled = $false
     try {
         $startedAt = Get-Date
         $proc = Start-Process -FilePath $script:BashExe -ArgumentList @($shPath) -NoNewWindow -PassThru
@@ -685,6 +729,7 @@ function Invoke-StageProcess {
                 } elseif ($Config.KillOnHang) {
                     Write-Log "⚠️ hang 감지 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 프로세스 트리 종료" WARN
                     Stop-ProcessTree $proc.Id
+                    $policyKilled = $true
                     Write-Log "강제 종료 [$Stage] (PID: $($proc.Id), 경과 $([math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1))초)" WARN
                     return 'hang'
                 } elseif (-not $hangReported) {
@@ -707,6 +752,7 @@ function Invoke-StageProcess {
                     $spent = [math]::Round(((Get-Date) - $startedAt).TotalMinutes, 1)
                     Write-Log "⛔ 하드 상한 초과 [$Stage] — $why; 경과 ${spent}분, 로그 $sz B, 트리 CPU +$([math]::Round($cpuNow.TotalSeconds, 2))s; 프로세스 트리 종료" ERROR
                     Stop-ProcessTree $proc.Id
+                    $policyKilled = $true
                     Write-Log "강제 종료 [$Stage] (PID: $($proc.Id), 경과 $([math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1))초)" ERROR
                     return 'timeout'
                 }
@@ -720,6 +766,21 @@ function Invoke-StageProcess {
     } finally {
         if ($null -ne $startedAt) {
             $ElapsedSeconds.Value = [math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1)
+        }
+        # Ctrl+C(파이프라인 중단)는 이 finally를 **동기적으로** 먼저 실행한다. 비동기 이벤트
+        # 액션(Invoke-DispatcherCleanup)은 그 뒤에야 큐에서 돌기 때문에, 여기서 추적 변수를
+        # 그냥 비우면 정리 함수가 항상 $null을 보고 아무것도 못 한다 — 모델 자식 프로세스가
+        # 살아남아 다음 디스패치와 같은 저장소를 동시에 쓴다(§3.9가 막으려던 바로 그 상태).
+        # 자식이 아직 살아 있다는 건 정상 종료가 아니라는 뜻이므로, 여기서 직접 끊는다.
+        # 정리 함수 쪽 경로도 그대로 두어, finally가 돌지 않는 경우에도 한쪽은 반드시 걸린다
+        # (양쪽 다 $script:CleanupStarted / HasExited로 중복 실행을 막는다).
+        if ($proc -and -not $policyKilled -and -not $proc.HasExited) {
+            if ($Stage -eq 'integration') {
+                Write-Log "⚠️ 디스패처 중단 — integration PID $($proc.Id)는 커밋/푸시 단계라 자동 종료하지 않는다." WARN
+            } else {
+                Stop-ProcessTree $proc.Id
+                Write-Log "디스패처 중단 — 자식 프로세스 트리 종료 PID $($proc.Id)" WARN
+            }
         }
         Remove-Item $shPath -ErrorAction SilentlyContinue
         $script:ActiveChildProcessId = $null; $script:ActiveChildStage = $null
@@ -1011,6 +1072,23 @@ function Test-QaVerdict {
     return $false
 }
 
+function Invoke-DispatcherCleanup {
+    if ($script:CleanupStarted) { return }
+    $script:CleanupStarted = $true
+    try {
+        if ($script:ActiveChildProcessId) {
+            if ($script:ActiveChildStage -eq 'integration') {
+                Write-Log "⚠️ dispatcher interruption left integration PID $script:ActiveChildProcessId running; do not kill a commit/push stage automatically." WARN
+            } else {
+                Stop-ProcessTree $script:ActiveChildProcessId
+                Write-Log "dispatcher interruption stopped child process tree PID $script:ActiveChildProcessId" WARN
+            }
+        }
+    } finally {
+        if ($script:ActiveLockStage) { Exit-DispatchLock -Stage $script:ActiveLockStage }
+    }
+}
+
 # ── 메인 ─────────────────────────────────────────────────────────────────────
 Validate-TaskId -Id $TaskId
 if ($Chain -and $Stage) { Write-Log '-Chain and -Stage are mutually exclusive.' ERROR; exit 1 }
@@ -1031,15 +1109,22 @@ if ($packetMatches.Count -eq 0 -and $archiveMatches.Count -eq 0) {
 }
 
 trap {
-    if ($script:ActiveChildProcessId) {
-        if ($script:ActiveChildStage -eq 'integration') {
-            Write-Log "⚠️ dispatcher interruption left integration PID $script:ActiveChildProcessId running; do not kill a commit/push stage automatically." WARN
-        } else {
-            Stop-ProcessTree $script:ActiveChildProcessId
-            Write-Log "dispatcher interruption stopped child process tree PID $script:ActiveChildProcessId" WARN
-        }
-    }
+    Invoke-DispatcherCleanup
     break
+}
+
+try {
+    # Console.CancelKeyPress is raised on a native console thread. A PowerShell
+    # scriptblock delegate attached with add_CancelKeyPress has no runspace on
+    # that thread and silently fails to invoke cleanup. Register-ObjectEvent
+    # marshals the callback onto PowerShell's event queue/runspace.
+    $null = Register-ObjectEvent -InputObject ([Console]) -EventName CancelKeyPress -Action {
+        $event.SourceEventArgs.Cancel = $true
+        Invoke-DispatcherCleanup
+    }
+    $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { Invoke-DispatcherCleanup }
+} catch {
+    Write-Log "⚠️ 종료 이벤트 등록 실패: $($_.Exception.Message)" WARN
 }
 
 # 저장소 루트 검증 — $RepoRoot는 "이 스크립트가 <프로젝트>/scripts/ 에 있다"는 전제로 계산된다.
