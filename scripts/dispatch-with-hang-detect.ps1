@@ -123,7 +123,7 @@ $StageConfig = @{
     'impl' = @{
         Command = 'opencode run --pure --auto -m {MODEL} --variant medium'
         ModelFallback = @('openai/gpt-5.6-terra', 'opencode-go/deepseek-v4-flash', 'opencode/big-pickle')
-        DefaultPrompt = "작업 $TaskId — [②구현] handoff 확인하고 UI/UX 디자인, 프런트엔드, 백엔드, SNS/마케팅 관련 스킬 최대한 적용해서 다음 단계 구현 진행시켜. [③자체리뷰] 1차 구현이 완료되었는데 개발의도 및 계획이 코드에 잘 반영되었는지, 로직과 코드품질이 어떤지 관련스킬을 최대한 적용해서 제로베이스에서 자체 리뷰하고 수정해. 이어서 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ②③을 갱신해"
+        DefaultPrompt = "작업 $TaskId — [②구현] handoff 확인하고 패킷의 Done When과 Amendments를 충실히 따라 다음 단계 구현을 진행해. 구현 완료 후 [③자체리뷰] 제로베이스에서 개발 의도·계획 반영 여부와 로직·코드 품질을 점검하고 필요시 수정해. 이어서 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ②③을 갱신해"
         LogFile = "$TaskLogPrefix-impl.log"
         KillOnHang = $true
         Retry = $false
@@ -131,7 +131,7 @@ $StageConfig = @{
     }
     'qa' = @{
         Command = 'codex exec'
-        DefaultPrompt = "작업 $TaskId — 개발팀의 1차 구현과 자체 리뷰가 완료되었어. Handoff 확인하고 제로베이스에서 서비스 및 제품 개발 QA 최종 책임자로서 관련스킬 전부 적용해서 구현 및 코드 품질에 대해 리뷰 실시해. 발견한 결함은 직접 수정한 뒤 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ④를 갱신해. 마지막으로 QA 판정을 .agents/briefs/logs/$TaskId-qa-verdict.json 파일에 JSON으로 남겨 — ⑤ 진행 가능하면 verdict를 pass, 차단성 이슈로 ⑤ 진행 불가면 verdict를 blocked(사유는 reason)로 기록해"
+        DefaultPrompt = "작업 $TaskId — 개발팀의 1차 구현과 자체 리뷰가 완료되었어. Handoff 확인하고 제로베이스에서 구현 및 코드 품질에 대해 리뷰해. 발견한 결함은 직접 수정한 뒤 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ④를 갱신해. 마지막으로 QA 판정을 .agents/briefs/logs/$TaskId-qa-verdict.json 파일에 JSON으로 남겨 — ⑤ 진행 가능하면 verdict를 pass, 차단성 이슈로 ⑤ 진행 불가면 verdict를 blocked(사유는 reason)로 기록해"
         LogFile = "$TaskLogPrefix-qa.log"
         ReportFile = "$TaskLogPrefix-qa-last.md"
         VerdictFile = "$TaskLogPrefix-qa-verdict.json"
@@ -142,7 +142,7 @@ $StageConfig = @{
     }
     'integration' = @{
         Command = 'claude'
-        DefaultPrompt = "작업 $TaskId — 개발1팀의 구현과 QA팀의 리뷰가 완료되었어. 최종 서비스/제품 개발 및 운영책임자로서 모든 스킬 적용해서 제로베이스에서 문제없는지 리뷰해봐. scripts/verify.ps1 게이트 통과 + 실동작 E2E 검증까지 마치고, 문제없으면 Integration을 완료 처리하고 Pipeline Status ⑤ 갱신 + 커밋·푸시·history.md 기록을 한 세트로 수행해"
+        DefaultPrompt = "작업 $TaskId — 개발1팀의 구현과 QA팀의 리뷰가 완료되었어. 제로베이스에서 문제없는지 리뷰해. scripts/verify.ps1 게이트 통과 + 실동작 E2E 검증까지 마치고, 문제없으면 Integration을 완료 처리하고 Pipeline Status ⑤ 갱신 + 커밋·푸시·history.md 기록을 한 세트로 수행해"
         LogFile = "$TaskLogPrefix-integration.log"
         KillOnHang = $false
         Retry = $false
