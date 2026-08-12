@@ -584,7 +584,7 @@ function Write-KilledLeftover {
 # 모델 전환이 안전한 실패를 순수하게 분류한다. 코드 작업 중 우연히 같은 단어가 나오는 오탐을 막기 위해
 # 과금·가용성 문구는 좁게 고정하고, 무패턴 전환은 산출 없는 조기 실패 네 조건을 모두 요구한다.
 function Get-SwitchableFailureClass {
-    param([string]$Tail, [int]$LogBytes, [double]$ElapsedSeconds, [bool]$TreeChanged)
+    param([string]$Tail, [int64]$LogBytes, [double]$ElapsedSeconds, [bool]$TreeChanged, [int64]$LogStartBytes = 0)
 
     $patterns = @(
         'Insufficient balance',
@@ -620,7 +620,10 @@ function Get-SwitchableFailureClass {
         if ($Tail -match [regex]::Escape($p)) { return 'unavailable' }
     }
 
-    if ($LogBytes -lt 2KB -and $ElapsedSeconds -lt 60 -and -not $TreeChanged) {
+    # The no-output guard measures bytes written by this attempt, not historical log size.
+    # Attempt logs start at zero today; retaining the offset keeps this contract safe if that changes.
+    $logGrowth = [math]::Max(0, $LogBytes - $LogStartBytes)
+    if ($logGrowth -lt 2KB -and $ElapsedSeconds -lt 60 -and -not $TreeChanged) {
         return 'noop'
     }
     return ''
@@ -787,13 +790,9 @@ function Invoke-StageProcess {
     }
 }
 
-# 한 단계 디스패치 + hang 감지 + 판정. 성공(종료 코드 정상 + verify 통과) 시 $true.
-# ModelFallback이 있는 단계(impl)는 모델을 바꿔가며 순서대로 시도한다 — 같은 모델을 두 번 부르지 않는다
-# (막힌 프로바이더/모델을 재시도해봐야 하드 상한만 다시 채우고 끝난다는 게 2026-08-08 CFG-001 실측).
-function Dispatch-Stage {
-    param([string]$Stage, [string]$PromptOverride)
-    $config = $StageConfig[$Stage]
-    $logRel = $config.LogFile
+function Resolve-ModelChain {
+    param([hashtable]$Config, [string]$Stage)
+
     # PS 5.1 주의: `$models = if (...) {...} else { @($null) }` 형태로 쓰면 @($null)이
     # 단일 원소 언랩으로 $models 자체가 $null이 되어버린다(2026-08-08 CFG-001 QA 무동작 실측 —
     # while ($modelIndex -lt $models.Count)가 0 -lt 0으로 죽어 프로세스가 아예 안 뜸). 분기 안에서
@@ -828,6 +827,120 @@ function Dispatch-Stage {
             $slots = ($providers[$provider] | ForEach-Object { "${_}번" }) -join ', '
             Write-Log "⚠️ [$Stage] 폴백 체인에 프로바이더가 중복됩니다: $provider ($slots) — 한쪽이 막히면 같이 막힙니다" WARN
         }
+    }
+
+    # Preserve a one-slot chain for stages without ModelFallback. PowerShell unwraps a
+    # one-item array on normal return, turning @($null) into $null for the caller.
+    return ,$models
+}
+
+function Get-AttemptLogPath {
+    param([string]$LogFile, [int]$AttemptNumber)
+    $extension = [System.IO.Path]::GetExtension($LogFile)
+    $base = $LogFile.Substring(0, $LogFile.Length - $extension.Length)
+    return "${base}.attempt${AttemptNumber}${extension}"
+}
+
+function Update-LatestAttemptLog {
+    param([string]$AttemptLog, [string]$LatestLog)
+    $attemptAbs = Resolve-RepoPath $AttemptLog
+    $latestAbs = Resolve-RepoPath $LatestLog
+    if (-not (Test-Path $attemptAbs)) { return }
+    [System.IO.File]::Copy($attemptAbs, $latestAbs, $true)
+}
+
+function Invoke-ModelAttempt {
+    param([string]$Stage, [hashtable]$Config, [string]$ToolCmd, [string]$AttemptLog, [string]$LatestLog)
+
+    $attemptConfig = @{}
+    foreach ($key in $Config.Keys) { $attemptConfig[$key] = $Config[$key] }
+    $attemptConfig.LogFile = $AttemptLog
+    # 시도 시작 시점의 로그 크기를 기록한다. noop 판정이 절대 크기가 아니라 이 시도가 쓴 증가량을
+    # 봐야 하므로, 시작 오프셋을 측정해 Classify-AttemptFailure에 넘겨야truncate/공유 로그로 바뀌어도
+    # CFG-004의 무산출 안전망이 살아있다. 현재는 매 시도 새 파일이라 항상 0이지만, 계약을 이곳에서 확정한다.
+    $attemptLogAbs = Resolve-RepoPath $AttemptLog
+    $logStartBytes = if (Test-Path $attemptLogAbs) { (Get-Item $attemptLogAbs).Length } else { 0 }
+    $exit = $null; $elapsedSeconds = 0
+    $outcome = Invoke-StageProcess -Stage $Stage -Config $attemptConfig -ToolCmd $ToolCmd -ExitCode ([ref]$exit) -ElapsedSeconds ([ref]$elapsedSeconds)
+    Update-LatestAttemptLog -AttemptLog $AttemptLog -LatestLog $LatestLog
+    return @{ Outcome = $outcome; ExitCode = $exit; ElapsedSeconds = $elapsedSeconds; LogStartBytes = $logStartBytes }
+}
+
+function Classify-AttemptFailure {
+    param([hashtable]$Attempt, [hashtable]$Before, [string]$AttemptLog)
+
+    $outcome = $Attempt.Outcome
+    if ($outcome -ne 'ok' -or $null -eq $Attempt.ExitCode -or $Attempt.ExitCode -eq 0) { return $outcome }
+    $logAbs = Resolve-RepoPath $AttemptLog
+    $logBytes = if (Test-Path $logAbs) { (Get-Item $logAbs).Length } else { 0 }
+    $tail = if (Test-Path $logAbs) { (Get-Content $logAbs -Tail 40 -ErrorAction SilentlyContinue) -join "`n" } else { '' }
+    $afterAttempt = Get-TreeState
+    $treeChanged = $null -eq $Before -or $null -eq $afterAttempt -or
+        $Before.Head -ne $afterAttempt.Head -or $Before.Dirty -ne $afterAttempt.Dirty
+    if (-not $treeChanged) { $treeChanged = $Before.Fingerprint -ne $afterAttempt.Fingerprint }
+    $startBytes = if ($Attempt.ContainsKey('LogStartBytes')) { $Attempt.LogStartBytes } else { 0 }
+    return (Get-SwitchableFailureClass -Tail $tail -LogBytes $logBytes -ElapsedSeconds $Attempt.ElapsedSeconds -TreeChanged $treeChanged -LogStartBytes $startBytes)
+}
+
+function Invoke-VerifyGate {
+    param([string]$Stage)
+
+    Write-Log "검증 게이트(scripts/verify.ps1) 실행..." INFO
+    $verifyLogRel = "$LogDir/$TaskId-verify-$Stage.log"
+    $verifyLogAbs = Resolve-RepoPath $verifyLogRel
+    # PS 5.1: 이 파일은 전역이 $ErrorActionPreference='Stop'인데, native 명령의 stderr를 2>&1로
+    # 성공 스트림에 합치면 stderr 한 줄마다 NativeCommandError가 terminating error로 승격된다.
+    # verify가 exit 0으로 끝나도 하위 프로세스(테스트 러너 등)가 stderr를 한 줄만 쓰면 디스패치
+    # 스크립트 전체가 그 자리에서 죽어 — 폴백도 실패 마커도 남지 않는다. 이 호출 구간만 Continue로 낮춘다.
+    $verifyOut = Join-Path ([System.IO.Path]::GetTempPath()) ("verify-$TaskId-$Stage-$([guid]::NewGuid().ToString('N')).out")
+    $verifyErr = Join-Path ([System.IO.Path]::GetTempPath()) ("verify-$TaskId-$Stage-$([guid]::NewGuid().ToString('N')).err")
+    $verifyMinutes = [Math]::Max(5, $HardTimeoutMinutes)
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $verify = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $RepoRoot 'scripts\verify.ps1')) -NoNewWindow -PassThru -RedirectStandardOutput $verifyOut -RedirectStandardError $verifyErr
+        $null = $verify.Handle
+        if (-not $verify.WaitForExit($verifyMinutes * 60 * 1000)) {
+            Stop-ProcessTree $verify.Id
+            $script:LastFailureReason = 'verify 게이트 시간 초과'
+            Write-Log "❌ [$Stage] verify 게이트가 ${verifyMinutes}분 안에 끝나지 않아 종료했습니다" ERROR
+            return $false
+        }
+        $verifyExit = $verify.ExitCode
+        $verifyEncoding = [Console]::OutputEncoding
+        $verifyOutput = @()
+        foreach ($capture in @($verifyOut, $verifyErr)) {
+            if (-not (Test-Path $capture)) { continue }
+            $captureText = [System.IO.File]::ReadAllText($capture, $verifyEncoding)
+            if ($captureText.Length -gt 0) { $verifyOutput += ($captureText.TrimEnd("`r", "`n") -split "`r?`n") }
+        }
+    } finally {
+        $ErrorActionPreference = $prevEap
+        Remove-Item $verifyOut, $verifyErr -ErrorAction SilentlyContinue
+    }
+    $verifyOutput | Out-File $verifyLogAbs -Encoding UTF8
+    if ($verifyExit -ne 0) {
+        Write-Log "❌ [$Stage] 검증 게이트 실패 — verify 로그: $verifyLogRel" ERROR
+        $script:LastFailureReason = "verify 게이트 실패 ($verifyLogRel)"
+        Write-Log "마지막 30줄:" WARN
+        $verifyOutput | Select-Object -Last 30 | ForEach-Object { Write-Host "    $_" }
+        return $false
+    }
+    return $true
+}
+
+# 한 단계 디스패치 + hang 감지 + 판정. 성공(종료 코드 정상 + verify 통과) 시 $true.
+# ModelFallback이 있는 단계(impl)는 모델을 바꿔가며 순서대로 시도한다 — 같은 모델을 두 번 부르지 않는다.
+function Dispatch-Stage {
+    param([string]$Stage, [string]$PromptOverride)
+    $config = $StageConfig[$Stage]
+    $logRel = $config.LogFile
+    $models = Resolve-ModelChain -Config $config -Stage $Stage
+
+    if ($models.Count -eq 0) {
+        $script:LastFailureReason = '모델 체인이 비어 있음 — 단계 구성 오류'
+        Write-Log "❌ [$Stage] $script:LastFailureReason" ERROR
+        return $false
     }
 
     if ($DryRun) {
@@ -869,6 +982,7 @@ function Dispatch-Stage {
     $outcome = $null
     $attemptFailures = @()
     $modelIndex = 0
+    $attemptNumber = 0
     while ($modelIndex -lt $models.Count) {
         $model = $models[$modelIndex]
         $toolCmd = Build-ToolCommand -Config $config -Stage $Stage -PromptOverride $PromptOverride -Model $model
@@ -879,8 +993,12 @@ function Dispatch-Stage {
 
         $attempt = 1
         while ($true) {
-            $elapsedSeconds = 0
-            $outcome = Invoke-StageProcess -Stage $Stage -Config $config -ToolCmd $toolCmd -ExitCode ([ref]$exit) -ElapsedSeconds ([ref]$elapsedSeconds)
+            $attemptNumber++
+            $attemptLog = Get-AttemptLogPath -LogFile $logRel -AttemptNumber $attemptNumber
+            Write-Log "시도 로그: $attemptLog (latest: $logRel)" INFO
+            $attemptResult = Invoke-ModelAttempt -Stage $Stage -Config $config -ToolCmd $toolCmd -AttemptLog $attemptLog -LatestLog $logRel
+            $exit = $attemptResult.ExitCode
+            $outcome = Classify-AttemptFailure -Attempt $attemptResult -Before $before -AttemptLog $attemptLog
             if ($outcome -eq 'hang' -and $config.Retry -and $attempt -eq 1) {
                 # hang-detect-agent Iron Law: 재시도는 최대 1회. 두 번 멈추면 작업 자체가 깨진 것이다.
                 $attempt = 2
@@ -892,19 +1010,6 @@ function Dispatch-Stage {
             break
         }
 
-        # 과금·가용성 거부는 정상 종료 + exit 1로 오므로 모델을 바꾸면 풀릴 수 있다. 로그가 작고
-        # 작업트리도 깨끗한 즉시 실패만 무패턴 안전망으로 전환해 실제 구현 실패의 재시도를 막는다.
-        if ($outcome -eq 'ok' -and $null -ne $exit -and $exit -ne 0) {
-            $logAbs = Resolve-RepoPath $logRel
-            $logBytes = if (Test-Path $logAbs) { (Get-Item $logAbs).Length } else { 0 }
-            $tail = if (Test-Path $logAbs) { (Get-Content $logAbs -Tail 40 -ErrorAction SilentlyContinue) -join "`n" } else { '' }
-            $afterAttempt = Get-TreeState
-            $treeChanged = $null -eq $before -or $null -eq $afterAttempt -or
-                $before.Head -ne $afterAttempt.Head -or $before.Dirty -ne $afterAttempt.Dirty
-            if (-not $treeChanged) { $treeChanged = $before.Fingerprint -ne $afterAttempt.Fingerprint }
-            $switchClass = Get-SwitchableFailureClass -Tail $tail -LogBytes $logBytes -ElapsedSeconds $elapsedSeconds -TreeChanged $treeChanged
-            if ($switchClass) { $outcome = $switchClass }
-        }
         if ($outcome -eq 'ok') { break }
 
         if ($outcome -eq 'hang') { $reason = 'hang' }
@@ -958,55 +1063,7 @@ function Dispatch-Stage {
         return $false
     }
 
-    # 공통 검증 게이트 재확인 (구현·QA·Integration 공통).
-    Write-Log "검증 게이트(scripts/verify.ps1) 실행..." INFO
-    $verifyLogRel = "$LogDir/$TaskId-verify-$Stage.log"
-    $verifyLogAbs = Resolve-RepoPath $verifyLogRel
-    # PS 5.1: 이 파일은 전역이 $ErrorActionPreference='Stop'인데, native 명령의 stderr를 2>&1로
-    # 성공 스트림에 합치면 stderr 한 줄마다 NativeCommandError가 terminating error로 승격된다.
-    # verify가 exit 0으로 끝나도 하위 프로세스(테스트 러너 등)가 stderr를 한 줄만 쓰면 디스패치
-    # 스크립트 전체가 그 자리에서 죽어 — 폴백도 실패 마커도 남지 않는다. 이 호출 구간만 Continue로 낮춘다.
-    $verifyOut = Join-Path ([System.IO.Path]::GetTempPath()) ("verify-$TaskId-$Stage-$([guid]::NewGuid().ToString('N')).out")
-    $verifyErr = Join-Path ([System.IO.Path]::GetTempPath()) ("verify-$TaskId-$Stage-$([guid]::NewGuid().ToString('N')).err")
-    $verifyMinutes = [Math]::Max(5, $HardTimeoutMinutes)
-    $prevEap = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $verify = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $RepoRoot 'scripts\verify.ps1')) -NoNewWindow -PassThru -RedirectStandardOutput $verifyOut -RedirectStandardError $verifyErr
-        # Dispatch-Stage의 단계 프로세스와 같은 이유로 Handle을 먼저 캐시한다. 이게 없으면 verify가 exit 0으로 통과해도
-        # $verify.ExitCode가 $null이라 아래 `-ne 0`이 항상 참이 되어 **게이트가 성공을 실패로 뒤집는다**
-        # (2026-08-10 CFG006 실측: verify 7스텝 ALL PASS인데 ② 단계가 실패 마커를 남기고 중단).
-        $null = $verify.Handle
-        if (-not $verify.WaitForExit($verifyMinutes * 60 * 1000)) {
-            Stop-ProcessTree $verify.Id
-            $script:LastFailureReason = 'verify 게이트 시간 초과'
-            Write-Log "❌ [$Stage] verify 게이트가 ${verifyMinutes}분 안에 끝나지 않아 종료했습니다" ERROR
-            return $false
-        }
-        $verifyExit = $verify.ExitCode
-        # 리다이렉트된 자식(verify)의 출력 인코딩은 **디스패처를 띄운 콘솔의 코드페이지**를 따라간다
-        # (2026-08-10 CFG006 실측: CP65001 콘솔이면 UTF-8 바이트, CP949 콘솔이면 CP949 바이트).
-        # 그래서 판독을 한쪽으로 못 박으면(-Encoding UTF8 / 기본 ANSI 둘 다) 반대쪽 콘솔에서 실행할 때
-        # verify 로그의 한글이 통째로 깨진다. 부모의 실제 출력 인코딩으로 읽어 양쪽 모두에서 성립시킨다.
-        $verifyEncoding = [Console]::OutputEncoding
-        $verifyOutput = @()
-        foreach ($capture in @($verifyOut, $verifyErr)) {
-            if (-not (Test-Path $capture)) { continue }
-            $captureText = [System.IO.File]::ReadAllText($capture, $verifyEncoding)
-            if ($captureText.Length -gt 0) { $verifyOutput += ($captureText.TrimEnd("`r", "`n") -split "`r?`n") }
-        }
-    } finally {
-        $ErrorActionPreference = $prevEap
-        Remove-Item $verifyOut, $verifyErr -ErrorAction SilentlyContinue
-    }
-    $verifyOutput | Out-File $verifyLogAbs -Encoding UTF8
-    if ($verifyExit -ne 0) {
-        Write-Log "❌ [$Stage] 검증 게이트 실패 — verify 로그: $verifyLogRel" ERROR
-        $script:LastFailureReason = "verify 게이트 실패 ($verifyLogRel)"
-        Write-Log "마지막 30줄:" WARN
-        $verifyOutput | Select-Object -Last 30 | ForEach-Object { Write-Host "    $_" }
-        return $false
-    }
+    if (-not (Invoke-VerifyGate -Stage $Stage)) { return $false }
 
     # 작업트리 변경 유무 — 경고만 한다(차단하지 않음).
     # 게이트는 손대지 않은 트리에서도 통과하므로, "성공했지만 아무것도 안 한" 단계를 게이트만으로는 걸러낼 수 없다.
