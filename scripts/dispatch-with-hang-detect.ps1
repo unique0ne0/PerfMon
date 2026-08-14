@@ -56,6 +56,8 @@ $WarningPreference = "SilentlyContinue"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $LogDir = ".agents/briefs/logs"
 $TaskLogPrefix = "$LogDir/$TaskId"
+$ProfileModule = Join-Path $PSScriptRoot 'model-profile.ps1'
+$ProfileConfigPath = Join-Path $PSScriptRoot 'model-profiles.json'
 
 # 동시 디스패치 락. 로그 디렉터리 **안**에 둔다 — Get-TreeState가 이 경로를 이미 걸러내므로
 # 락 파일 자체가 작업트리를 더럽혀 무변경 감지를 무력화하는 자충수를 피한다.
@@ -71,16 +73,13 @@ $BusyCpuRate = 0.05
 # little CPU and producing no output. This rate avoids killing those active stages.
 $BusyIoBytesPerSec = 65536
 
-# 마지막 실패 사유 — Dispatch-Stage가 채우고 Invoke-StageWithLock이 실패 마커에 기록한다.
-$script:LastFailureReason = $null
-
-# QA 단계 디스패치 시각 — verdict가 "이번 실행에서" 쓰였는지 판정하는 기준. 미실행이면 $null.
-$script:QaDispatchedAt = $null
 $script:WatcherLogAbs = $null
+# CFG009: 종료 이벤트 핸들러는 인자를 받을 수 없어, 자식·락 상태를 스크립트 스코프에서 공유해야 한다.
 $script:ActiveChildProcessId = $null
 $script:ActiveChildStage = $null
 $script:ActiveLockStage = $null
 $script:CimFailureCount = 0
+# CFG009: 종료 이벤트 핸들러는 인자를 받을 수 없어, 재진입 방지 상태를 스크립트 스코프에서 공유해야 한다.
 $script:CleanupStarted = $false
 
 # ── 단계별 설정 (모델·프롬프트는 CLAUDE.md verbatim) ─────────────────────────
@@ -130,7 +129,7 @@ $StageConfig = @{
         HangSeconds = 600
     }
     'qa' = @{
-        Command = 'codex exec'
+        Command = ''
         DefaultPrompt = "작업 $TaskId — 개발팀의 1차 구현과 자체 리뷰가 완료되었어. Handoff 확인하고 제로베이스에서 구현 및 코드 품질에 대해 리뷰해. 발견한 결함은 직접 수정한 뒤 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ④를 갱신해. 마지막으로 QA 판정을 .agents/briefs/logs/$TaskId-qa-verdict.json 파일에 JSON으로 남겨 — ⑤ 진행 가능하면 verdict를 pass, 차단성 이슈로 ⑤ 진행 불가면 verdict를 blocked(사유는 reason)로 기록해"
         LogFile = "$TaskLogPrefix-qa.log"
         ReportFile = "$TaskLogPrefix-qa-last.md"
@@ -141,8 +140,8 @@ $StageConfig = @{
         HangSeconds = 600
     }
     'integration' = @{
-        Command = 'claude'
-        DefaultPrompt = "작업 $TaskId — 개발1팀의 구현과 QA팀의 리뷰가 완료되었어. 제로베이스에서 문제없는지 리뷰해. scripts/verify.ps1 게이트 통과 + 실동작 E2E 검증까지 마치고, 문제없으면 Integration을 완료 처리하고 Pipeline Status ⑤ 갱신 + 커밋·푸시·history.md 기록을 한 세트로 수행해"
+        Command = ''
+        DefaultPrompt = "작업 $TaskId — 현재 프로세스가 하네스가 시작한 유일한 Integration 본체다. 별도 Integration을 디스패치하거나 PID·락을 감시하거나 프로세스를 종료하지 마. 개발1팀의 구현과 QA팀의 리뷰가 완료되었어. 제로베이스에서 문제없는지 리뷰해. scripts/verify.ps1 게이트 통과 + 실동작 E2E 검증까지 마치고, 문제없으면 Integration을 로컬 완료 처리하고 Pipeline Status ⑤와 history.md를 갱신해. 패킷 Amendment에 이번 작업의 자동 commit/push 사용자 승인이 명시되어 있으면 관련 변경만 커밋·push하고, 없으면 별도 승인 전에는 수행하지 마."
         LogFile = "$TaskLogPrefix-integration.log"
         KillOnHang = $false
         Retry = $false
@@ -165,12 +164,18 @@ function Write-Log {
 }
 
 # 워처 판단은 단계 로그와 분리한다. 단계 로그에 하트비트를 쓰면 로그 무변화 감지가 무력화된다.
+# CFG017: 워처 로그는 사이클 간 증거 보존을 위해 truncate 하지 않고 append 한다 — 재디스패치가
+# 이전 사이클의 관찰 이력을 덮어쓰지 않도록. 대시보드의 hang 판정은 LastWriteTime만 본다.
 function Initialize-WatcherLog {
     param([string]$Stage)
     $script:WatcherLogAbs = Resolve-RepoPath "$LogDir/$TaskId-$Stage-watcher.log"
     $parent = Split-Path -Parent $script:WatcherLogAbs
     if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-    [System.IO.File]::WriteAllText($script:WatcherLogAbs, '', (New-Object System.Text.UTF8Encoding($false)))
+    if (Test-Path $script:WatcherLogAbs) {
+        [System.IO.File]::AppendAllText($script:WatcherLogAbs, "`n===== $Stage 사이클 시작 $([datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss')) =====`n", (New-Object System.Text.UTF8Encoding($false)))
+    } else {
+        [System.IO.File]::WriteAllText($script:WatcherLogAbs, '', (New-Object System.Text.UTF8Encoding($false)))
+    }
 }
 
 # 저장소 상대 경로(bash·프롬프트가 쓰는 형태)를 PowerShell 쪽 절대 경로로 변환.
@@ -178,6 +183,42 @@ function Initialize-WatcherLog {
 function Resolve-RepoPath {
     param([string]$RelativePath)
     return (Join-Path $RepoRoot ($RelativePath -replace '/','\'))
+}
+
+function Get-SessionHealthRole {
+    param([string]$Stage)
+    switch ($Stage) {
+        'impl' { return 'implementation' }
+        'qa' { return 'qa' }
+        'integration' { return 'integration' }
+        default { return 'unknown' }
+    }
+}
+
+function Invoke-SessionHealthCheck {
+    param([string]$Stage)
+    # Health warnings are advisory. A missing, damaged, or newly deployed helper must
+    # never prevent the dispatcher from starting the requested stage.
+    # AST fixture tests import this function without a script path. In production
+    # PSScriptRoot is always the deployed scripts directory.
+    $helperBase = if ($PSScriptRoot) { $PSScriptRoot } else { Join-Path $RepoRoot 'scripts' }
+    $helper = Join-Path $helperBase 'session-health.ps1'
+    if (-not (Test-Path -LiteralPath $helper)) {
+        Write-Log "[$Stage] session-health helper missing; advisory check skipped" WARN
+        return
+    }
+    try {
+        $healthArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $helper, '-CheckAndRecord', '-ProjectRoot', $RepoRoot, '-TaskId', $TaskId, '-Stage', $Stage, '-Role', (Get-SessionHealthRole -Stage $Stage))
+        if (-not [string]::IsNullOrWhiteSpace($env:ORCHESTRATION_DRIVER_CYCLE_ID)) {
+            $healthArgs += @('-DriverCycleId', $env:ORCHESTRATION_DRIVER_CYCLE_ID)
+        }
+        $warnings = @(& powershell @healthArgs 2>&1)
+        foreach ($warning in $warnings) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$warning)) { Write-Log "[$Stage] $warning" WARN }
+        }
+    } catch {
+        Write-Log "[$Stage] session-health advisory check failed: $($_.Exception.Message)" WARN
+    }
 }
 
 function Validate-TaskId {
@@ -238,15 +279,117 @@ function ConvertTo-BashSingleQuoted {
 
 # 단계별 도구 명령 문자열(리다이렉트 제외 — bash 래퍼에서 처리).
 # $Model: ModelFallback 체인을 쓰는 단계(impl)에서 Command의 {MODEL} 자리에 넣을 값. 다른 단계는 무시.
+function Resolve-AntigravityProjectId {
+    param([string]$RepositoryRoot)
+    if (-not $env:USERPROFILE) { throw 'Antigravity project resolution requires USERPROFILE.' }
+    $projectsDir = Join-Path $env:USERPROFILE '.gemini\config\projects'
+    if (-not (Test-Path -LiteralPath $projectsDir)) { throw "Antigravity projects directory not found: $projectsDir" }
+    $wanted = [IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\').Replace('\','/').ToLowerInvariant()
+    foreach ($file in @(Get-ChildItem -LiteralPath $projectsDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+        try { $project = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+        foreach ($resource in @($project.projectResources.resources)) {
+            $uri = if ($resource.folderUri) { [string]$resource.folderUri } elseif ($resource.gitFolder.folderUri) { [string]$resource.gitFolder.folderUri } else { '' }
+            if (-not $uri.StartsWith('file:', [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $decoded = [Uri]::UnescapeDataString(($uri -replace '^file:/+', ''))
+            $candidate = $decoded.TrimEnd('/').ToLowerInvariant()
+            if ($candidate -eq $wanted) {
+                $id = [string]$project.id
+                if ($id -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,127}$') { throw "Invalid Antigravity project id in $($file.FullName)" }
+                return $id
+            }
+        }
+    }
+    throw "No Antigravity project maps repository '$RepositoryRoot'. Run 'agy --new-project' from that repository root after explicit user approval."
+}
+
+# CFG017: Antigravity 어댑터 단계의 읽기 전용 preflight. PATH·버전·project mapping을 진단만 하고
+# 외부 설정(설치·매핑 생성·환경 변수·config 변경)을 절대 수정하지 않는다. 실패는 재시도 불가능한
+# config failure이며, 성공해도 Diagnostics(읽기 전용 확인 결과)만 반환한다.
+function Test-AntigravityPreflight {
+    param([string]$Stage)
+    $result = @{ Ready = $true; Warnings = @(); Diagnostics = @(); Executable = $null }
+    $config = $StageConfig[$Stage]
+    if ($config.Adapter -ne 'antigravity') { return $result }
+
+    # 1) 실행 파일: 명시 경로 → PATH → 알려진 설치 위치(CS-BL-019: LOCALAPPDATA\agy\bin\agy.exe).
+    $exe = $null
+    if ($script:ProfileConfig.antigravity -and $script:ProfileConfig.antigravity.executablePath) {
+        $candidate = [string]$script:ProfileConfig.antigravity.executablePath
+        if (Test-Path -LiteralPath $candidate) { $exe = $candidate }
+    }
+    if (-not $exe) {
+        $cmd = Get-Command 'agy' -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath $cmd.Source)) { $exe = $cmd.Source }
+    }
+    if (-not $exe -and $env:LOCALAPPDATA) {
+        $candidate = Join-Path $env:LOCALAPPDATA 'agy\bin\agy.exe'
+        if (Test-Path -LiteralPath $candidate) { $exe = $candidate }
+    }
+    if (-not $exe) {
+        $result.Ready = $false
+        $result.Warnings += 'agy 실행 파일을 찾을 수 없습니다 — PATH·설치 경로를 확인하세요'
+        return $result
+    }
+
+    $result.Executable = $exe
+
+    # 2) 버전 — 읽기 전용 실행.
+    $version = $null
+    try { $version = (& $exe --version 2>&1 | Select-Object -First 1) } catch { $version = $null }
+    if (-not $version -or "$version" -notmatch '\d+\.\d+') {
+        $result.Ready = $false
+        $result.Warnings += "agy 버전을 확인할 수 없습니다 ($exe)"
+        return $result
+    }
+
+    # 3) project mapping — 읽기 전용(같은 디렉터리를 Resolve-AntigravityProjectId처럼 탐색하되 throw 하지 않는다).
+    $projectsDir = Join-Path $env:USERPROFILE '.gemini\config\projects'
+    $mapped = $false
+    if (Test-Path -LiteralPath $projectsDir) {
+        $wanted = [IO.Path]::GetFullPath($RepoRoot).TrimEnd('\').Replace('\','/').ToLowerInvariant()
+        foreach ($file in @(Get-ChildItem -LiteralPath $projectsDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+            try { $project = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+            foreach ($resource in @($project.projectResources.resources)) {
+                $uri = if ($resource.folderUri) { [string]$resource.folderUri } elseif ($resource.gitFolder.folderUri) { [string]$resource.gitFolder.folderUri } else { '' }
+                if ($uri.StartsWith('file:', [StringComparison]::OrdinalIgnoreCase)) {
+                    $decoded = [Uri]::UnescapeDataString(($uri -replace '^file:/+', '')).TrimEnd('/').ToLowerInvariant()
+                    if ($decoded -eq $wanted) { $mapped = $true; break }
+                }
+            }
+            if ($mapped) { break }
+        }
+    }
+    if (-not $mapped) {
+        $result.Ready = $false
+        $result.Warnings += "저장소 '$RepoRoot'에 대한 Antigravity project mapping이 없습니다 — 승인 후 프로젝트 매핑을 만들어야 합니다(CS-BL-019)"
+        return $result
+    }
+
+    $result.Diagnostics += "agy $version ($exe), project mapped"
+    return $result
+}
+
 function Build-ToolCommand {
     param([hashtable]$Config, [string]$Stage, [string]$PromptOverride, [string]$Model)
     $p = if ([string]::IsNullOrWhiteSpace($PromptOverride)) { $Config.DefaultPrompt } else { $PromptOverride }
     $q = ConvertTo-BashSingleQuoted $p
     $cmd = if ($Model) { $Config.Command -replace '\{MODEL\}', $Model } else { $Config.Command }
+    $agyCommand = if ($Config.Executable) { ConvertTo-BashSingleQuoted ([string]$Config.Executable).Replace('\','/') } else { 'agy' }
     switch ($Stage) {
         'impl'        { return "$cmd $q" }
-        'qa'          { return "$cmd $q -m gpt-5.6-sol -s danger-full-access -o $(ConvertTo-BashSingleQuoted $Config.ReportFile)" }
-        'integration' { return "$cmd -p $q --dangerously-skip-permissions --output-format stream-json --verbose" }
+        'qa' {
+            if ($Config.Adapter -eq 'gemini') { return "gemini --approval-mode yolo -m $Model $q" }
+            if ($Config.Adapter -eq 'antigravity') { if (-not $Config.ProjectId) { throw 'Antigravity ProjectId is required.' }; return "$agyCommand --project $($Config.ProjectId) --model $Model --mode accept-edits --output-format stream-json --print-timeout 25m --print $q" }
+            if ($Config.Adapter -eq 'opencode') { return "opencode run --pure --auto -m $Model $q" }
+            return "codex exec $q -m $Model -s danger-full-access -o $(ConvertTo-BashSingleQuoted $Config.ReportFile)"
+        }
+        'integration' {
+            if ($Config.Adapter -eq 'codex') { return "codex exec $q -m $Model -s danger-full-access -o $(ConvertTo-BashSingleQuoted $Config.ReportFile)" }
+            if ($Config.Adapter -eq 'gemini') { return "gemini --approval-mode yolo -m $Model $q" }
+            if ($Config.Adapter -eq 'antigravity') { if (-not $Config.ProjectId) { throw 'Antigravity ProjectId is required.' }; return "$agyCommand --project $($Config.ProjectId) --model $Model --mode accept-edits --output-format stream-json --print-timeout 25m --print $q" }
+            if ($Config.Adapter -eq 'opencode') { return "opencode run --pure --auto -m $Model $q" }
+            return "claude -p $q --model $Model --dangerously-skip-permissions --output-format stream-json --verbose"
+        }
     }
 }
 
@@ -263,6 +406,26 @@ function New-DispatchScript {
 function Stop-ProcessTree {
     param([int]$ProcessId)
     & taskkill /PID $ProcessId /T /F 2>$null | Out-Null
+}
+
+# CFG014: 반복 오류는 정상 장기 작업과 구분하기 어렵다. 관찰 자료가 쌓이기 전에는
+# 하드 상한 연장 판단을 바꾸지 않고, 같은 오류가 한 관찰 구간에 3회 이상이면 경고만 남긴다.
+function Get-RepeatedErrorObservation {
+    param([string]$LogPath, [int]$MaxLines = 200, [int]$MinimumOccurrences = 3)
+
+    $result = @{ Repeated = $false; Line = $null; Count = 0; SampledLines = 0 }
+    if (-not (Test-Path -LiteralPath $LogPath)) { return $result }
+    $lines = @(Get-Content -LiteralPath $LogPath -Tail $MaxLines -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and $_ -match '(?i)(error|exception|failed|fatal|오류|실패|예외)' })
+    $result.SampledLines = $lines.Count
+    if ($lines.Count -eq 0) { return $result }
+    $mostFrequent = @($lines | Group-Object | Sort-Object Count -Descending | Select-Object -First 1)
+    if ($mostFrequent.Count -eq 0) { return $result }
+    $result.Line = $mostFrequent[0].Name
+    $result.Count = $mostFrequent[0].Count
+    $result.Repeated = $result.Count -ge $MinimumOccurrences
+    return $result
 }
 
 # 루트 bash와 그 자식들의 누적 CPU 시간을 합산한다. 실제 에이전트/도구는 bash의
@@ -466,6 +629,7 @@ function Enter-DispatchLock {
     }
 
     # 재실행은 이전 실패 판정을 무효화한다 — 대시보드가 RUNNING 옆에 낡은 FAILED를 같이 들고 있지 않도록.
+    # CFG017: 같은 TaskId의 다른 단계 마커나 다른 TaskId 마커는 절대 지우지 않는다 — 증거 보존.
     Clear-FailureMarker -Stage $Stage
     Clear-BlockedMarker -Stage $Stage
 
@@ -524,7 +688,6 @@ function Clear-FailureMarker {
     $p = Get-FailureMarkerPath $Stage
     if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
 }
-
 function Write-FailureMarker {
     param([string]$Stage, [string]$Reason)
     $state = Get-TreeState
@@ -555,7 +718,6 @@ function Clear-BlockedMarker {
     $p = Get-BlockedMarkerPath $Stage
     if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
 }
-
 function Write-BlockedMarker {
     param([string]$Stage, [string]$Reason, [string]$OwnerTaskId, [string]$OwnerProcessId)
     $safeReason = ($Reason -replace '\|', '/').Trim()
@@ -756,6 +918,10 @@ function Invoke-StageProcess {
                 # 진행 중인 프로세스가 "이번 창은 아직 0B"라는 이유로 죽는 일을 막는다.
                 $growth = [math]::Max($lastWindowGrowth, [math]::Max(0, $sz - $windowStartSize))
                 if ($growth -ge $HardTimeoutProgressBytes -and $deadline -lt $absoluteDeadline) {
+                    $repeatedError = Get-RepeatedErrorObservation -LogPath $logAbs
+                    if ($repeatedError.Repeated) {
+                        Write-Log "⚠️ 반복 오류 관찰 [$Stage] — 최근 $($repeatedError.SampledLines)개 오류 줄 중 같은 문구 $($repeatedError.Count)회: $($repeatedError.Line) (경고 전용; 하드 상한 연장·종료 정책은 유지)" WARN
+                    }
                     $deadline = $deadline.AddMinutes($extendStep)
                     if ($deadline -gt $absoluteDeadline) { $deadline = $absoluteDeadline }
                     $remain = [math]::Round(($absoluteDeadline - (Get-Date)).TotalMinutes, 1)
@@ -808,11 +974,12 @@ function Resolve-ModelChain {
     # 단일 원소 언랩으로 $models 자체가 $null이 되어버린다(2026-08-08 CFG-001 QA 무동작 실측 —
     # while ($modelIndex -lt $models.Count)가 0 -lt 0으로 죽어 프로세스가 아예 안 뜸). 분기 안에서
     # 직접 대입해야 배열이 보존된다.
-    if ($config.ModelFallback) { $models = $config.ModelFallback } else { $models = @($null) }
+    if ($config.ModelFallback) { $models = @($config.ModelFallback) } elseif ($config.Model) { $models = @($config.Model) } else { $models = @($null) }
 
     # -Model: 작업 성격에 맞는 1번 모델을 기획 단계에서 지정한다(예: 리팩토링 위주면 코딩 특화 모델).
     # 폴백 체인의 나머지는 '이 모델/프로바이더가 막혔을 때의 탈출 경로'라 성격과 무관하게 유지해야 하므로,
     # 지정 모델을 맨 앞에 놓고 나머지를 뒤에 붙인다(중복 제거 — 같은 모델을 두 번 부르지 않는다).
+    # $script:Model은 최상위 param()의 $Model을 스크립트 스코프에서 읽는 것이다. 별도 대입은 없다.
     # $script: 로 명시하는 이유: 아래 루프가 로컬 $model에 대입하는데 PowerShell 변수명은
     # 대소문자를 구분하지 않아 그 뒤로는 스크립트 파라미터 $Model이 가려진다. 여기선 아직 가려지기
     # 전이지만, 루프 순서가 바뀌면 조용히 잘못된 값을 읽게 되므로 스코프를 못박아 둔다.
@@ -821,6 +988,20 @@ function Resolve-ModelChain {
         $rest = @($config.ModelFallback | Where-Object { $_ -ne $picked })
         $models = @($picked) + $rest
         Write-Log "[$Stage] 1번 모델 override: $picked (폴백: $($rest -join ' → '))" INFO
+    }
+
+    if ($Stage -eq 'impl' -and $script:ProviderHealthPath) {
+        $health = Read-ProviderHealth -Path $script:ProviderHealthPath
+        $go = $health.providers.'opencode-go'
+        if ($go -and $go.reason -eq 'quota' -and $go.nextProbeAt) {
+            [datetime]$nextProbe = [datetime]::MinValue
+            if (-not [datetime]::TryParse([string]$go.nextProbeAt, [ref]$nextProbe)) {
+                Write-Log "provider health nextProbeAt is unreadable for opencode-go; ignoring the corrupt cooldown entry" WARN
+            } elseif ($nextProbe.ToUniversalTime() -gt [datetime]::UtcNow) {
+                $models = @($models | Where-Object { $_ -notmatch '^opencode-go/' })
+                Write-Log "[$Stage] GO quota cooldown until $($nextProbe.ToUniversalTime().ToString('o')); DeepSeek Free부터 시작" WARN
+            }
+        }
     }
 
     # 슬롯은 서로 다른 과금·인증 주체여야 한 슬롯의 장애가 체인 전체를 막지 않는다.
@@ -845,11 +1026,70 @@ function Resolve-ModelChain {
     return ,$models
 }
 
+# CFG017: TaskId/단계별 사이클 상태 파일 — 재디스패치마다 단조 증가하는 durable cycle 번호를 보존한다.
+# 승인 대기 뒤 fresh cycle이 새 번호를 받고, 과거 사이클의 attempt 로그는 이름에 cycle이 박혀 불변이다.
+function Get-DispatchCycleStatePath {
+    param([string]$Stage)
+    return (Resolve-RepoPath "$LogDir/$TaskId-$Stage-cycles.json")
+}
+
+# 사이클 원자 할당(읽기-증가-쓰기, temp-file + Move-Item). 동일 단계는 Enter-DispatchLock 안에서만
+# 호출되므로 같은 TaskId/Stage 사이클 번호가 동시에 두 프로세스에서 갈라지지 않는다.
+# 상태 파일이 손상되면 로그 파일명에서 마지막 cycle을 재스캔해 복구한다(재사용 금지).
+function New-DispatchCycle {
+    param([string]$Stage)
+    $path = Get-DispatchCycleStatePath $Stage
+    $parent = Split-Path -Parent $path
+    if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+
+    $existing = @()
+    $nextId = 1
+    if (Test-Path -LiteralPath $path) {
+        try {
+            $state = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -ne $state -and $null -ne $state.cycles) {
+                $existing = @($state.cycles | Where-Object { $null -ne $_.id })
+                $ids = @($existing | ForEach-Object { try { [int]$_.id } catch { 0 } })
+                if ($ids.Count -gt 0) { $nextId = ([int]($ids | Measure-Object -Maximum).Maximum) + 1 }
+            }
+        } catch {
+            # 손상 상태는 조용히 1로 되돌리지 않는다 — 재사용을 막기 위해 attempt 로그명에서 마지막 cycle을 찾는다.
+            Write-Log "⚠️ 디스패치 사이클 상태 파일 손상($path) — 로그에서 마지막 cycle 재스캔으로 복구합니다" WARN
+            $existing = @()
+            $lastKnown = 0
+            $logDirAbs = Resolve-RepoPath $LogDir
+            if (Test-Path $logDirAbs) {
+                foreach ($f in @(Get-ChildItem -LiteralPath $logDirAbs -File -Filter "$TaskId-$Stage.cycle*.attempt*" -ErrorAction SilentlyContinue)) {
+                    $m = [regex]::Match($f.Name, '\.cycle(?<id>\d+)\.attempt')
+                    if ($m.Success) {
+                        $cid = 0
+                        if ([int]::TryParse($m.Groups['id'].Value, [ref]$cid) -and $cid -gt $lastKnown) { $lastKnown = $cid }
+                    }
+                }
+            }
+            $nextId = $lastKnown + 1
+        }
+    }
+
+    $value = [ordered]@{
+        schemaVersion = 1
+        taskId = $TaskId
+        stage = $Stage
+        cycles = @($existing) + @([ordered]@{ id = $nextId; token = ('cycle{0:D4}' -f $nextId); allocatedAt = [datetime]::UtcNow.ToString('o') })
+    }
+    $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
+    [System.IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($true)))
+    Move-Item -LiteralPath $temporary -Destination $path -Force
+    return @{ Id = $nextId; Token = ('cycle{0:D4}' -f $nextId) }
+}
+
+# CFG017: attempt 로그명에 사이클을 박는다 — <base>.cycle0001.attempt01<ext>. 재디스패치가
+# attempt 번호를 1로 되돌려도 이전 사이클 로그는 절대 덮어쓰지 않는다(불변 증거).
 function Get-AttemptLogPath {
-    param([string]$LogFile, [int]$AttemptNumber)
+    param([string]$LogFile, [int]$CycleNumber, [int]$AttemptNumber)
     $extension = [System.IO.Path]::GetExtension($LogFile)
     $base = $LogFile.Substring(0, $LogFile.Length - $extension.Length)
-    return "${base}.attempt${AttemptNumber}${extension}"
+    return ('{0}.cycle{1:D4}.attempt{2:D2}{3}' -f $base, $CycleNumber, $AttemptNumber, $extension)
 }
 
 function Update-LatestAttemptLog {
@@ -858,6 +1098,183 @@ function Update-LatestAttemptLog {
     $latestAbs = Resolve-RepoPath $LatestLog
     if (-not (Test-Path $attemptAbs)) { return }
     [System.IO.File]::Copy($attemptAbs, $latestAbs, $true)
+}
+
+# CFG017: 승인 대기 기록 경로 — 실패 마커·차단 마커와 분리된 별도 레코드다. 대시보드는 이 파일을
+# 읽어 APPROVAL REQUIRED를 띄우고, 감사는 이 JSON이 곧 정확 target·증거 링크의 정본이다.
+function Get-ApprovalRecordPath {
+    param([string]$Stage, [int]$CycleNumber)
+    # 승인 요청 자체도 cycle의 불변 증거다. stage별 단일 파일이면 연속된 승인 요청이
+    # 앞 기록을 덮어 감사 공백이 생기므로, 반드시 cycle을 경로에 포함한다.
+    return (Resolve-RepoPath ('{0}/{1}-{2}-cycle{3:D4}-approval.json' -f $LogDir, $TaskId, $Stage, $CycleNumber))
+}
+
+# CFG018: 승인 판정은 모델이 인용한 문서가 아니라 Antigravity의 구조화 terminal event만 신뢰한다.
+# command가 없으면 추측하지 않고 null+reason을 남겨, 사후 cli.log grep에 의존하지 않는다.
+function Get-AntigravityTerminalEvidence {
+    param([string]$AttemptLog)
+    $logAbs = Resolve-RepoPath $AttemptLog
+    if (-not (Test-Path -LiteralPath $logAbs)) { return $null }
+    foreach ($line in @(Get-Content -LiteralPath $logAbs -Tail 80 -ErrorAction SilentlyContinue)) {
+        try { $event = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        $eventName = [string](@($event.event, $event.type, $event.kind) | Where-Object { $_ } | Select-Object -First 1)
+        $rawError = (@($event.error, $event.message, $event.detail, $event.result.error, $event.result.message) | Where-Object { $_ } | Select-Object -First 1)
+        $approvalEventNames = @('error', 'result', 'terminal', 'permission', 'permission_denied', 'tool_confirmation')
+        if ($approvalEventNames -notcontains $eventName.ToLowerInvariant() -or -not $rawError) { continue }
+        $rawError = [string]$rawError
+        if ($rawError -notmatch '(?i)(permission.+headless mode|requir[ea][sd]?\s+the\s+["``]?command["``]?\s+permission|auto-denied.+permission|user denied permission|permission check failed)') { continue }
+        $target = (@($event.command, $event.input.command, $event.arguments.command, $event.tool_input.command) | Where-Object { $_ } | Select-Object -First 1)
+        $conversationId = (@($event.conversation_id, $event.result.conversation_id) | Where-Object { $_ } | Select-Object -First 1)
+        $stepId = (@($event.step_id, $event.step, $event.result.step_id) | Where-Object { $_ } | Select-Object -First 1)
+        return [pscustomobject]@{
+            Target = if ($target) { [string]$target } else { $null }
+            TargetExtractionReason = if ($target) { $null } else { 'structured terminal approval event omitted command' }
+            ConversationId = if ($conversationId) { [string]$conversationId } else { $null }
+            StepId = if ($stepId) { [string]$stepId } else { $null }
+            RawError = $rawError
+        }
+    }
+    return $null
+}
+
+# Extract only the structured terminal target; ordinary attempt-log text is not evidence.
+function Get-ApprovalTarget {
+    param([string]$AttemptLog)
+    $evidence = Get-AntigravityTerminalEvidence -AttemptLog $AttemptLog
+    if ($evidence) { return $evidence.Target }
+    return $null
+}
+
+# 원자적 JSON 승인 대기 기록. status='pending'으로 시작하며, 성공한 fresh cycle이 resolved로 바꾼다.
+function Write-ApprovalRecord {
+    param([string]$Stage, [int]$CycleNumber, [int]$AttemptNumber, [string]$Model, [string]$AttemptLog, [object]$Evidence)
+    $path = Get-ApprovalRecordPath -Stage $Stage -CycleNumber $CycleNumber
+    $parent = Split-Path -Parent $path
+    if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $adapter = if ($StageConfig[$Stage].Adapter) { $StageConfig[$Stage].Adapter } else { 'opencode' }
+    $value = [ordered]@{
+        schemaVersion = 1
+        taskId = $TaskId
+        stage = $Stage
+        cycle = $CycleNumber
+        attempt = $AttemptNumber
+        adapter = $adapter
+        model = $Model
+        timestamp = [datetime]::UtcNow.ToString('o')
+        approval_required = $true
+        target = if ($Evidence) { $Evidence.Target } else { $null }
+        targetExtractionReason = if ($Evidence) { $Evidence.TargetExtractionReason } else { 'no structured terminal approval evidence' }
+        conversationId = if ($Evidence) { $Evidence.ConversationId } else { $null }
+        stepId = if ($Evidence) { $Evidence.StepId } else { $null }
+        rawError = if ($Evidence) { $Evidence.RawError } else { $null }
+        evidencePaths = @($AttemptLog)
+        decisionNeeded = 'Inspect the exact target, arrange approval outside the headless process, then start one explicit fresh stage dispatch (new cycle).'
+        status = 'pending'
+    }
+    $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
+    [System.IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($true)))
+    Move-Item -LiteralPath $temporary -Destination $path -Force
+    return $path
+}
+
+# fresh cycle의 성공(verify 통과, QA는 fresh verdict까지)만 승인 대기를 해소한다.
+# 해소는 status만 'resolved'로 바꾸고 해소한 cycle을 남긴다 — 기록 자체는 삭제하지 않아 감사 이력이 보존된다.
+function Resolve-ApprovalRecords {
+    param([string]$Stage, [int]$ResolvingCycle)
+    $logDirAbs = Resolve-RepoPath $LogDir
+    if (-not (Test-Path -LiteralPath $logDirAbs)) { return }
+    # 같은 TaskId/stage의 모든 pending cycle을 해소한다. 파일은 수정만 하고 절대 삭제하지 않는다.
+    foreach ($path in @(Get-ChildItem -LiteralPath $logDirAbs -Filter ("$TaskId-$Stage-cycle*-approval.json") -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })) {
+      try {
+        $record = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($null -eq $record -or $record.taskId -ne $TaskId -or $record.stage -ne $Stage -or $record.status -ne 'pending') { continue }
+        $record.status = 'resolved'
+        $record | Add-Member -NotePropertyName resolvedCycle -NotePropertyValue $ResolvingCycle -Force
+        $record | Add-Member -NotePropertyName resolvedAt -NotePropertyValue ([datetime]::UtcNow.ToString('o')) -Force
+        $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
+        [System.IO.File]::WriteAllText($temporary, ($record | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($true)))
+        Move-Item -LiteralPath $temporary -Destination $path -Force
+        Write-Log "✅ [$TaskId/$Stage] 승인 대기(cycle $($record.cycle))를 fresh cycle $ResolvingCycle 성공으로 해소 — 감사 기록 보존" SUCCESS
+      } catch {
+        Write-Log "승인 기록 해소 중 실패(감사에 영향 없음): $($_.Exception.Message)" WARN
+      }
+    }
+}
+
+# CFG018: stream-json의 init/result event에 담긴 conversation_id만 재개 대상으로 쓴다.
+# implicit most-recent continuation flag는 같은 project의 다른 stage 대화를 선택할 수 있으므로 절대 사용하지 않는다.
+function Get-AntigravityConversationId {
+    param([string]$AttemptLog)
+    $logAbs = Resolve-RepoPath $AttemptLog
+    if (-not (Test-Path -LiteralPath $logAbs)) { return $null }
+    $ids = @()
+    foreach ($line in @(Get-Content -LiteralPath $logAbs -ErrorAction SilentlyContinue)) {
+        try { $event = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        $eventName = [string](@($event.event, $event.type, $event.kind) | Where-Object { $_ } | Select-Object -First 1)
+        if (@('init', 'result') -notcontains $eventName.ToLowerInvariant()) { continue }
+        $candidate = @($event.conversation_id, $event.result.conversation_id) | Where-Object { $_ } | Select-Object -First 1
+        if ($candidate -and [string]$candidate -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+            $ids += ([string]$candidate).ToLowerInvariant()
+        }
+    }
+    $ids = @($ids | Select-Object -Unique)
+    if ($ids.Count -ne 1) { return $null }
+    return $ids[0]
+}
+
+function Test-AntigravityPrintTimeout {
+    param([string]$AttemptLog)
+    $logAbs = Resolve-RepoPath $AttemptLog
+    if (-not (Test-Path -LiteralPath $logAbs)) { return $false }
+    $tail = (Get-Content -LiteralPath $logAbs -Tail 80 -ErrorAction SilentlyContinue) -join "`n"
+    return $tail -match '(?i)(print mode:\s*timed out|timeout waiting for response|timed out after\s+\d+\s+polls)'
+}
+
+# Existing hard-timeout extension regards a stage as healthy when its recent log growth
+# clears this same threshold. Antigravity stream-json emits activity into the attempt log,
+# so reuse the rule after a provider-owned timeout rather than starting a fresh cycle.
+function Test-AntigravityContinuationActivity {
+    param([string]$AttemptLog, [Int64]$LogStartBytes = 0, [double]$RecentWindowMinutes = 10)
+    $logAbs = Resolve-RepoPath $AttemptLog
+    if (-not (Test-Path -LiteralPath $logAbs)) { return $false }
+    $logItem = Get-Item -LiteralPath $logAbs
+    $growth = [math]::Max(0, $logItem.Length - $LogStartBytes)
+    # 실행 중인 프로세스의 유연 연장과 같은 창을 사용한다. 종료된 provider CLI에는
+    # CPU/I/O를 다시 관찰할 수 없으므로, 마지막 stream-json 기록 시점이 이 창 안에
+    # 있어야 한다. 초반 출력만 남기고 오래 멈춘 세션은 누적 바이트가 커도 재개하지 않는다.
+    $recent = ([datetime]::UtcNow - $logItem.LastWriteTimeUtc).TotalMinutes -le $RecentWindowMinutes
+    return $growth -ge $HardTimeoutProgressBytes -and $recent
+}
+
+function Get-ContinuationRecordPath {
+    param([string]$Stage, [int]$CycleNumber)
+    return (Resolve-RepoPath ('{0}/{1}-{2}-cycle{3:D4}-continuation.json' -f $LogDir, $TaskId, $Stage, $CycleNumber))
+}
+
+function Write-ContinuationRecord {
+    param([string]$Stage, [int]$CycleNumber, [int]$AttemptNumber, [string]$AttemptLog, [string]$ConversationId, [bool]$Active, [bool]$Resumed, [string]$Reason)
+    $path = Get-ContinuationRecordPath -Stage $Stage -CycleNumber $CycleNumber
+    $record = $null
+    if (Test-Path -LiteralPath $path) {
+        try { $record = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $record = $null }
+    }
+    if ($null -eq $record) {
+        $record = [ordered]@{ schemaVersion = 1; taskId = $TaskId; stage = $Stage; cycle = $CycleNumber; segments = @() }
+    }
+    $segment = [ordered]@{ attempt = $AttemptNumber; timestamp = [datetime]::UtcNow.ToString('o'); attemptLog = $AttemptLog; conversationId = $ConversationId; active = $Active; resumed = $Resumed; reason = $Reason }
+    $record.segments = @($record.segments) + @($segment)
+    $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
+    [System.IO.File]::WriteAllText($temporary, ($record | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($true)))
+    Move-Item -LiteralPath $temporary -Destination $path -Force
+    return $path
+}
+
+function Build-AntigravityContinuationCommand {
+    param([hashtable]$Config, [string]$Model, [string]$ConversationId)
+    if (-not $Config.ProjectId -or -not $ConversationId) { throw 'Antigravity continuation requires project and conversation IDs.' }
+    $agyCommand = if ($Config.Executable) { ConvertTo-BashSingleQuoted ([string]$Config.Executable).Replace('\\','/') } else { 'agy' }
+    $prompt = ConvertTo-BashSingleQuoted 'Continue the same assigned stage from the existing conversation. Do not restart discovery, do not create a fresh dispatch cycle, and preserve all existing safety restrictions.'
+    return "$agyCommand --project $($Config.ProjectId) --model $Model --mode accept-edits --output-format stream-json --print-timeout 25m --conversation $ConversationId --print $prompt"
 }
 
 function Invoke-ModelAttempt {
@@ -874,15 +1291,21 @@ function Invoke-ModelAttempt {
     $exit = $null; $elapsedSeconds = 0
     $outcome = Invoke-StageProcess -Stage $Stage -Config $attemptConfig -ToolCmd $ToolCmd -ExitCode ([ref]$exit) -ElapsedSeconds ([ref]$elapsedSeconds)
     Update-LatestAttemptLog -AttemptLog $AttemptLog -LatestLog $LatestLog
-    return @{ Outcome = $outcome; ExitCode = $exit; ElapsedSeconds = $elapsedSeconds; LogStartBytes = $logStartBytes }
+    return @{ Outcome = $outcome; ExitCode = $exit; ElapsedSeconds = $elapsedSeconds; LogStartBytes = $logStartBytes; Adapter = $Config.Adapter }
 }
 
 function Classify-AttemptFailure {
     param([hashtable]$Attempt, [hashtable]$Before, [string]$AttemptLog)
 
     $outcome = $Attempt.Outcome
-    if ($outcome -ne 'ok' -or $null -eq $Attempt.ExitCode -or $Attempt.ExitCode -eq 0) { return $outcome }
+    if ($outcome -ne 'ok' -or $null -eq $Attempt.ExitCode) { return $outcome }
     $logAbs = Resolve-RepoPath $AttemptLog
+    # CFG018: quoted handoff/test text is never terminal evidence. Only the adapter's parsed
+    # stream-json event can put a stage into approval_required.
+    $Attempt.ApprovalEvidence = if ($Attempt.Adapter -eq 'antigravity') { Get-AntigravityTerminalEvidence -AttemptLog $AttemptLog } else { $null }
+    if ($Attempt.ApprovalEvidence) { return 'approval_required' }
+    if ($Attempt.Adapter -eq 'antigravity' -and (Test-AntigravityPrintTimeout -AttemptLog $AttemptLog)) { return 'provider_timeout' }
+    if ($Attempt.ExitCode -eq 0) { return $outcome }
     $logBytes = if (Test-Path $logAbs) { (Get-Item $logAbs).Length } else { 0 }
     $tail = if (Test-Path $logAbs) { (Get-Content $logAbs -Tail 40 -ErrorAction SilentlyContinue) -join "`n" } else { '' }
     $afterAttempt = Get-TreeState
@@ -913,9 +1336,8 @@ function Invoke-VerifyGate {
         $null = $verify.Handle
         if (-not $verify.WaitForExit($verifyMinutes * 60 * 1000)) {
             Stop-ProcessTree $verify.Id
-            $script:LastFailureReason = 'verify 게이트 시간 초과'
             Write-Log "❌ [$Stage] verify 게이트가 ${verifyMinutes}분 안에 끝나지 않아 종료했습니다" ERROR
-            return $false
+            return @{ Success = $false; FailureReason = 'verify 게이트 시간 초과' }
         }
         $verifyExit = $verify.ExitCode
         $verifyEncoding = [Console]::OutputEncoding
@@ -932,12 +1354,12 @@ function Invoke-VerifyGate {
     $verifyOutput | Out-File $verifyLogAbs -Encoding UTF8
     if ($verifyExit -ne 0) {
         Write-Log "❌ [$Stage] 검증 게이트 실패 — verify 로그: $verifyLogRel" ERROR
-        $script:LastFailureReason = "verify 게이트 실패 ($verifyLogRel)"
         Write-Log "마지막 30줄:" WARN
         $verifyOutput | Select-Object -Last 30 | ForEach-Object { Write-Host "    $_" }
-        return $false
+        return @{ Success = $false; FailureReason = "verify 게이트 실패 ($verifyLogRel)" }
     }
-    return $true
+
+    return @{ Success = $true; FailureReason = $null }
 }
 
 # 역할 판정은 Pipeline Status 섹션에만 한정한다. 다른 체크박스는 검증·인수인계 목록일 수 있다.
@@ -967,6 +1389,70 @@ function Get-StagePipelineIndexes {
         'qa' { return @(4) }
         'integration' { return @(5) }
     }
+}
+
+function Get-EffectivePipelineStage {
+    param([object]$PipelineStatus)
+    if ($null -eq $PipelineStatus -or -not $PipelineStatus.HasPipelineStatus -or $null -eq $PipelineStatus.FirstUnchecked) { return $null }
+    switch ([int]$PipelineStatus.FirstUnchecked.Index) {
+        { $_ -in @(2, 3) } { return 'impl' }
+        4 { return 'qa' }
+        5 { return 'integration' }
+        default { return $null }
+    }
+}
+
+function Get-RuntimeRoleBinding {
+    param([string]$PacketPath)
+    $result = [ordered]@{ Present = $false; Valid = $false; Legacy = $true; PlanningProfile = $null; PlanningAdapter = $null; Error = $null }
+    if (-not $PacketPath -or -not (Test-Path -LiteralPath $PacketPath)) { return [pscustomobject]$result }
+    $text = Get-Content -LiteralPath $PacketPath -Raw -Encoding UTF8
+    $profileMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+Planning\s+Profile|actual\s+planning\s+profile)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $adapterMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+Planning\s+Adapter|actual\s+planning\s+adapter)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $legacyMatch = [regex]::Match($text, '(?im)^-\s*legacy\s+packet\s*:\s*`?(true|false)`?\s*$')
+    $result.Present = $profileMatch.Success -or $adapterMatch.Success -or $legacyMatch.Success
+    if ($legacyMatch.Success) { $result.Legacy = $legacyMatch.Groups[1].Value -eq 'true' }
+    if (-not ($profileMatch.Success -and $adapterMatch.Success)) {
+        if ($result.Present -and -not $result.Legacy) { $result.Error = 'Runtime Role Binding must contain both actual planning profile and adapter.' }
+        return [pscustomobject]$result
+    }
+    $result.PlanningProfile = $profileMatch.Groups[1].Value.Trim()
+    $result.PlanningAdapter = $adapterMatch.Groups[1].Value.Trim()
+    $result.Valid = $true
+    return [pscustomobject]$result
+}
+
+function Set-CompletedStageApprovalsSuperseded {
+    param([object]$PipelineStatus, [string]$Evidence)
+    if ($null -eq $PipelineStatus -or -not $PipelineStatus.HasPipelineStatus) { return @() }
+    $logDirAbs = Resolve-RepoPath $LogDir
+    if (-not (Test-Path -LiteralPath $logDirAbs)) { return @() }
+    $updated = @()
+    foreach ($recordFile in @(Get-ChildItem -LiteralPath $logDirAbs -Filter "$TaskId-*-cycle*-approval.json" -File -ErrorAction SilentlyContinue)) {
+        try {
+            $record = Get-Content -LiteralPath $recordFile.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($record.status -ne 'pending') { continue }
+            $indexes = Get-StagePipelineIndexes -Stage ([string]$record.stage)
+            if ($indexes.Count -eq 0) { continue }
+            $stageItems = @($PipelineStatus.Items | Where-Object { $indexes -contains $_.Index })
+            if ($stageItems.Count -eq 0 -or @($stageItems | Where-Object { -not $_.Checked }).Count -gt 0) { continue }
+            # QA completion has an independent durable gate. A mistakenly checked packet alone
+            # must never suppress a genuine approval request.
+            if ($record.stage -eq 'qa' -and -not (Test-QaVerdict -QaDispatchedAt $null)) { continue }
+            $record.status = 'superseded'
+            $record | Add-Member -NotePropertyName supersededAt -NotePropertyValue ([datetime]::UtcNow.ToString('o')) -Force
+            $record | Add-Member -NotePropertyName supersededReason -NotePropertyValue 'packet stage completed; durable pipeline state outranks the pending runtime artifact' -Force
+            $record | Add-Member -NotePropertyName supersededByEvidence -NotePropertyValue $Evidence -Force
+            $temporary = "$($recordFile.FullName).$([guid]::NewGuid().ToString('N')).tmp"
+            [System.IO.File]::WriteAllText($temporary, ($record | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($true)))
+            Move-Item -LiteralPath $temporary -Destination $recordFile.FullName -Force
+            $updated += $recordFile.FullName
+            Write-Log "✅ [$TaskId/$($record.stage)] 완료된 패킷 단계의 pending 승인 기록을 superseded 처리: $($recordFile.Name)" SUCCESS
+        } catch {
+            Write-Log "승인 기록 supersede 실패($($recordFile.FullName)): $($_.Exception.Message)" WARN
+        }
+    }
+    return $updated
 }
 
 function Test-RequestedPipelineStage {
@@ -1003,11 +1489,12 @@ function Dispatch-Stage {
     $config = $StageConfig[$Stage]
     $logRel = $config.LogFile
     $models = Resolve-ModelChain -Config $config -Stage $Stage
+    $qaDispatchedAt = $null
 
     if ($models.Count -eq 0) {
-        $script:LastFailureReason = '모델 체인이 비어 있음 — 단계 구성 오류'
-        Write-Log "❌ [$Stage] $script:LastFailureReason" ERROR
-        return $false
+        $failureReason = '모델 체인이 비어 있음 — 단계 구성 오류'
+        Write-Log "❌ [$Stage] $failureReason" ERROR
+        return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $null }
     }
 
     if ($DryRun) {
@@ -1023,12 +1510,17 @@ function Dispatch-Stage {
         } finally {
             Remove-Item $shPath -ErrorAction SilentlyContinue
         }
-        return $true
+        return @{ Success = $true; FailureReason = $null; QaDispatchedAt = $null }
     }
 
     $logDirAbs = Resolve-RepoPath $LogDir
     if (-not (Test-Path $logDirAbs)) { New-Item -ItemType Directory -Path $logDirAbs -Force | Out-Null }
     Initialize-WatcherLog -Stage $Stage
+
+    # CFG017: fresh direct 디스패치마다 durable 사이클을 할당한다. 같은 TaskId/단계의 재디스패치는
+    # 단조 증가하는 새 사이클 번호를 받고, 과거 사이클의 attempt 로그는 이름에 cycle이 박혀 불변으로 남는다.
+    $cycle = New-DispatchCycle -Stage $Stage
+    Write-Log "디스패치 사이클: $($cycle.Token) (id $($cycle.Id))" INFO
 
     # ④ QA: 이전 실행이 남긴 verdict·보고서를 먼저 지운다.
     # 이번 실행이 verdict를 쓰지 못하고 끝났을 때 직전 실행의 pass를 재사용해 ⑤로 넘어가는 오탐을 막는다.
@@ -1040,10 +1532,30 @@ function Dispatch-Stage {
                 Write-Log "이전 실행 산출물 삭제: $rel" INFO
             }
         }
-        $script:QaDispatchedAt = Get-Date
+        $qaDispatchedAt = Get-Date
     }
 
+    Invoke-SessionHealthCheck -Stage $Stage
+
+    # CFG017: Antigravity 어댑터 단계는 실행 전 읽기 전용 preflight로 PATH·버전·project mapping을
+    # 진단한다. 이 진단은 외부 설정(설치·매핑·환경 변수)을 절대 변경하지 않는다 — 문제는 재시도 불가능한
+    # config failure로 즉시 돌린다(모델 체인 폴백·자동 재시도 없음).
+    $preflight = Test-AntigravityPreflight -Stage $Stage
+    if (-not $preflight.Ready) {
+        $reason = "Antigravity preflight 실패: $($preflight.Warnings -join '; ')"
+        Write-Log "❌ [$Stage] $reason" ERROR
+        return @{ Success = $false; FailureReason = $reason; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
+    }
+    if ($config.Adapter -eq 'antigravity' -and $preflight.Executable) { $config.Executable = $preflight.Executable }
+    if ($preflight.Diagnostics.Count -gt 0) { Write-Log "[$Stage] preflight: $($preflight.Diagnostics -join ' | ')" INFO }
+
     $before = Get-TreeState
+    # CFG018: provider print timeout can be resumed, but only inside one logical run.
+    # The existing hard-timeout absolute maximum remains the total budget across segments.
+    $logicalStartedAt = Get-Date
+    $logicalHardLimit = if ($config.HardTimeoutMinutes) { $config.HardTimeoutMinutes } else { $HardTimeoutMinutes }
+    $logicalAbsoluteDeadline = $logicalStartedAt.AddMinutes($logicalHardLimit * 3)
+    $continuationCount = 0
 
     $exit = $null
     $outcome = $null
@@ -1061,11 +1573,45 @@ function Dispatch-Stage {
         $attempt = 1
         while ($true) {
             $attemptNumber++
-            $attemptLog = Get-AttemptLogPath -LogFile $logRel -AttemptNumber $attemptNumber
+            $attemptLog = Get-AttemptLogPath -LogFile $logRel -CycleNumber $cycle.Id -AttemptNumber $attemptNumber
             Write-Log "시도 로그: $attemptLog (latest: $logRel)" INFO
             $attemptResult = Invoke-ModelAttempt -Stage $Stage -Config $config -ToolCmd $toolCmd -AttemptLog $attemptLog -LatestLog $logRel
             $exit = $attemptResult.ExitCode
             $outcome = Classify-AttemptFailure -Attempt $attemptResult -Before $before -AttemptLog $attemptLog
+            if ($Stage -eq 'impl' -and (Get-Command Update-ProviderHealth -ErrorAction SilentlyContinue)) { Update-ProviderHealth -Model $model -Outcome $outcome -AttemptLog $attemptLog }
+            if ($outcome -eq 'approval_required') {
+                # CFG017: headless 권한 요청은 재시도 불가능한 종결 상태다 — 모델 체인 전환·자동 재시도를
+                # 절대 하지 않는다. 정확 target을 추출해 승인 대기 기록을 남기고 즉시 돌아간다.
+                $evidence = $attemptResult.ApprovalEvidence
+                $target = if ($evidence) { $evidence.Target } else { $null }
+                $targetLabel = if ($target) { $target } elseif ($evidence) { "null ($($evidence.TargetExtractionReason))" } else { 'null (structured terminal evidence missing)' }
+                $approvalPath = Write-ApprovalRecord -Stage $Stage -CycleNumber $cycle.Id -AttemptNumber $attemptNumber -Model $model -AttemptLog $attemptLog -Evidence $evidence
+                Write-Log "❌ [$Stage] Antigravity headless 권한 요청 → 승인 대기 (approval_required)" ERROR
+                Write-Log "대상 명령: $targetLabel" WARN
+                Write-Log "승인 기록: $approvalPath" INFO
+                Write-Log "동작: 대상 확인 후 headless 프로세스 밖에서 승인을 마치고, 명시적으로 새 사이클의 fresh 디스패치를 시작하세요." WARN
+                return @{ Success = $false; Outcome = 'approval_required'; ApprovalPath = $approvalPath; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
+            }
+            if ($outcome -eq 'provider_timeout') {
+                $conversationId = Get-AntigravityConversationId -AttemptLog $attemptLog
+                $activityWindowMinutes = [Math]::Max(1, [Math]::Round($logicalHardLimit / 3.0, 2))
+                $active = Test-AntigravityContinuationActivity -AttemptLog $attemptLog -LogStartBytes $attemptResult.LogStartBytes -RecentWindowMinutes $activityWindowMinutes
+                $withinBudget = (Get-Date) -lt $logicalAbsoluteDeadline
+                $canContinue = $config.Adapter -eq 'antigravity' -and $active -and $conversationId -and $continuationCount -lt 2 -and $withinBudget
+                if (-not $conversationId) { $continuationReason = 'exact conversation ID missing or ambiguous' }
+                elseif (-not $active) { $continuationReason = 'no healthy stream-json activity' }
+                elseif (-not $withinBudget) { $continuationReason = 'logical absolute deadline reached' }
+                elseif ($continuationCount -ge 2) { $continuationReason = 'automatic continuation limit reached' }
+                else { $continuationReason = 'healthy provider timeout; resume same conversation' }
+                $continuationPath = Write-ContinuationRecord -Stage $Stage -CycleNumber $cycle.Id -AttemptNumber $attemptNumber -AttemptLog $attemptLog -ConversationId $conversationId -Active $active -Resumed $canContinue -Reason $continuationReason
+                if ($canContinue) {
+                    $continuationCount++
+                    $toolCmd = Build-AntigravityContinuationCommand -Config $config -Model $model -ConversationId $conversationId
+                    Write-Log "⏳ [$Stage] provider print timeout 뒤 건강한 동일 대화 자동 재개 $continuationCount/2 (cycle $($cycle.Token), 기록: $continuationPath)" WARN
+                    continue
+                }
+                Write-Log "⛔ [$Stage] provider print timeout 재개 불가: $continuationReason (cycle $($cycle.Token), 기록: $continuationPath)" ERROR
+            }
             if ($outcome -eq 'hang' -and $config.Retry -and $attempt -eq 1) {
                 # hang-detect-agent Iron Law: 재시도는 최대 1회. 두 번 멈추면 작업 자체가 깨진 것이다.
                 $attempt = 2
@@ -1081,11 +1627,17 @@ function Dispatch-Stage {
 
         if ($outcome -eq 'hang') { $reason = 'hang' }
         elseif ($outcome -eq 'timeout') { $reason = '하드 상한 초과' }
+        elseif ($outcome -eq 'provider_timeout') { $reason = 'provider print timeout (자동 재개 한도 또는 건강도 미충족)' }
+        elseif ($outcome -eq 'quota') { $reason = '잔액·쿼터 부족' }
         elseif ($outcome -eq 'billing') { $reason = '잔액·쿼터 부족' }
+        elseif ($outcome -eq 'authentication') { $reason = '인증 실패' }
         elseif ($outcome -eq 'unavailable') { $reason = '모델·프로바이더 사용 불가' }
         elseif ($outcome -eq 'noop') { $reason = '무산출 조기 실패' }
         else { $reason = '알 수 없는 실행 실패' }
         $attemptFailures += "${model}: $reason"
+        # provider timeout은 새로운 모델/새 대화로 우회하지 않는다. 위의 동일 대화
+        # continuation만 허용하고, 그 조건을 만족하지 못하면 현재 논리 실행을 끝낸다.
+        if ($outcome -eq 'provider_timeout') { $modelIndex = $models.Count; continue }
         $modelIndex++
         if ($modelIndex -lt $models.Count) {
             Write-Log "⚠️ [$Stage] $model 에서 $reason — 다음 모델로 전환: $($models[$modelIndex])" WARN
@@ -1098,16 +1650,19 @@ function Dispatch-Stage {
     $failureOutcomes = @{
         hang = @{ Reason = 'hang'; KilledContext = '강제 종료'; ShowLogTail = $false }
         timeout = @{ Reason = '하드 상한 초과'; KilledContext = '하드 상한 초과로 강제 종료'; ShowLogTail = $false }
+        provider_timeout = @{ Reason = 'provider print timeout'; KilledContext = $null; ShowLogTail = $true }
+        quota = @{ Reason = '잔액·쿼터 부족'; KilledContext = $null; ShowLogTail = $true }
         billing = @{ Reason = '잔액·쿼터 부족'; KilledContext = $null; ShowLogTail = $true }
+        authentication = @{ Reason = '인증 실패'; KilledContext = $null; ShowLogTail = $true }
         unavailable = @{ Reason = '모델·프로바이더 사용 불가'; KilledContext = $null; ShowLogTail = $false }
         noop = @{ Reason = '무산출 조기 실패'; KilledContext = $null; ShowLogTail = $false }
     }
     if ($failureOutcomes.ContainsKey($outcome)) {
         $failure = $failureOutcomes[$outcome]
         $failureMessage = "$($failure.Reason) — 모델 체인 전부 소진, 중단"
-        if ($outcome -eq 'billing') { $failureMessage += '. 프로바이더 결제 상태를 확인하세요.' }
+        if ($outcome -in @('quota', 'billing')) { $failureMessage += '. 프로바이더 결제 상태를 확인하세요.' }
         Write-Log "❌ [$Stage] $failureMessage$attemptSummary" ERROR
-        $script:LastFailureReason = "$($failure.Reason) — 모델 체인 전부 소진$attemptSummary"
+        $failureReason = "$($failure.Reason) — 모델 체인 전부 소진$attemptSummary"
         if ($failure.KilledContext) {
             Write-KilledLeftover -Before $before -Stage $Stage -Context $failure.KilledContext
         }
@@ -1115,7 +1670,7 @@ function Dispatch-Stage {
             $logAbs = Resolve-RepoPath $logRel
             if (Test-Path $logAbs) { Get-Content $logAbs -Tail 15 | ForEach-Object { Write-Host "    $_" } }
         }
-        return $false
+        return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $qaDispatchedAt }
     }
 
     $exitLabel = if ($null -eq $exit) { '<unknown>' } else { $exit }
@@ -1124,13 +1679,20 @@ function Dispatch-Stage {
         Write-Log "⚠️ [$Stage] 종료 코드를 읽지 못함 — 검증 게이트 결과로 판정" WARN
     } elseif ($exit -ne 0) {
         Write-Log "⚠️ [$Stage] 실패 (Exit $exit) — 로그 끝부분:" WARN
-        $script:LastFailureReason = "종료 코드 $exit"
+        $failureReason = "종료 코드 $exit"
         $logAbs = Resolve-RepoPath $logRel
         if (Test-Path $logAbs) { Get-Content $logAbs -Tail 15 | ForEach-Object { Write-Host "    $_" } }
-        return $false
+        return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $qaDispatchedAt }
     }
 
-    if (-not (Invoke-VerifyGate -Stage $Stage)) { return $false }
+    $verifyResult = Invoke-VerifyGate -Stage $Stage
+    if (-not $verifyResult.Success) {
+        return @{ Success = $false; FailureReason = $verifyResult.FailureReason; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
+    }
+
+    # CFG017: 이전에 승인 대기 상태였던 단계가 fresh cycle에서 성공하면 승인 기록을 resolved로 해소한다.
+    # (qa는 이곳이 아니라 fresh verdict 통과를 확인한 뒤 해소한다 — Dispatch-Stage는 verdict를 모른다.)
+    if ($Stage -ne 'qa') { Resolve-ApprovalRecords -Stage $Stage -ResolvingCycle $cycle.Id }
 
     # 작업트리 변경 유무 — 경고만 한다(차단하지 않음).
     # 게이트는 손대지 않은 트리에서도 통과하므로, "성공했지만 아무것도 안 한" 단계를 게이트만으로는 걸러낼 수 없다.
@@ -1148,26 +1710,117 @@ function Dispatch-Stage {
     }
 
     Write-Log "✅ [$Stage] 성공 + 검증 통과" SUCCESS
-    return $true
+    return @{ Success = $true; FailureReason = $null; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
+}
+
+function Read-ProviderHealth {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return [pscustomobject]@{ schemaVersion = 1; providers = [pscustomobject]@{} } }
+    try {
+        $state = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($state.schemaVersion -ne 1 -or $null -eq $state.providers) { throw 'invalid schema' }
+        return $state
+    } catch {
+        Write-Log "provider health state corrupt; ignoring it until the next classified result: $($_.Exception.Message)" WARN
+        return [pscustomobject]@{ schemaVersion = 1; providers = [pscustomobject]@{} }
+    }
+}
+
+function Write-ProviderHealth {
+    param([string]$Path, [object]$Value)
+    $parent = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    [System.IO.File]::WriteAllText($temporary, ($Value | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($true)))
+    Move-Item -LiteralPath $temporary -Destination $Path -Force
+}
+
+function Update-ProviderHealth {
+    param([string]$Model, [string]$Outcome, [string]$AttemptLog)
+    if (-not $script:ProviderHealthPath -or $Model -notmatch '^([^/]+)/') { return }
+    $provider = $Matches[1]
+    if ($provider -ne 'opencode-go') { return }
+    $state = Read-ProviderHealth -Path $script:ProviderHealthPath
+    if ($null -eq $state.providers) { $state | Add-Member -NotePropertyName providers -NotePropertyValue ([pscustomobject]@{}) -Force }
+    if ($Outcome -eq 'ok') {
+        $state.providers.psobject.Properties.Remove($provider)
+        Write-ProviderHealth -Path $script:ProviderHealthPath -Value $state
+        return
+    }
+    if ($Outcome -notin @('quota', 'billing')) { return }
+    $prior = $state.providers.$provider
+    $count = if ($prior) { [int]$prior.consecutiveFailures + 1 } else { 1 }
+    $hours = if ($count -gt 1) { [int]$script:ProfileConfig.providerCooldown.repeatedQuotaHours } else { [int]$script:ProfileConfig.providerCooldown.quotaDefaultHours }
+    $nextProbe = [datetime]::UtcNow.AddHours($hours)
+    if ($AttemptLog) {
+        $logPath = Resolve-RepoPath $AttemptLog
+        if (Test-Path -LiteralPath $logPath) {
+            $retry = [regex]::Match((Get-Content -LiteralPath $logPath -Raw -ErrorAction SilentlyContinue), '(?im)retry-after\s*[:=]\s*(\d+)')
+            if ($retry.Success) { $nextProbe = [datetime]::UtcNow.AddSeconds([int]$retry.Groups[1].Value) }
+        }
+    }
+    $entry = [pscustomobject]@{ reason = 'quota'; consecutiveFailures = $count; observedAt = [datetime]::UtcNow.ToString('o'); nextProbeAt = $nextProbe.ToString('o') }
+    $state.providers | Add-Member -NotePropertyName $provider -NotePropertyValue $entry -Force
+    Write-ProviderHealth -Path $script:ProviderHealthPath -Value $state
+}
+
+function Write-ChainSummary {
+    param(
+        [ValidateSet('completed','blocked','failed','approval_required','judgment_required')][string]$State,
+        [object[]]$Stages,
+        [string[]]$Warnings,
+        [datetime]$StartedAt,
+        [object]$PipelineBefore,
+        [object]$PipelineAfter,
+        [object]$TreeBefore,
+        [object]$TreeAfter,
+        [object]$QaVerdict
+    )
+    $summaryPath = Resolve-RepoPath "$LogDir/$TaskId-chain-summary.json"
+    $parent = Split-Path -Parent $summaryPath
+    if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $value = [ordered]@{
+        schemaVersion = 1
+        taskId = $TaskId
+        driverCycleId = $env:ORCHESTRATION_DRIVER_CYCLE_ID
+        state = $State
+        startedAt = $StartedAt.ToUniversalTime().ToString('o')
+        completedAt = [datetime]::UtcNow.ToString('o')
+        elapsedSeconds = [math]::Round(((Get-Date) - $StartedAt).TotalSeconds, 1)
+        stages = @($Stages)
+        qaVerdict = $QaVerdict
+        pipelineStatus = @{ before = $PipelineBefore; after = $PipelineAfter }
+        tree = @{ before = $TreeBefore; after = $TreeAfter; changedFileCount = if ($TreeAfter -and $TreeAfter.Dirty) { @(($TreeAfter.Dirty -split "`r?`n") | Where-Object { $_ }).Count } else { 0 }; fingerprintComparable = [bool]($TreeBefore -and $TreeAfter -and $TreeBefore.FingerprintOk -and $TreeAfter.FingerprintOk) }
+        warnings = @($Warnings)
+        logDirectory = $LogDir
+    }
+    $tempPath = "$summaryPath.$([guid]::NewGuid().ToString('N')).tmp"
+    [System.IO.File]::WriteAllText($tempPath, ($value | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($true)))
+    Move-Item -LiteralPath $tempPath -Destination $summaryPath -Force
+    return $summaryPath
 }
 
 # 락을 잡고 한 단계를 실행한다. 락 획득 실패 시 디스패치 자체를 하지 않는다 —
 # Dispatch-Stage 안에서 잡으면 QA의 "이전 verdict 삭제"가 먼저 돌아, 차단된 실행이
 # 정상 실행 중인 QA의 판정 파일을 지워버린다.
 function Invoke-StageWithLock {
-    param([string]$Stage, [string]$PromptOverride)
+    param([string]$Stage, [string]$PromptOverride, [bool]$CheckPipelineBefore, [string]$CheckPipelinePacket)
     if ($DryRun) { return (Dispatch-Stage -Stage $Stage -PromptOverride $PromptOverride) }
     # 락 획득 실패는 이 작업의 실패가 아니라 "지금은 때가 아님"이므로 마커를 남기지 않는다.
     if (-not (Enter-DispatchLock -Stage $Stage)) { return $false }
-    $script:LastFailureReason = $null
     try {
-        if ($script:CheckPipelineBefore) { Test-RequestedPipelineStage -Stage $Stage -PacketPath $script:CheckPipelinePacket }
+        if ($CheckPipelineBefore) { Test-RequestedPipelineStage -Stage $Stage -PacketPath $CheckPipelinePacket }
         # 성공/실패 어느 쪽이든 마커 상태를 확정한다 — 실패는 다음 실행까지 눈에 남고, 성공은 즉시 지운다.
-        $ok = Dispatch-Stage -Stage $Stage -PromptOverride $PromptOverride
-        if ($ok) { Test-PipelineStageUpdated -Stage $Stage -PacketPath $script:CheckPipelinePacket }
-        if ($ok) { Clear-FailureMarker -Stage $Stage }
-        else { Write-FailureMarker -Stage $Stage -Reason $script:LastFailureReason }
-        return $ok
+        $result = Dispatch-Stage -Stage $Stage -PromptOverride $PromptOverride
+        if ($result.Success) { Test-PipelineStageUpdated -Stage $Stage -PacketPath $CheckPipelinePacket }
+        if ($result.Success) { Clear-FailureMarker -Stage $Stage }
+        elseif ($result.Outcome -eq 'approval_required') {
+            # CFG017: 승인 대기는 failure 마커를 남기지 않는다 — 승인 기록 파일 자체가 상태·감사 증거다.
+            # 자동 재시도 계기가 될 만한 "실패" 흔적을 남기지 않기 위함이다.
+            Write-Log "[$Stage] 승인 대기 — failure 마커 대신 승인 기록이 상태를 나타냅니다 ($($result.ApprovalPath))" INFO
+        }
+        else { Write-FailureMarker -Stage $Stage -Reason $result.FailureReason }
+        return $result
     } catch {
         Write-FailureMarker -Stage $Stage -Reason "예외: $($_.Exception.Message)"
         throw
@@ -1178,6 +1831,7 @@ function Invoke-StageWithLock {
 
 # ④ QA verdict 게이트: 이번 실행에서 새로 쓴 verdict가 pass일 때만 ⑤ 진행.
 function Test-QaVerdict {
+    param([object]$QaDispatchedAt)
     $rel = $StageConfig['qa'].VerdictFile
     $vf = Resolve-RepoPath $rel
     if (-not (Test-Path $vf)) {
@@ -1185,10 +1839,10 @@ function Test-QaVerdict {
         return $false
     }
     # 디스패치 이후에 쓰인 파일만 인정 — 이전 실행이 남긴 pass의 재사용을 막는다.
-    if ($null -ne $script:QaDispatchedAt) {
+    if ($null -ne $QaDispatchedAt) {
         $written = (Get-Item $vf).LastWriteTime
-        if ($written -lt $script:QaDispatchedAt) {
-            Write-Log "⚠️ QA verdict가 이번 실행 이전 것($written < $($script:QaDispatchedAt)) — 이번 QA는 판정을 남기지 않았다. 안전상 ⑤ 중단" ERROR
+        if ($written -lt $QaDispatchedAt) {
+            Write-Log "⚠️ QA verdict가 이번 실행 이전 것($written < $QaDispatchedAt) — 이번 QA는 판정을 남기지 않았다. 안전상 ⑤ 중단" ERROR
             return $false
         }
     }
@@ -1238,8 +1892,35 @@ $archiveMatches = @(Get-ChildItem -Path (Join-Path $RepoRoot '.agents\briefs\arc
 if ($packetMatches.Count -eq 0 -and $archiveMatches.Count -eq 0) {
     Write-Log "작업 패킷을 찾지 못했습니다: $TaskId (저장소별 패킷 경로가 다를 수 있어 경고만 남기고 진행)" WARN
 }
-$script:CheckPipelinePacket = if ($packetMatches.Count -eq 1) { $packetMatches[0].FullName } else { $null }
-$script:CheckPipelineBefore = $false
+$checkPipelinePacket = if ($packetMatches.Count -eq 1) { $packetMatches[0].FullName } else { $null }
+
+. $ProfileModule
+$script:ProfileConfig = Read-ModelProfileConfig -CentralPath $ProfileConfigPath -LocalPath (Join-Path $RepoRoot 'model-profiles.local.json')
+$configuredPlanning = Resolve-RoleProfile -Role planning -Config $script:ProfileConfig
+$planningProfile = $configuredPlanning.Name
+$planningAdapter = $configuredPlanning.Adapter
+if ($checkPipelinePacket) {
+    $runtimeBinding = Get-RuntimeRoleBinding -PacketPath $checkPipelinePacket
+    if ($runtimeBinding.Valid) {
+        $planningProfile = $runtimeBinding.PlanningProfile
+        $planningAdapter = $runtimeBinding.PlanningAdapter
+    } elseif ($runtimeBinding.Error) {
+        throw $runtimeBinding.Error
+    } else {
+        Write-Log 'Runtime Role Binding missing; using configured planning profile for legacy packet.' WARN
+    }
+}
+$script:PipelineRouting = Resolve-PipelineRouting -Config $script:ProfileConfig -PlanningProfile $planningProfile -PlanningAdapter $planningAdapter
+$StageConfig.impl.ModelFallback = @($script:PipelineRouting.ImplementationModels)
+$StageConfig.qa.Adapter = $script:PipelineRouting.QaProfile.Adapter
+$StageConfig.qa.Model = $script:PipelineRouting.QaProfile.Model
+if ($StageConfig.qa.Adapter -eq 'antigravity') { $StageConfig.qa.ProjectId = Resolve-AntigravityProjectId -RepositoryRoot $RepoRoot }
+$StageConfig.integration.Adapter = $script:PipelineRouting.IntegrationProfile.Adapter
+$StageConfig.integration.Model = $script:PipelineRouting.IntegrationProfile.Model
+$StageConfig.integration.ReportFile = "$TaskLogPrefix-integration-last.md"
+$stateRoot = if ($env:USERPROFILE) { Join-Path $env:USERPROFILE '.agents\harness\state' } else { Join-Path ([IO.Path]::GetTempPath()) 'agents-harness-state' }
+$script:ProviderHealthPath = Join-Path $stateRoot 'provider-health.json'
+Write-Log "planner=$planningProfile/$planningAdapter impl-route=$($script:PipelineRouting.ImplementationRoute) qa=$($StageConfig.qa.Adapter)/$($StageConfig.qa.Model) project=$($StageConfig.qa.ProjectId) integration=$($StageConfig.integration.Adapter)/$($StageConfig.integration.Model)" INFO
 
 trap {
     Invoke-DispatcherCleanup
@@ -1279,40 +1960,86 @@ if (-not $DryRun -and -not $script:BashExe) {
 }
 
 if ($Chain) {
-    Write-Log "📋 자동 연쇄 모드 시작 (TaskId: $TaskId): ②③ → ④ → ⑤" INFO
-    foreach ($stage in @('impl','qa','integration')) {
-        $script:CheckPipelineBefore = ($stage -eq 'impl')
-        if (-not (Invoke-StageWithLock -Stage $stage -PromptOverride '')) {
-            Write-Log "❌ [$stage] 실패로 파이프라인 중단 (로그: $($StageConfig[$stage].LogFile))" ERROR
+    Write-Log "📋 자동 연쇄 모드 시작 (TaskId: $TaskId): 패킷 첫 미완료 단계부터 수렴" INFO
+    $chainStartedAt = Get-Date
+    $chainPipelineBefore = Get-PacketPipelineStatus -PacketPath $checkPipelinePacket
+    Set-CompletedStageApprovalsSuperseded -PipelineStatus $chainPipelineBefore -Evidence $checkPipelinePacket | Out-Null
+    $chainTreeBefore = Get-TreeState
+    $chainQaVerdict = @{ verdict = $null; fresh = $false }
+    $chainStages = @()
+    $effectiveStage = Get-EffectivePipelineStage -PipelineStatus $chainPipelineBefore
+    $allStages = @('impl','qa','integration')
+    $effectiveIndex = [array]::IndexOf($allStages, $effectiveStage)
+    if ($effectiveIndex -lt 0) {
+        Write-ChainSummary -State 'completed' -Stages @() -Warnings @('packet has no incomplete executable stage') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter $chainPipelineBefore -TreeBefore $chainTreeBefore -TreeAfter $chainTreeBefore -QaVerdict $chainQaVerdict | Out-Null
+        Write-Log '✅ 패킷에 미완료 실행 단계가 없습니다 — 재디스패치 없이 종료' SUCCESS
+        exit 0
+    }
+    $stagesToRun = @($allStages[$effectiveIndex..($allStages.Count - 1)])
+    Write-Log "유효 시작 단계: $effectiveStage (완료 단계 재디스패치 금지)" INFO
+    foreach ($stage in $stagesToRun) {
+        if ($stage -eq 'integration' -and -not $DryRun -and -not (Test-QaVerdict -QaDispatchedAt $null)) {
+            Write-FailureMarker -Stage 'integration' -Reason 'QA verdict 미통과 — ⑤ 진행 중단'
+            Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @('QA verdict 미통과 — ⑤ 진행 중단') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
+            exit 1
+        }
+        $result = Invoke-StageWithLock -Stage $stage -PromptOverride '' -CheckPipelineBefore ($stage -eq 'impl') -CheckPipelinePacket $checkPipelinePacket
+        $chainStages += [ordered]@{ stage = $stage; success = [bool]$result.Success; failureReason = $result.FailureReason; verifyPassed = [bool]$result.Success; logPath = $StageConfig[$stage].LogFile }
+        if (-not $result.Success) {
+            # CFG017: 승인 대기는 'failed'가 아니라 'approval_required'로 연쇄를 중단한다 — 오케스트레이터가
+            # 이 상태를 보고 재시도하지 않고 judgment_required로 멈춘다.
+            $chainState = if ($result.Outcome -eq 'approval_required') { 'approval_required' } else { 'failed' }
+            $chainWarnings = if ($result.Outcome -eq 'approval_required') { @("승인 대기 — 기록: $($result.ApprovalPath)") } else { @($result.FailureReason) }
+            Write-ChainSummary -State $chainState -Stages $chainStages -Warnings $chainWarnings -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
+            Write-Log "❌ [$stage] 파이프라인 중단 (상태: $chainState, 로그: $($StageConfig[$stage].LogFile))" ERROR
             exit 1
         }
         # QA 자체는 성공했어도 verdict가 ⑤를 막으면 파이프라인은 거기서 멈춘다 —
         # 사용자 눈에는 이것도 "중단"이므로 마커를 남긴다.
-        if ($stage -eq 'qa' -and -not $DryRun -and -not (Test-QaVerdict)) {
+        if ($stage -eq 'qa' -and -not $DryRun -and -not (Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt)) {
             Write-FailureMarker -Stage 'qa' -Reason 'QA verdict 미통과 — ⑤ 진행 중단'
+            Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @('QA verdict 미통과 — ⑤ 진행 중단') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
             exit 1
         }
+        if ($stage -eq 'qa') { $chainQaVerdict = @{ verdict = 'pass'; fresh = $true } }
+        # CFG017: QA 승인 대기는 fresh verdict pass를 확인한 뒤에만 해소한다 — Dispatch-Stage 안에서
+        # 해소하면 "실행 성공이지만 verdict 미통과" 케이스에 승인 기록이 조기 해소된다.
+        if ($stage -eq 'qa' -and -not $DryRun -and $result.CycleId) { Resolve-ApprovalRecords -Stage 'qa' -ResolvingCycle $result.CycleId }
         Start-Sleep -Seconds 2
     }
+    Write-ChainSummary -State 'completed' -Stages $chainStages -Warnings @() -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
     Write-Log "🎉 파이프라인 완료 — impl/qa/integration 로그는 $LogDir 참조" SUCCESS
     exit 0
 } else {
     if (-not $Stage) { Write-Log "오류: -Stage 또는 -Chain 옵션이 필요합니다." ERROR; exit 1 }
+    $standalonePipeline = Get-PacketPipelineStatus -PacketPath $checkPipelinePacket
+    Set-CompletedStageApprovalsSuperseded -PipelineStatus $standalonePipeline -Evidence $checkPipelinePacket | Out-Null
+    $effectiveStage = Get-EffectivePipelineStage -PipelineStatus $standalonePipeline
+    if ($effectiveStage -and $effectiveStage -ne $Stage) {
+        $requestedIndexes = Get-StagePipelineIndexes -Stage $Stage
+        $requestedItems = @($standalonePipeline.Items | Where-Object { $requestedIndexes -contains $_.Index })
+        if ($requestedItems.Count -gt 0 -and @($requestedItems | Where-Object { -not $_.Checked }).Count -eq 0) {
+            Write-Log "✅ [$Stage] 이미 완료됨 — 재디스패치하지 않고 첫 미완료 단계 [$effectiveStage]로 수렴" SUCCESS
+            $Stage = $effectiveStage
+        }
+    }
     if ($Stage -eq 'integration' -and -not $DryRun) {
         if ($SkipVerdictGate) {
             Write-Log 'WARNING: -SkipVerdictGate bypasses the standalone integration QA verdict gate.' WARN
-        } elseif (-not (Test-QaVerdict)) {
+        } elseif (-not (Test-QaVerdict -QaDispatchedAt $null)) {
             Write-FailureMarker -Stage 'integration' -Reason 'QA verdict 미통과 — ⑤ 진행 중단'
             exit 1
         }
     }
-    $script:CheckPipelineBefore = $true
-    $ok = Invoke-StageWithLock -Stage $Stage -PromptOverride $Prompt
+    $result = Invoke-StageWithLock -Stage $Stage -PromptOverride $Prompt -CheckPipelineBefore $true -CheckPipelinePacket $checkPipelinePacket
+    $ok = $result.Success
     # -Chain has its existing verdict gate above. A standalone QA dispatch must enforce
     # the same fresh pass verdict before its process can exit successfully.
     if ($ok -and $Stage -eq 'qa' -and -not $DryRun) {
-        $ok = Test-QaVerdict
+        $ok = Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt
         if (-not $ok) { Write-FailureMarker -Stage 'qa' -Reason 'QA verdict 미통과 — ⑤ 진행 중단' }
+        # CFG017: fresh verdict pass 확인 후에만 QA 승인 대기를 해소한다.
+        if ($ok -and $result.CycleId) { Resolve-ApprovalRecords -Stage 'qa' -ResolvingCycle $result.CycleId }
     }
     exit ([int](-not $ok))
 }
