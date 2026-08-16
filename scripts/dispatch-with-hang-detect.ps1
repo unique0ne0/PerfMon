@@ -188,7 +188,7 @@ function Resolve-RepoPath {
 }
 
 function Write-StageState {
-    param([string]$Stage, [int]$Cycle, [string]$State, [int]$ProcessId, [string[]]$EvidencePaths, [string]$Reason)
+    param([string]$Stage, [int]$Cycle, [string]$State, [int]$ProcessId, [string[]]$EvidencePaths, [string]$Reason, [string]$Model)
     $path = Resolve-RepoPath "$LogDir/$TaskId-stage-state.json"
     $parent = Split-Path -Parent $path
     if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
@@ -203,7 +203,7 @@ function Write-StageState {
     if ($sameStage -and [int]::TryParse([string]$previous.cycle, [ref]$previousCycle) -and $previousCycle -gt $Cycle) { return }
     $sequence = if ($previous -and $previous.sequence) { [int]$previous.sequence + 1 } else { 1 }
     $now = [datetime]::UtcNow.ToString('o')
-    $value = [ordered]@{ schemaVersion = 1; taskId = $TaskId; stage = $Stage; cycle = $Cycle; sequence = $sequence; state = $State; owner = 'dispatcher'; pid = $ProcessId; startedAt = $now; heartbeatAt = $now; eventAt = $now; evidencePaths = @($EvidencePaths); reason = $Reason }
+    $value = [ordered]@{ schemaVersion = 1; taskId = $TaskId; stage = $Stage; cycle = $Cycle; sequence = $sequence; state = $State; owner = 'dispatcher'; pid = $ProcessId; model = $Model; startedAt = $now; heartbeatAt = $now; eventAt = $now; evidencePaths = @($EvidencePaths); reason = $Reason }
     $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
     [System.IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($true)))
     Move-Item -LiteralPath $temporary -Destination $path -Force
@@ -510,11 +510,13 @@ function Get-TreeState {
     Push-Location $RepoRoot
     try {
         $head = (& git rev-parse HEAD 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) { throw 'git rev-parse failed' }
         # 로그 디렉터리는 제외한다 — 디스패치 자체가 로그를 쓰므로, 프로젝트가 이 경로를
         # gitignore 하지 않으면 "무엇도 바꾸지 않은 실행"이 항상 변경으로 보여 경고가 죽는다.
         $logPrefix = ($LogDir.Trim('/')) + '/'
         $dirty = (@(& git status --porcelain 2>$null |
             Where-Object { $_.Length -le 3 -or -not $_.Substring(3).Trim('"').StartsWith($logPrefix) }) -join "`n").Trim()
+        if ($LASTEXITCODE -ne 0) { throw 'git status failed' }
 
         # status 문자열은 "이미 수정된 파일을 더 수정한 경우"에도 그대로다. noop 폴백이 실제 편집을
         # 무변경으로 오판하지 않도록 tracked diff와 untracked 파일 내용을 함께 지문화한다.
@@ -525,10 +527,15 @@ function Get-TreeState {
             $sha.TransformBlock($bytes, 0, $bytes.Length, $bytes, 0) | Out-Null
         }
         # Stream git diff into SHA256 so a large binary diff cannot be duplicated in memory.
+        # Git writes core.autocrlf conversion advice to stderr with exit code 0. Stderr is
+        # intentionally excluded from this content stream; only a non-zero Git exit means
+        # the fingerprint is invalid.
         & git diff --binary HEAD -- . 2>$null | ForEach-Object { & $hashText ($_ + "`n") }
+        if ($LASTEXITCODE -ne 0) { throw 'git diff failed' }
         $untracked = @(& git ls-files --others --exclude-standard 2>$null |
             Where-Object { -not $_.Replace('\','/').StartsWith($logPrefix) } |
             Sort-Object)
+        if ($LASTEXITCODE -ne 0) { throw 'git ls-files failed' }
         foreach ($rel in $untracked) {
             & $hashText "`nuntracked:$rel`n"
             $abs = Join-Path $RepoRoot $rel
@@ -830,7 +837,7 @@ function Get-SwitchableFailureClass {
 # 반환: 'ok'(정상 종료) · 'hang'(무변화로 강제 종료) · 'timeout'(하드 상한 초과로 강제 종료)
 # 정상 종료 시 [ref]$ExitCode 에 종료 코드를 담는다($null이면 읽기 실패).
 function Invoke-StageProcess {
-    param([string]$Stage, [hashtable]$Config, [string]$ToolCmd, [int]$Cycle, [ref]$ExitCode, [ref]$ElapsedSeconds)
+    param([string]$Stage, [hashtable]$Config, [string]$ToolCmd, [int]$Cycle, [ref]$ExitCode, [ref]$ElapsedSeconds, [string]$Model)
 
     $logRel = $Config.LogFile
     $logAbs = Resolve-RepoPath $logRel
@@ -856,7 +863,7 @@ function Invoke-StageProcess {
         # 함께 줄 수 없다. 별도 hidden child로 시작해야 콘솔도 노출하지 않고 parameter-set 예외도 피한다.
         $proc = Start-Process -FilePath $script:BashExe -WindowStyle Hidden -ArgumentList @($shPath) -PassThru
         $script:ActiveChildProcessId = $proc.Id; $script:ActiveChildStage = $Stage
-        Write-StageState -Stage $Stage -Cycle $Cycle -State 'running' -ProcessId $proc.Id -EvidencePaths @($logRel) -Reason 'child process started'
+        Write-StageState -Stage $Stage -Cycle $Cycle -State 'running' -ProcessId $proc.Id -EvidencePaths @($logRel) -Reason 'child process started' -Model $Model
         # Windows PowerShell 5.1은 Start-Process -PassThru의 Process 핸들을 미리 캐시하지 않으면
         # 종료 뒤 ExitCode가 $null로 남을 수 있다. 여기서 Handle을 한 번 읽어 캐시한다.
         $null = $proc.Handle
@@ -880,7 +887,7 @@ function Invoke-StageProcess {
             # 이미 끝난 정상 프로세스를 'hang'으로 반환할 수 있다.
             $proc.Refresh()
             if ($proc.HasExited) { break }
-            Write-StageState -Stage $Stage -Cycle $Cycle -State 'running' -ProcessId $proc.Id -EvidencePaths @($logRel) -Reason 'watcher heartbeat'
+            Write-StageState -Stage $Stage -Cycle $Cycle -State 'running' -ProcessId $proc.Id -EvidencePaths @($logRel) -Reason 'watcher heartbeat' -Model $Model
             $sz = if (Test-Path $logAbs) { (Get-Item $logAbs).Length } else { 0 }
             $logChanged = $sz -ne $lastSize
             if ($logChanged) { $lastLogChangedAt = Get-Date; $lastSize = $sz; $hangReported = $false }
@@ -1031,7 +1038,11 @@ function Resolve-ModelChain {
                 Write-Log "provider health nextProbeAt is unreadable for opencode-go; ignoring the corrupt cooldown entry" WARN
             } elseif ($nextProbe.ToUniversalTime() -gt [datetime]::UtcNow) {
                 $models = @($models | Where-Object { $_ -notmatch '^opencode-go/' })
-                Write-Log "[$Stage] GO $($go.reason) cooldown until $($nextProbe.ToUniversalTime().ToString('o')); configured fallback부터 시작" WARN
+                # The free emergency model is the first usable slot while GO is known unavailable.
+                # Keep the remaining configured order so the normal reprobe contract is unchanged.
+                $bigPickle = @($models | Where-Object { $_ -eq 'opencode/big-pickle' })
+                $models = $bigPickle + @($models | Where-Object { $_ -ne 'opencode/big-pickle' })
+                Write-Log "[$Stage] GO $($go.reason) cooldown until $($nextProbe.ToUniversalTime().ToString('o')); big-pickle fast-path로 시작" WARN
             }
         }
     }
@@ -1310,7 +1321,7 @@ function Build-AntigravityContinuationCommand {
 }
 
 function Invoke-ModelAttempt {
-    param([string]$Stage, [hashtable]$Config, [string]$ToolCmd, [string]$AttemptLog, [string]$LatestLog, [int]$Cycle)
+    param([string]$Stage, [hashtable]$Config, [string]$ToolCmd, [string]$AttemptLog, [string]$LatestLog, [int]$Cycle, [string]$Model)
 
     $attemptConfig = @{}
     foreach ($key in $Config.Keys) { $attemptConfig[$key] = $Config[$key] }
@@ -1321,7 +1332,7 @@ function Invoke-ModelAttempt {
     $attemptLogAbs = Resolve-RepoPath $AttemptLog
     $logStartBytes = if (Test-Path $attemptLogAbs) { (Get-Item $attemptLogAbs).Length } else { 0 }
     $exit = $null; $elapsedSeconds = 0
-    $outcome = Invoke-StageProcess -Stage $Stage -Config $attemptConfig -ToolCmd $ToolCmd -Cycle $Cycle -ExitCode ([ref]$exit) -ElapsedSeconds ([ref]$elapsedSeconds)
+    $outcome = Invoke-StageProcess -Stage $Stage -Config $attemptConfig -ToolCmd $ToolCmd -Cycle $Cycle -ExitCode ([ref]$exit) -ElapsedSeconds ([ref]$elapsedSeconds) -Model $Model
     Update-LatestAttemptLog -AttemptLog $AttemptLog -LatestLog $LatestLog
     return @{ Outcome = $outcome; ExitCode = $exit; ElapsedSeconds = $elapsedSeconds; LogStartBytes = $logStartBytes; Adapter = $Config.Adapter }
 }
@@ -1554,7 +1565,7 @@ function Dispatch-Stage {
     # CFG017: fresh direct 디스패치마다 durable 사이클을 할당한다. 같은 TaskId/단계의 재디스패치는
     # 단조 증가하는 새 사이클 번호를 받고, 과거 사이클의 attempt 로그는 이름에 cycle이 박혀 불변으로 남는다.
     $cycle = New-DispatchCycle -Stage $Stage
-    Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'starting' -ProcessId $PID -EvidencePaths @($logRel) -Reason 'dispatcher accepted stage'
+    Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'starting' -ProcessId $PID -EvidencePaths @($logRel) -Reason 'dispatcher accepted stage' -Model $null
     Write-Log "디스패치 사이클: $($cycle.Token) (id $($cycle.Id))" INFO
 
     # ④ QA: 이전 실행이 남긴 verdict·보고서를 먼저 지운다.
@@ -1579,7 +1590,7 @@ function Dispatch-Stage {
     if (-not $preflight.Ready) {
         $reason = "Antigravity preflight 실패: $($preflight.Warnings -join '; ')"
         Write-Log "❌ [$Stage] $reason" ERROR
-        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $reason
+        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $reason -Model $null
         return @{ Success = $false; FailureReason = $reason; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
     }
     if ($config.Adapter -eq 'antigravity' -and $preflight.Executable) { $config.Executable = $preflight.Executable }
@@ -1611,7 +1622,7 @@ function Dispatch-Stage {
             $attemptNumber++
             $attemptLog = Get-AttemptLogPath -LogFile $logRel -CycleNumber $cycle.Id -AttemptNumber $attemptNumber
             Write-Log "시도 로그: $attemptLog (latest: $logRel)" INFO
-            $attemptResult = Invoke-ModelAttempt -Stage $Stage -Config $config -ToolCmd $toolCmd -AttemptLog $attemptLog -LatestLog $logRel -Cycle $cycle.Id
+            $attemptResult = Invoke-ModelAttempt -Stage $Stage -Config $config -ToolCmd $toolCmd -AttemptLog $attemptLog -LatestLog $logRel -Cycle $cycle.Id -Model $model
             $exit = $attemptResult.ExitCode
             $outcome = Classify-AttemptFailure -Attempt $attemptResult -Before $before -AttemptLog $attemptLog
             if ($Stage -eq 'impl' -and (Get-Command Update-ProviderHealth -ErrorAction SilentlyContinue)) { Update-ProviderHealth -Model $model -Outcome $outcome -AttemptLog $attemptLog }
@@ -1626,7 +1637,7 @@ function Dispatch-Stage {
                 Write-Log "대상 명령: $targetLabel" WARN
                 Write-Log "승인 기록: $approvalPath" INFO
                 Write-Log "동작: 대상 확인 후 headless 프로세스 밖에서 승인을 마치고, 명시적으로 새 사이클의 fresh 디스패치를 시작하세요." WARN
-                Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'approval_required' -ProcessId $PID -EvidencePaths @($logRel) -Reason $targetLabel
+                Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'approval_required' -ProcessId $PID -EvidencePaths @($logRel) -Reason $targetLabel -Model $model
                 return @{ Success = $false; Outcome = 'approval_required'; ApprovalPath = $approvalPath; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
             }
             if ($outcome -eq 'provider_timeout') {
@@ -1709,7 +1720,7 @@ function Dispatch-Stage {
             $logAbs = Resolve-RepoPath $logRel
             if (Test-Path $logAbs) { Get-Content $logAbs -Tail 15 | ForEach-Object { Write-Host "    $_" } }
         }
-        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $failureReason
+        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $failureReason -Model $model
         return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $qaDispatchedAt }
     }
 
@@ -1722,13 +1733,13 @@ function Dispatch-Stage {
         $failureReason = "종료 코드 $exit"
         $logAbs = Resolve-RepoPath $logRel
         if (Test-Path $logAbs) { Get-Content $logAbs -Tail 15 | ForEach-Object { Write-Host "    $_" } }
-        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $failureReason
+        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $failureReason -Model $model
         return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $qaDispatchedAt }
     }
 
     $verifyResult = Invoke-VerifyGate -Stage $Stage
     if (-not $verifyResult.Success) {
-        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $verifyResult.FailureReason
+        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $verifyResult.FailureReason -Model $model
         return @{ Success = $false; FailureReason = $verifyResult.FailureReason; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
     }
 
@@ -1752,7 +1763,7 @@ function Dispatch-Stage {
     }
 
     Write-Log "✅ [$Stage] 성공 + 검증 통과" SUCCESS
-    Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'completed' -ProcessId $PID -EvidencePaths @($logRel) -Reason 'stage succeeded and verify passed'
+    Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'completed' -ProcessId $PID -EvidencePaths @($logRel) -Reason 'stage succeeded and verify passed' -Model $model
     return @{ Success = $true; FailureReason = $null; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
 }
 
