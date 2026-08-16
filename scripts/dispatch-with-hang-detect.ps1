@@ -36,6 +36,7 @@
                               멈춰 있으면 종료시킨다. 연장 폭(상한÷3)과 절대 상한(상한×3)이 전부 이 값에서
                               파생되므로 — 별도의 상한 노브는 두지 않는다 — 이것만 줄이면 짧게 검증할 수 있다.
 .PARAMETER DryRun             실제 실행 없이 생성될 명령/스크립트만 출력(단일 단계 검증용).
+.PARAMETER BypassToolPermissions  사용자 승인 시에만 Antigravity CLI의 도구 권한 요청을 자동 승인한다.
 #>
 
 param(
@@ -47,7 +48,8 @@ param(
     [Parameter(Mandatory=$false)][int]$HangWaitSeconds = 300,
     [Parameter(Mandatory=$false)][int]$HardTimeoutMinutes = 30,
     [Parameter(Mandatory=$false)][switch]$DryRun,
-    [Parameter(Mandatory=$false)][switch]$SkipVerdictGate
+    [Parameter(Mandatory=$false)][switch]$SkipVerdictGate,
+    [Parameter(Mandatory=$false)][switch]$BypassToolPermissions
 )
 
 $ErrorActionPreference = "Stop"
@@ -86,7 +88,7 @@ $script:CleanupStarted = $false
 # 개발1팀 기준 모델: openai/gpt-5.6-terra + reasoning medium(= opencode auth login으로 붙인 사용자
 # OpenAI 구독 경로. 2026-08-06 gpt-5.5→terra 승급, 08-08 프로바이더 장애로 opencode/ 피신,
 # 08-09 워크스페이스 크레딧 소진을 계기로 구독 경로 복귀 — 아래 ModelFallback 주석 참조).
-# QA(④) 모델은 Build-ToolCommand의 -m gpt-5.6-sol — codex exec가 직접 OpenAI로 호출하므로
+# QA(④) 모델은 Build-ToolCommand의 -m gpt-5.6-terra — codex exec가 직접 OpenAI로 호출하므로
 # opencode 프로바이더 네임스페이스(openai/·opencode/·opencode-go/)와 무관하고 이번 장애의 영향을 받지 않는다.
 #
 # ModelFallback (impl 전용, 2026-08-08 CFG-001 착수 중 openai/ 프로바이더 장애 실측으로 도입):
@@ -121,7 +123,7 @@ $script:CleanupStarted = $false
 $StageConfig = @{
     'impl' = @{
         Command = 'opencode run --pure --auto -m {MODEL} --variant medium'
-        ModelFallback = @('openai/gpt-5.6-terra', 'opencode-go/deepseek-v4-flash', 'opencode/big-pickle')
+        ModelFallback = @('openai/gpt-5.6-terra', 'opencode-go/deepseek-v4-flash', 'opencode/big-pickle', 'opencode/deepseek-v4-flash-free')
         DefaultPrompt = "작업 $TaskId — [②구현] handoff 확인하고 패킷의 Done When과 Amendments를 충실히 따라 다음 단계 구현을 진행해. 구현 완료 후 [③자체리뷰] 제로베이스에서 개발 의도·계획 반영 여부와 로직·코드 품질을 점검하고 필요시 수정해. 이어서 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ②③을 갱신해"
         LogFile = "$TaskLogPrefix-impl.log"
         KillOnHang = $true
@@ -185,6 +187,28 @@ function Resolve-RepoPath {
     return (Join-Path $RepoRoot ($RelativePath -replace '/','\'))
 }
 
+function Write-StageState {
+    param([string]$Stage, [int]$Cycle, [string]$State, [int]$ProcessId, [string[]]$EvidencePaths, [string]$Reason)
+    $path = Resolve-RepoPath "$LogDir/$TaskId-stage-state.json"
+    $parent = Split-Path -Parent $path
+    if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $previous = $null
+    try { if (Test-Path -LiteralPath $path) { $previous = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json } } catch { }
+    # 사이클은 단계마다 독립적으로 증가하므로 비교를 같은 단계로 한정한다. 같은 단계의 늦은
+    # 과거 사이클 기록만 거부하고, 새 단계(impl→qa→integration)는 이전 단계 lease를 대체한다.
+    # CFG020: impl cycle 5 완료 후 qa cycle 1이 이전 단계 cycle에 막혀 'starting'을 쓰지 못하면
+    # 대시보드가 실제 진행 중인 qa를 이전 단계 상태로 계속 보여주는 오탐이 생긴다.
+    $sameStage = $previous -and ([string]$previous.stage -eq $Stage)
+    $previousCycle = 0
+    if ($sameStage -and [int]::TryParse([string]$previous.cycle, [ref]$previousCycle) -and $previousCycle -gt $Cycle) { return }
+    $sequence = if ($previous -and $previous.sequence) { [int]$previous.sequence + 1 } else { 1 }
+    $now = [datetime]::UtcNow.ToString('o')
+    $value = [ordered]@{ schemaVersion = 1; taskId = $TaskId; stage = $Stage; cycle = $Cycle; sequence = $sequence; state = $State; owner = 'dispatcher'; pid = $ProcessId; startedAt = $now; heartbeatAt = $now; eventAt = $now; evidencePaths = @($EvidencePaths); reason = $Reason }
+    $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
+    [System.IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($true)))
+    Move-Item -LiteralPath $temporary -Destination $path -Force
+}
+
 function Get-SessionHealthRole {
     param([string]$Stage)
     switch ($Stage) {
@@ -208,7 +232,7 @@ function Invoke-SessionHealthCheck {
         return
     }
     try {
-        $healthArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $helper, '-CheckAndRecord', '-ProjectRoot', $RepoRoot, '-TaskId', $TaskId, '-Stage', $Stage, '-Role', (Get-SessionHealthRole -Stage $Stage))
+        $healthArgs = @('-WindowStyle', 'Hidden', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $helper, '-CheckAndRecord', '-ProjectRoot', $RepoRoot, '-TaskId', $TaskId, '-Stage', $Stage, '-Role', (Get-SessionHealthRole -Stage $Stage))
         if (-not [string]::IsNullOrWhiteSpace($env:ORCHESTRATION_DRIVER_CYCLE_ID)) {
             $healthArgs += @('-DriverCycleId', $env:ORCHESTRATION_DRIVER_CYCLE_ID)
         }
@@ -370,7 +394,7 @@ function Test-AntigravityPreflight {
 }
 
 function Build-ToolCommand {
-    param([hashtable]$Config, [string]$Stage, [string]$PromptOverride, [string]$Model)
+    param([hashtable]$Config, [string]$Stage, [string]$PromptOverride, [string]$Model, [switch]$BypassToolPermissions)
     $p = if ([string]::IsNullOrWhiteSpace($PromptOverride)) { $Config.DefaultPrompt } else { $PromptOverride }
     $q = ConvertTo-BashSingleQuoted $p
     $cmd = if ($Model) { $Config.Command -replace '\{MODEL\}', $Model } else { $Config.Command }
@@ -379,14 +403,14 @@ function Build-ToolCommand {
         'impl'        { return "$cmd $q" }
         'qa' {
             if ($Config.Adapter -eq 'gemini') { return "gemini --approval-mode yolo -m $Model $q" }
-            if ($Config.Adapter -eq 'antigravity') { if (-not $Config.ProjectId) { throw 'Antigravity ProjectId is required.' }; return "$agyCommand --project $($Config.ProjectId) --model $Model --mode accept-edits --output-format stream-json --print-timeout 25m --print $q" }
+            if ($Config.Adapter -eq 'antigravity') { if (-not $Config.ProjectId) { throw 'Antigravity ProjectId is required.' }; $permissionFlag = if ($BypassToolPermissions) { ' --dangerously-skip-permissions' } else { '' }; $effortFlag = if ($Model -eq 'gemini-3.7-flash') { ' --effort medium' } else { '' }; return "$agyCommand --project $($Config.ProjectId) --model $Model$effortFlag --mode accept-edits$permissionFlag --output-format stream-json --print-timeout 25m --print $q" }
             if ($Config.Adapter -eq 'opencode') { return "opencode run --pure --auto -m $Model $q" }
             return "codex exec $q -m $Model -s danger-full-access -o $(ConvertTo-BashSingleQuoted $Config.ReportFile)"
         }
         'integration' {
             if ($Config.Adapter -eq 'codex') { return "codex exec $q -m $Model -s danger-full-access -o $(ConvertTo-BashSingleQuoted $Config.ReportFile)" }
             if ($Config.Adapter -eq 'gemini') { return "gemini --approval-mode yolo -m $Model $q" }
-            if ($Config.Adapter -eq 'antigravity') { if (-not $Config.ProjectId) { throw 'Antigravity ProjectId is required.' }; return "$agyCommand --project $($Config.ProjectId) --model $Model --mode accept-edits --output-format stream-json --print-timeout 25m --print $q" }
+            if ($Config.Adapter -eq 'antigravity') { if (-not $Config.ProjectId) { throw 'Antigravity ProjectId is required.' }; $permissionFlag = if ($BypassToolPermissions) { ' --dangerously-skip-permissions' } else { '' }; return "$agyCommand --project $($Config.ProjectId) --model $Model --mode accept-edits$permissionFlag --output-format stream-json --print-timeout 25m --print $q" }
             if ($Config.Adapter -eq 'opencode') { return "opencode run --pure --auto -m $Model $q" }
             return "claude -p $q --model $Model --dangerously-skip-permissions --output-format stream-json --verbose"
         }
@@ -806,7 +830,7 @@ function Get-SwitchableFailureClass {
 # 반환: 'ok'(정상 종료) · 'hang'(무변화로 강제 종료) · 'timeout'(하드 상한 초과로 강제 종료)
 # 정상 종료 시 [ref]$ExitCode 에 종료 코드를 담는다($null이면 읽기 실패).
 function Invoke-StageProcess {
-    param([string]$Stage, [hashtable]$Config, [string]$ToolCmd, [ref]$ExitCode, [ref]$ElapsedSeconds)
+    param([string]$Stage, [hashtable]$Config, [string]$ToolCmd, [int]$Cycle, [ref]$ExitCode, [ref]$ElapsedSeconds)
 
     $logRel = $Config.LogFile
     $logAbs = Resolve-RepoPath $logRel
@@ -828,8 +852,11 @@ function Invoke-StageProcess {
     $policyKilled = $false
     try {
         $startedAt = Get-Date
-        $proc = Start-Process -FilePath $script:BashExe -ArgumentList @($shPath) -NoNewWindow -PassThru
+        # -WindowStyle Hidden과 -NoNewWindow는 Windows PowerShell 5.1에서 같은 Start-Process에
+        # 함께 줄 수 없다. 별도 hidden child로 시작해야 콘솔도 노출하지 않고 parameter-set 예외도 피한다.
+        $proc = Start-Process -FilePath $script:BashExe -WindowStyle Hidden -ArgumentList @($shPath) -PassThru
         $script:ActiveChildProcessId = $proc.Id; $script:ActiveChildStage = $Stage
+        Write-StageState -Stage $Stage -Cycle $Cycle -State 'running' -ProcessId $proc.Id -EvidencePaths @($logRel) -Reason 'child process started'
         # Windows PowerShell 5.1은 Start-Process -PassThru의 Process 핸들을 미리 캐시하지 않으면
         # 종료 뒤 ExitCode가 $null로 남을 수 있다. 여기서 Handle을 한 번 읽어 캐시한다.
         $null = $proc.Handle
@@ -853,6 +880,7 @@ function Invoke-StageProcess {
             # 이미 끝난 정상 프로세스를 'hang'으로 반환할 수 있다.
             $proc.Refresh()
             if ($proc.HasExited) { break }
+            Write-StageState -Stage $Stage -Cycle $Cycle -State 'running' -ProcessId $proc.Id -EvidencePaths @($logRel) -Reason 'watcher heartbeat'
             $sz = if (Test-Path $logAbs) { (Get-Item $logAbs).Length } else { 0 }
             $logChanged = $sz -ne $lastSize
             if ($logChanged) { $lastLogChangedAt = Get-Date; $lastSize = $sz; $hangReported = $false }
@@ -993,13 +1021,17 @@ function Resolve-ModelChain {
     if ($Stage -eq 'impl' -and $script:ProviderHealthPath) {
         $health = Read-ProviderHealth -Path $script:ProviderHealthPath
         $go = $health.providers.'opencode-go'
-        if ($go -and $go.reason -eq 'quota' -and $go.nextProbeAt) {
+        # A temporary provider outage is handled exactly like quota: skip only until its
+        # bounded re-probe time, then restore the configured GO-first order automatically.
+        # Authentication is deliberately excluded here: a sandbox credential denial is a
+        # context problem, not evidence that the shared provider account was logged out.
+        if ($go -and $go.reason -in @('quota', 'billing', 'unavailable') -and $go.nextProbeAt) {
             [datetime]$nextProbe = [datetime]::MinValue
             if (-not [datetime]::TryParse([string]$go.nextProbeAt, [ref]$nextProbe)) {
                 Write-Log "provider health nextProbeAt is unreadable for opencode-go; ignoring the corrupt cooldown entry" WARN
             } elseif ($nextProbe.ToUniversalTime() -gt [datetime]::UtcNow) {
                 $models = @($models | Where-Object { $_ -notmatch '^opencode-go/' })
-                Write-Log "[$Stage] GO quota cooldown until $($nextProbe.ToUniversalTime().ToString('o')); DeepSeek Free부터 시작" WARN
+                Write-Log "[$Stage] GO $($go.reason) cooldown until $($nextProbe.ToUniversalTime().ToString('o')); configured fallback부터 시작" WARN
             }
         }
     }
@@ -1278,7 +1310,7 @@ function Build-AntigravityContinuationCommand {
 }
 
 function Invoke-ModelAttempt {
-    param([string]$Stage, [hashtable]$Config, [string]$ToolCmd, [string]$AttemptLog, [string]$LatestLog)
+    param([string]$Stage, [hashtable]$Config, [string]$ToolCmd, [string]$AttemptLog, [string]$LatestLog, [int]$Cycle)
 
     $attemptConfig = @{}
     foreach ($key in $Config.Keys) { $attemptConfig[$key] = $Config[$key] }
@@ -1289,7 +1321,7 @@ function Invoke-ModelAttempt {
     $attemptLogAbs = Resolve-RepoPath $AttemptLog
     $logStartBytes = if (Test-Path $attemptLogAbs) { (Get-Item $attemptLogAbs).Length } else { 0 }
     $exit = $null; $elapsedSeconds = 0
-    $outcome = Invoke-StageProcess -Stage $Stage -Config $attemptConfig -ToolCmd $ToolCmd -ExitCode ([ref]$exit) -ElapsedSeconds ([ref]$elapsedSeconds)
+    $outcome = Invoke-StageProcess -Stage $Stage -Config $attemptConfig -ToolCmd $ToolCmd -Cycle $Cycle -ExitCode ([ref]$exit) -ElapsedSeconds ([ref]$elapsedSeconds)
     Update-LatestAttemptLog -AttemptLog $AttemptLog -LatestLog $LatestLog
     return @{ Outcome = $outcome; ExitCode = $exit; ElapsedSeconds = $elapsedSeconds; LogStartBytes = $logStartBytes; Adapter = $Config.Adapter }
 }
@@ -1332,7 +1364,9 @@ function Invoke-VerifyGate {
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $verify = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $RepoRoot 'scripts\verify.ps1')) -NoNewWindow -PassThru -RedirectStandardOutput $verifyOut -RedirectStandardError $verifyErr
+        # See Invoke-StageProcess: keep the verify PowerShell invisible without mixing the
+        # incompatible -WindowStyle Hidden and -NoNewWindow parameters on PS 5.1.
+        $verify = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $RepoRoot 'scripts\verify.ps1')) -PassThru -RedirectStandardOutput $verifyOut -RedirectStandardError $verifyErr
         $null = $verify.Handle
         if (-not $verify.WaitForExit($verifyMinutes * 60 * 1000)) {
             Stop-ProcessTree $verify.Id
@@ -1499,7 +1533,7 @@ function Dispatch-Stage {
 
     if ($DryRun) {
         # 임시 파일을 남기지 않고 실제로 실행될 .sh 본문을 그대로 보여준다(체인 1번째 모델 기준).
-        $toolCmd = Build-ToolCommand -Config $config -Stage $Stage -PromptOverride $PromptOverride -Model $models[0]
+        $toolCmd = Build-ToolCommand -Config $config -Stage $Stage -PromptOverride $PromptOverride -Model $models[0] -BypassToolPermissions:$BypassToolPermissions
         Write-Log "작업 $TaskId [$Stage] 디스패치" INFO
         Write-Log "명령: $toolCmd" INFO
         Write-Log "로그: $logRel" INFO
@@ -1520,6 +1554,7 @@ function Dispatch-Stage {
     # CFG017: fresh direct 디스패치마다 durable 사이클을 할당한다. 같은 TaskId/단계의 재디스패치는
     # 단조 증가하는 새 사이클 번호를 받고, 과거 사이클의 attempt 로그는 이름에 cycle이 박혀 불변으로 남는다.
     $cycle = New-DispatchCycle -Stage $Stage
+    Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'starting' -ProcessId $PID -EvidencePaths @($logRel) -Reason 'dispatcher accepted stage'
     Write-Log "디스패치 사이클: $($cycle.Token) (id $($cycle.Id))" INFO
 
     # ④ QA: 이전 실행이 남긴 verdict·보고서를 먼저 지운다.
@@ -1544,6 +1579,7 @@ function Dispatch-Stage {
     if (-not $preflight.Ready) {
         $reason = "Antigravity preflight 실패: $($preflight.Warnings -join '; ')"
         Write-Log "❌ [$Stage] $reason" ERROR
+        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $reason
         return @{ Success = $false; FailureReason = $reason; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
     }
     if ($config.Adapter -eq 'antigravity' -and $preflight.Executable) { $config.Executable = $preflight.Executable }
@@ -1564,7 +1600,7 @@ function Dispatch-Stage {
     $attemptNumber = 0
     while ($modelIndex -lt $models.Count) {
         $model = $models[$modelIndex]
-        $toolCmd = Build-ToolCommand -Config $config -Stage $Stage -PromptOverride $PromptOverride -Model $model
+        $toolCmd = Build-ToolCommand -Config $config -Stage $Stage -PromptOverride $PromptOverride -Model $model -BypassToolPermissions:$BypassToolPermissions
         $modelTag = if ($model) { " (모델 $($modelIndex + 1)/$($models.Count): $model)" } else { "" }
         Write-Log "작업 $TaskId [$Stage] 디스패치$modelTag" INFO
         Write-Log "명령: $toolCmd" INFO
@@ -1575,7 +1611,7 @@ function Dispatch-Stage {
             $attemptNumber++
             $attemptLog = Get-AttemptLogPath -LogFile $logRel -CycleNumber $cycle.Id -AttemptNumber $attemptNumber
             Write-Log "시도 로그: $attemptLog (latest: $logRel)" INFO
-            $attemptResult = Invoke-ModelAttempt -Stage $Stage -Config $config -ToolCmd $toolCmd -AttemptLog $attemptLog -LatestLog $logRel
+            $attemptResult = Invoke-ModelAttempt -Stage $Stage -Config $config -ToolCmd $toolCmd -AttemptLog $attemptLog -LatestLog $logRel -Cycle $cycle.Id
             $exit = $attemptResult.ExitCode
             $outcome = Classify-AttemptFailure -Attempt $attemptResult -Before $before -AttemptLog $attemptLog
             if ($Stage -eq 'impl' -and (Get-Command Update-ProviderHealth -ErrorAction SilentlyContinue)) { Update-ProviderHealth -Model $model -Outcome $outcome -AttemptLog $attemptLog }
@@ -1590,6 +1626,7 @@ function Dispatch-Stage {
                 Write-Log "대상 명령: $targetLabel" WARN
                 Write-Log "승인 기록: $approvalPath" INFO
                 Write-Log "동작: 대상 확인 후 headless 프로세스 밖에서 승인을 마치고, 명시적으로 새 사이클의 fresh 디스패치를 시작하세요." WARN
+                Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'approval_required' -ProcessId $PID -EvidencePaths @($logRel) -Reason $targetLabel
                 return @{ Success = $false; Outcome = 'approval_required'; ApprovalPath = $approvalPath; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
             }
             if ($outcome -eq 'provider_timeout') {
@@ -1637,7 +1674,9 @@ function Dispatch-Stage {
         $attemptFailures += "${model}: $reason"
         # provider timeout은 새로운 모델/새 대화로 우회하지 않는다. 위의 동일 대화
         # continuation만 허용하고, 그 조건을 만족하지 못하면 현재 논리 실행을 끝낸다.
-        if ($outcome -eq 'provider_timeout') { $modelIndex = $models.Count; continue }
+        # 원인이 분류되지 않은 Exit 1은 폴백 근거가 아니다. 다음 모델을 태우지 않고
+        # 현재 cycle을 끝내야 반쯤 수정된 작업트리·토큰 낭비를 막을 수 있다.
+        if ($outcome -in @('provider_timeout', 'unknown')) { $modelIndex = $models.Count; continue }
         $modelIndex++
         if ($modelIndex -lt $models.Count) {
             Write-Log "⚠️ [$Stage] $model 에서 $reason — 다음 모델로 전환: $($models[$modelIndex])" WARN
@@ -1670,6 +1709,7 @@ function Dispatch-Stage {
             $logAbs = Resolve-RepoPath $logRel
             if (Test-Path $logAbs) { Get-Content $logAbs -Tail 15 | ForEach-Object { Write-Host "    $_" } }
         }
+        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $failureReason
         return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $qaDispatchedAt }
     }
 
@@ -1682,11 +1722,13 @@ function Dispatch-Stage {
         $failureReason = "종료 코드 $exit"
         $logAbs = Resolve-RepoPath $logRel
         if (Test-Path $logAbs) { Get-Content $logAbs -Tail 15 | ForEach-Object { Write-Host "    $_" } }
+        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $failureReason
         return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $qaDispatchedAt }
     }
 
     $verifyResult = Invoke-VerifyGate -Stage $Stage
     if (-not $verifyResult.Success) {
+        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $verifyResult.FailureReason
         return @{ Success = $false; FailureReason = $verifyResult.FailureReason; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
     }
 
@@ -1710,6 +1752,7 @@ function Dispatch-Stage {
     }
 
     Write-Log "✅ [$Stage] 성공 + 검증 통과" SUCCESS
+    Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'completed' -ProcessId $PID -EvidencePaths @($logRel) -Reason 'stage succeeded and verify passed'
     return @{ Success = $true; FailureReason = $null; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
 }
 
@@ -1747,10 +1790,10 @@ function Update-ProviderHealth {
         Write-ProviderHealth -Path $script:ProviderHealthPath -Value $state
         return
     }
-    if ($Outcome -notin @('quota', 'billing')) { return }
+    if ($Outcome -notin @('quota', 'billing', 'unavailable')) { return }
     $prior = $state.providers.$provider
     $count = if ($prior) { [int]$prior.consecutiveFailures + 1 } else { 1 }
-    $hours = if ($count -gt 1) { [int]$script:ProfileConfig.providerCooldown.repeatedQuotaHours } else { [int]$script:ProfileConfig.providerCooldown.quotaDefaultHours }
+    $hours = if ($count -gt 1) { [int]$script:ProfileConfig.providerCooldown.repeatedQuotaHours } elseif ($Outcome -eq 'unavailable') { 1 } else { [int]$script:ProfileConfig.providerCooldown.quotaDefaultHours }
     $nextProbe = [datetime]::UtcNow.AddHours($hours)
     if ($AttemptLog) {
         $logPath = Resolve-RepoPath $AttemptLog
@@ -1759,7 +1802,7 @@ function Update-ProviderHealth {
             if ($retry.Success) { $nextProbe = [datetime]::UtcNow.AddSeconds([int]$retry.Groups[1].Value) }
         }
     }
-    $entry = [pscustomobject]@{ reason = 'quota'; consecutiveFailures = $count; observedAt = [datetime]::UtcNow.ToString('o'); nextProbeAt = $nextProbe.ToString('o') }
+    $entry = [pscustomobject]@{ reason = $Outcome; consecutiveFailures = $count; observedAt = [datetime]::UtcNow.ToString('o'); nextProbeAt = $nextProbe.ToString('o') }
     $state.providers | Add-Member -NotePropertyName $provider -NotePropertyValue $entry -Force
     Write-ProviderHealth -Path $script:ProviderHealthPath -Value $state
 }
