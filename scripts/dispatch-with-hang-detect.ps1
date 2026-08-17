@@ -123,7 +123,7 @@ $script:CleanupStarted = $false
 $StageConfig = @{
     'impl' = @{
         Command = 'opencode run --pure --auto -m {MODEL} --variant medium'
-        ModelFallback = @('openai/gpt-5.6-terra', 'opencode-go/deepseek-v4-flash', 'opencode/big-pickle', 'opencode/deepseek-v4-flash-free')
+        ModelFallback = @('openai/gpt-5.6-terra', 'opencode/big-pickle', 'opencode-go/deepseek-v4-flash', 'opencode/deepseek-v4-flash-free')
         DefaultPrompt = "작업 $TaskId — [②구현] handoff 확인하고 패킷의 Done When과 Amendments를 충실히 따라 다음 단계 구현을 진행해. 구현 완료 후 [③자체리뷰] 제로베이스에서 개발 의도·계획 반영 여부와 로직·코드 품질을 점검하고 필요시 수정해. 이어서 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ②③을 갱신해"
         LogFile = "$TaskLogPrefix-impl.log"
         KillOnHang = $true
@@ -143,7 +143,7 @@ $StageConfig = @{
     }
     'integration' = @{
         Command = ''
-        DefaultPrompt = "작업 $TaskId — 현재 프로세스가 하네스가 시작한 유일한 Integration 본체다. 별도 Integration을 디스패치하거나 PID·락을 감시하거나 프로세스를 종료하지 마. 개발1팀의 구현과 QA팀의 리뷰가 완료되었어. 제로베이스에서 문제없는지 리뷰해. scripts/verify.ps1 게이트 통과 + 실동작 E2E 검증까지 마치고, 문제없으면 Integration을 로컬 완료 처리하고 Pipeline Status ⑤와 history.md를 갱신해. 패킷 Amendment에 이번 작업의 자동 commit/push 사용자 승인이 명시되어 있으면 관련 변경만 커밋·push하고, 없으면 별도 승인 전에는 수행하지 마."
+        DefaultPrompt = "작업 $TaskId — 현재 프로세스가 하네스가 시작한 유일한 Integration 본체다. 별도 Integration을 디스패치하거나 PID·락을 감시하거나 프로세스를 종료하지 마. 개발1팀의 구현과 QA팀의 리뷰가 완료되었어. 제로베이스에서 문제없는지 리뷰해. scripts/verify.ps1 게이트 통과 + 실동작 E2E 검증까지 마치고, 문제없으면 Integration을 로컬 완료 처리하고 Pipeline Status ⑤와 history.md를 갱신한 뒤, 관련 변경을 커밋하고 원격에 push까지 자동으로 수행해(추가 승인 대기 없음). 패킷 Amendment에 자동 commit/push를 명시적으로 금지하는 지시가 있으면 그 지시를 따르고 사유를 남겨."
         LogFile = "$TaskLogPrefix-integration.log"
         KillOnHang = $false
         Retry = $false
@@ -203,7 +203,10 @@ function Write-StageState {
     if ($sameStage -and [int]::TryParse([string]$previous.cycle, [ref]$previousCycle) -and $previousCycle -gt $Cycle) { return }
     $sequence = if ($previous -and $previous.sequence) { [int]$previous.sequence + 1 } else { 1 }
     $now = [datetime]::UtcNow.ToString('o')
-    $value = [ordered]@{ schemaVersion = 1; taskId = $TaskId; stage = $Stage; cycle = $Cycle; sequence = $sequence; state = $State; owner = 'dispatcher'; pid = $ProcessId; model = $Model; startedAt = $now; heartbeatAt = $now; eventAt = $now; evidencePaths = @($EvidencePaths); reason = $Reason }
+    $sameCycle = $sameStage -and ($previous -and [string]$previous.cycle -eq [string]$Cycle)
+    $wasRunning = $previous -and ([string]$previous.state -match '^(starting|running)$')
+    $startedAt = if ($sameCycle -and $wasRunning -and $previous.startedAt) { [string]$previous.startedAt } else { $now }
+    $value = [ordered]@{ schemaVersion = 1; taskId = $TaskId; stage = $Stage; cycle = $Cycle; sequence = $sequence; state = $State; owner = 'dispatcher'; pid = $ProcessId; model = $Model; startedAt = $startedAt; heartbeatAt = $now; eventAt = $now; evidencePaths = @($EvidencePaths); reason = $Reason }
     $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
     [System.IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($true)))
     Move-Item -LiteralPath $temporary -Destination $path -Force
@@ -400,7 +403,12 @@ function Build-ToolCommand {
     $cmd = if ($Model) { $Config.Command -replace '\{MODEL\}', $Model } else { $Config.Command }
     $agyCommand = if ($Config.Executable) { ConvertTo-BashSingleQuoted ([string]$Config.Executable).Replace('\','/') } else { 'agy' }
     switch ($Stage) {
-        'impl'        { return "$cmd $q" }
+                'impl'        {
+            if ($Model -and $Model -match '(?i)(big-pickle|free|flash)' -and $cmd -match ' --variant \S+') {
+                $cmd = $cmd -replace ' --variant \S+', ''
+            }
+            return "$cmd $q"
+        }
         'qa' {
             if ($Config.Adapter -eq 'gemini') { return "gemini --approval-mode yolo -m $Model $q" }
             if ($Config.Adapter -eq 'antigravity') { if (-not $Config.ProjectId) { throw 'Antigravity ProjectId is required.' }; $permissionFlag = if ($BypassToolPermissions) { ' --dangerously-skip-permissions' } else { '' }; $effortFlag = if ($Model -eq 'gemini-3.7-flash') { ' --effort medium' } else { '' }; return "$agyCommand --project $($Config.ProjectId) --model $Model$effortFlag --mode accept-edits$permissionFlag --output-format stream-json --print-timeout 25m --print $q" }
@@ -1407,6 +1415,15 @@ function Invoke-VerifyGate {
     return @{ Success = $true; FailureReason = $null }
 }
 
+# 경량 등급 선언 여부만 읽는다 — Pipeline Status ④ 체크와 별개 신호로, 둘 다 있어야 QA 스킵이 성립한다.
+function Get-PacketGateTier {
+    param([string]$PacketPath)
+    if (-not $PacketPath -or -not (Test-Path -LiteralPath $PacketPath)) { return 'full' }
+    $text = Get-Content -LiteralPath $PacketPath -Raw -Encoding UTF8
+    if ($text -match '(?im)^-\s*게이트\s*등급\s*[:：]\s*경량\b') { return 'light' }
+    return 'full'
+}
+
 # 역할 판정은 Pipeline Status 섹션에만 한정한다. 다른 체크박스는 검증·인수인계 목록일 수 있다.
 function Get-PacketPipelineStatus {
     param([string]$PacketPath)
@@ -2019,7 +2036,8 @@ if ($Chain) {
     $chainPipelineBefore = Get-PacketPipelineStatus -PacketPath $checkPipelinePacket
     Set-CompletedStageApprovalsSuperseded -PipelineStatus $chainPipelineBefore -Evidence $checkPipelinePacket | Out-Null
     $chainTreeBefore = Get-TreeState
-    $chainQaVerdict = @{ verdict = $null; fresh = $false }
+    $gateTier = Get-PacketGateTier -PacketPath $checkPipelinePacket
+    $chainQaVerdict = @{ verdict = if ($gateTier -eq 'light') { 'skipped_light_tier' } else { $null }; fresh = $false }
     $chainStages = @()
     $effectiveStage = Get-EffectivePipelineStage -PipelineStatus $chainPipelineBefore
     $allStages = @('impl','qa','integration')
@@ -2032,7 +2050,9 @@ if ($Chain) {
     $stagesToRun = @($allStages[$effectiveIndex..($allStages.Count - 1)])
     Write-Log "유효 시작 단계: $effectiveStage (완료 단계 재디스패치 금지)" INFO
     foreach ($stage in $stagesToRun) {
-        if ($stage -eq 'integration' -and -not $DryRun -and -not (Test-QaVerdict -QaDispatchedAt $null)) {
+        if ($stage -eq 'integration' -and -not $DryRun -and $gateTier -eq 'light') {
+            Write-Log 'ℹ️ 경량 게이트 등급(패킷 선언) — QA verdict 게이트 생략, ⑤ 그대로 진행' INFO
+        } elseif ($stage -eq 'integration' -and -not $DryRun -and -not (Test-QaVerdict -QaDispatchedAt $null)) {
             Write-FailureMarker -Stage 'integration' -Reason 'QA verdict 미통과 — ⑤ 진행 중단'
             Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @('QA verdict 미통과 — ⑤ 진행 중단') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
             exit 1
@@ -2080,6 +2100,8 @@ if ($Chain) {
     if ($Stage -eq 'integration' -and -not $DryRun) {
         if ($SkipVerdictGate) {
             Write-Log 'WARNING: -SkipVerdictGate bypasses the standalone integration QA verdict gate.' WARN
+        } elseif ((Get-PacketGateTier -PacketPath $checkPipelinePacket) -eq 'light') {
+            Write-Log 'ℹ️ 경량 게이트 등급(패킷 선언) — QA verdict 게이트 생략, ⑤ 그대로 진행' INFO
         } elseif (-not (Test-QaVerdict -QaDispatchedAt $null)) {
             Write-FailureMarker -Stage 'integration' -Reason 'QA verdict 미통과 — ⑤ 진행 중단'
             exit 1
