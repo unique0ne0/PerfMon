@@ -1,0 +1,8 @@
+﻿# BEGIN harness-generated (managed-by: ai-agents-config sync-configs.ps1 — do not edit by hand)
+scripts/dispatch-with-hang-detect.ps1 linguist-generated=true
+scripts/check-packet-archive.ps1 linguist-generated=true
+scripts/model-profiles.json linguist-generated=true
+scripts/model-profile.ps1 linguist-generated=true
+scripts/orchestrate-packet.ps1 linguist-generated=true
+scripts/session-health.ps1 linguist-generated=true
+# END harness-generated
