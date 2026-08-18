@@ -85,32 +85,19 @@ $script:CimFailureCount = 0
 $script:CleanupStarted = $false
 
 # ── 단계별 설정 (모델·프롬프트는 CLAUDE.md verbatim) ─────────────────────────
-# 개발1팀 기준 모델: openai/gpt-5.6-terra + reasoning medium(= opencode auth login으로 붙인 사용자
-# OpenAI 구독 경로. 2026-08-06 gpt-5.5→terra 승급, 08-08 프로바이더 장애로 opencode/ 피신,
-# 08-09 워크스페이스 크레딧 소진을 계기로 구독 경로 복귀 — 아래 ModelFallback 주석 참조).
-# QA(④) 모델은 Build-ToolCommand의 -m gpt-5.6-terra — codex exec가 직접 OpenAI로 호출하므로
-# opencode 프로바이더 네임스페이스(openai/·opencode/·opencode-go/)와 무관하고 이번 장애의 영향을 받지 않는다.
+# 2026-08-18 사용자 지시로 개발1팀(impl) 체인에서 gemini/gpt 계열을 전부 제거하고 go/free 모델로만
+# 구성한다 — openai/gpt-5.6-terra 슬롯 삭제. ModelFallback은 opencode 계열 3슬롯으로 축소.
 #
-# ModelFallback (impl 전용, 2026-08-08 CFG-001 착수 중 openai/ 프로바이더 장애 실측으로 도입):
-# opencode 프로바이더 장애로 -m openai/gpt-5.6-terra가 30분 하드 상한까지 완전 무응답으로 멈췄다(로그 0바이트,
-# 그런데도 CPU는 계속 소모돼 hang 판정조차 안 뜨고 타임아웃까지 감). 같은 모델을 opencode/ 프로바이더로
-# 부르면 즉시 응답 — 문제는 모델이 아니라 openai/ 라우팅이었다. 재발 시 매번 30분을 날리지 않도록,
-# 1번째 모델에서 hang·timeout 어느 쪽이 나도 즉시 다음 모델로 넘어간다(같은 모델 재시도 없음 — 이미
-# 그 라우팅/모델이 막혔다는 신호이므로).
+# ModelFallback (impl 전용):
+# 체인 구성 원칙: 슬롯의 과금·인증 주체를 다르게 둔다. 하나가 막혀도 나머지가 같이 막히지 않는다.
+#   1번 opencode/     = opencode.ai 워크스페이스. big-pickle은 그 안에서 크레딧을 안 쓰는 무료 최후 수단
+#   2번 opencode-go/  = 별도 opencode-go API 키. mimo-v2.5(사용자 지시, 2026-08-18 재도입)
+#   3번 opencode/     = opencode.ai 워크스페이스 free 모델(deepseek-v4-flash-free)
 #
-# 체인 구성 원칙: 세 슬롯의 과금·인증 주체를 전부 다르게 둔다. 하나가 막혀도 나머지가 같이 막히지 않는다.
-#   1번 openai/       = opencode auth login으로 붙인 사용자 OpenAI 구독(oauth)
-#   2번 opencode-go/  = 별도 opencode-go API 키
-#   3번 opencode/     = opencode.ai 워크스페이스. big-pickle은 그 안에서 크레딧을 안 쓰는 무료 최후 수단
-#
-# 이력: 2026-08-08 위 장애로 1번을 openai/ → opencode/ 로 피신시켰으나, 그 결과 1·3번이 모두
-# opencode.ai 워크스페이스 과금이 되어 2026-08-09 CS-024에서 워크스페이스 크레딧 소진 하나로 1번이
-# 통째로 죽었다(구독은 멀쩡했는데도 안 쓰이고 있었다). 하드 상한 timeout → 다음 모델 폴백이 그 사이
-# 도입되어 무응답 hang은 30분 뒤 자동 복구되므로, 1번을 구독 경로(openai/)로 되돌린다.
-# 2번 모델은 2026-08-09 kimi-k2.7-code에서 deepseek-v4-flash로 교체(사용자 지시).
-# 2026-08-10 베이크오프(6회 실디스패치, 2라운드 × mimo-v2.5-pro/deepseek-v4-flash/deepseek-v4-pro)로
-# 2번 슬롯을 deepseek-v4-flash로 확정했다. mimo는 가짜 패킷 생성·완료 보고로 프로토콜을 오염시켰고,
-# pro는 같은 산출물에 2.4배 비용이 들었지만 품질 우위가 없었다.
+# 이력: 2번 모델은 kimi-k2.7-code → deepseek-v4-flash(2026-08-09, 사용자 지시) → 2026-08-10
+# 베이크오프로 deepseek-v4-flash 확정(mimo는 가짜 패킷 생성·완료 보고로 프로토콜 오염 이력 있음) →
+# 2026-08-18 사용자가 이력 인지 후에도 mimo-v2.5로 재도입 지시. 재발 시 packet/handoff 오염 여부를
+# 특히 주의해서 모니터링할 것.
 # 쿼터 소진 등 다른 이유로 이 체인이 안 맞으면 -Prompt는 프롬프트만 override하므로 모델은 이 파일에서 고친다.
 #
 # KillOnHang: 로그 무변화 시 프로세스 트리를 죽여도 되는가.
@@ -123,7 +110,7 @@ $script:CleanupStarted = $false
 $StageConfig = @{
     'impl' = @{
         Command = 'opencode run --pure --auto -m {MODEL} --variant medium'
-        ModelFallback = @('openai/gpt-5.6-terra', 'opencode/big-pickle', 'opencode-go/deepseek-v4-flash', 'opencode/deepseek-v4-flash-free')
+        ModelFallback = @('opencode/big-pickle', 'opencode-go/mimo-v2.5', 'opencode/deepseek-v4-flash-free')
         DefaultPrompt = "작업 $TaskId — [②구현] handoff 확인하고 패킷의 Done When과 Amendments를 충실히 따라 다음 단계 구현을 진행해. 구현 완료 후 [③자체리뷰] 제로베이스에서 개발 의도·계획 반영 여부와 로직·코드 품질을 점검하고 필요시 수정해. 이어서 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ②③을 갱신해"
         LogFile = "$TaskLogPrefix-impl.log"
         KillOnHang = $true
