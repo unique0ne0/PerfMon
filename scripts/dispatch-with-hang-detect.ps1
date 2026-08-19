@@ -49,7 +49,11 @@ param(
     [Parameter(Mandatory=$false)][int]$HardTimeoutMinutes = 30,
     [Parameter(Mandatory=$false)][switch]$DryRun,
     [Parameter(Mandatory=$false)][switch]$SkipVerdictGate,
-    [Parameter(Mandatory=$false)][switch]$BypassToolPermissions
+    [Parameter(Mandatory=$false)][switch]$BypassToolPermissions,
+    # CFG027: 원장(ledger) 시도 카운트를 구조적 수정 완료 후 감사 가능한 방식으로 초기화한다.
+    # 기존에는 CFG025-qa-ledger.json 등을 Write 툴로 직접 덮어써야 했다 — 반복되는 수동 개입.
+    [Parameter(Mandatory=$false)][switch]$ResetStageLedger,
+    [Parameter(Mandatory=$false)][string]$ResetReason
 )
 
 $ErrorActionPreference = "Stop"
@@ -100,7 +104,7 @@ $StageConfig = @{
     }
     'qa' = @{
         Command = ''
-        DefaultPrompt = "작업 $TaskId — 개발팀의 1차 구현과 자체 리뷰가 완료되었어. Handoff 확인하고 제로베이스에서 구현 및 코드 품질에 대해 리뷰해. 발견한 결함은 직접 수정한 뒤 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ④를 갱신해. 마지막으로 QA 판정을 .agents/briefs/logs/$TaskId-qa-verdict.json 파일에 JSON으로 남겨 — ⑤ 진행 가능하면 verdict를 pass, 차단성 이슈로 ⑤ 진행 불가면 verdict를 blocked(사유는 reason)로 기록해"
+        DefaultPrompt = "작업 $TaskId — 개발팀의 1차 구현과 자체 리뷰가 완료되었어. Handoff 확인하고 제로베이스에서 구현 및 코드 품질에 대해 리뷰해. 리뷰 시작 전 패킷의 Done When 항목을 전부 나열하고, 각 항목마다 실제 diff·코드 근거를 들어 충족 여부를 개별 확인해 — 근거 없이 통째로 '완료'로 넘기지 마(CFG024에서 Done When 항목 하나가 이런 식으로 누락됐었다). 발견한 결함은 직접 수정한 뒤 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ④를 갱신해. 마지막으로 QA 판정을 .agents/briefs/logs/$TaskId-qa-verdict.json 파일에 JSON으로 남겨 — doneWhen 배열에 각 항목을 {item, satisfied, evidence} 형태로 개별 기록하고, 하나라도 satisfied가 false면 verdict는 반드시 blocked여야 해. ⑤ 진행 가능하면 verdict를 pass, 차단성 이슈로 ⑤ 진행 불가면 verdict를 blocked(사유는 reason)로 기록해"
         LogFile = "$TaskLogPrefix-qa.log"
         ReportFile = "$TaskLogPrefix-qa-last.md"
         VerdictFile = "$TaskLogPrefix-qa-verdict.json"
@@ -1452,6 +1456,27 @@ function Record-StageAttempt {
     return @{ Blocked = $false; Count = $count; MaxAllowed = $maxAllowed }
 }
 
+# CFG027: 구조적 원인 수정을 확인한 뒤 원장을 감사 가능하게 초기화하는 유일한 공식 경로.
+# 이전에는 CFG025 QA 원장을 Write 툴로 직접 덮어쓰는 수동 워크어라운드가 두 번 반복됐다 —
+# 사유 없는 초기화를 막기 위해 -ResetReason을 필수로 요구하고 초기화 이력을 별도 로그에 남긴다.
+function Reset-StageLedger {
+    param([string]$Stage, [string]$Reason)
+    $prior = Read-StageLedger -Stage $Stage
+    $priorCount = @($prior.attempts.psobject.Properties).Count
+    $empty = [pscustomobject]@{ schemaVersion = 1; attempts = [pscustomobject]@{} }
+    Write-StageLedger -Stage $Stage -Ledger $empty
+    Clear-BlockedMarker -Stage $Stage
+    $auditPath = Resolve-RepoPath "$LogDir/$TaskId-$Stage-ledger-resets.log"
+    $safeReason = ($Reason -replace '\|', '/').Trim()
+    $line = "[$([datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))] cleared $priorCount attempt(s), blocked marker 해제 — $safeReason"
+    try {
+        [System.IO.File]::AppendAllText($auditPath, $line + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        # 감사 로그 기록 실패가 초기화 자체를 막지 않는다 — 초기화는 이미 완료됐다.
+    }
+    Write-Log "🔄 [$Stage] 원장 초기화 완료 (기존 $priorCount건 삭제, 차단 마커 해제) — $safeReason" SUCCESS
+}
+
 function Test-StageDispatchAllowed {
     param([string]$Stage)
     $blockedMarker = Get-BlockedMarkerPath $Stage
@@ -1607,6 +1632,37 @@ function Get-PacketPipelineStatus {
     return $result
 }
 
+# CFG027: opencode 등 구현 에이전트가 자체 리뷰 후 Pipeline Status 체크박스 갱신을 누락하는
+# 사례가 반복돼(CFG025 ③ 소급 체크 필요) 기획팀이 git diff로 실구현을 확인한 뒤 손으로 체크했다.
+# 하네스는 이미 "단계 성공(=verify.ps1 통과)"이라는 근거를 갖고 있으므로, 그 근거로 대신 체크한다.
+function Set-PacketCheckboxes {
+    param([string]$PacketPath, [int[]]$Indexes, [string]$Annotation)
+    if (-not $PacketPath -or -not (Test-Path -LiteralPath $PacketPath)) { return $false }
+    $lines = @(Get-Content -LiteralPath $PacketPath -Encoding UTF8)
+    $inSection = $false
+    $changed = $false
+    $circles = '①②③④⑤'
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        if ($line -match '^##\s+Pipeline Status\s*$') { $inSection = $true; continue }
+        if ($inSection -and $line -match '^##\s+') { break }
+        if (-not $inSection -or $line -notmatch '^\s*-\s*\[([ xX])\]') { continue }
+        if ($line -match '^\s*-\s*\[[xX]\]') { continue }
+        $stageMatch = [regex]::Match($line, '[①②③④⑤]')
+        if (-not $stageMatch.Success) { continue }
+        $idx = $circles.IndexOf($stageMatch.Value) + 1
+        if ($Indexes -notcontains $idx) { continue }
+        $newLine = $line -replace '^(\s*-\s*)\[ \]', '$1[x]'
+        if ($Annotation) { $newLine = "$newLine $Annotation" }
+        $lines[$i] = $newLine
+        $changed = $true
+    }
+    if ($changed) {
+        [System.IO.File]::WriteAllLines($PacketPath, $lines, (New-Object System.Text.UTF8Encoding($false)))
+    }
+    return $changed
+}
+
 function Get-StagePipelineIndexes {
     param([string]$Stage)
     switch ($Stage) {
@@ -1703,8 +1759,84 @@ function Test-PipelineStageUpdated {
     $status = Get-PacketPipelineStatus -PacketPath $PacketPath
     if (-not $status.HasPipelineStatus -or $status.Items.Count -eq 0) { return }
     $expected = Get-StagePipelineIndexes -Stage $Stage
-    $unchecked = @($status.Items | Where-Object { $expected -contains $_.Index -and -not $_.Checked } | Select-Object -First 1)
-    if ($unchecked.Count -gt 0) { Write-Log "⚠️ [$Stage] 성공했지만 패킷 Pipeline Status가 갱신되지 않았습니다: $($unchecked[0].Label)" WARN }
+    $unchecked = @($status.Items | Where-Object { $expected -contains $_.Index -and -not $_.Checked })
+    if ($unchecked.Count -eq 0) { return }
+    $labels = ($unchecked | ForEach-Object { $_.Label }) -join '; '
+    Write-Log "⚠️ [$Stage] 성공했지만 패킷 Pipeline Status가 갱신되지 않았습니다 — 하네스가 대신 체크합니다: $labels" WARN
+    # CFG027: 구현 에이전트가 체크박스 갱신을 누락해도 파이프라인이 실구현 상태와 어긋나지 않도록,
+    # 하네스가 이미 확보한 "단계 성공(verify.ps1 통과)" 근거로 대신 체크한다 — WARN만 남기고 방치하지 않는다.
+    $indexes = @($unchecked | ForEach-Object { [int]$_.Index })
+    $updated = Set-PacketCheckboxes -PacketPath $PacketPath -Indexes $indexes -Annotation "(자동 갱신 — 하네스가 $Stage 단계 성공 확인 후 대신 체크, 구현 에이전트 누락분)"
+    if ($updated) { Write-Log "✅ [$Stage] Pipeline Status 자동 갱신 완료" SUCCESS }
+}
+
+# CFG026: 착수 컨텍스트 바이트 수 측정. 모델이 실제로 로드하는 문서(전역 CLAUDE.md, 프로젝트
+# CLAUDE.md, 라우터, 패킷 전문, Required Reading)와 DefaultPrompt의 합산 바이트를 잰다.
+# 측정 자체가 컨텍스트를 늘리지 않도록, 이미 존재하는 파일의 크기만 읽는다.
+function Measure-ContextBytes {
+    param([string]$Stage)
+
+    $globalClaude = if ($env:USERPROFILE) { Join-Path $env:USERPROFILE '.claude\CLAUDE.md' } else { $null }
+    $projectClaude = Join-Path $RepoRoot 'CLAUDE.md'
+    $routerPath = Resolve-RepoPath '.agents/briefs/handoff-log.md'
+
+    $totalBytes = 0
+    $parts = @{}
+
+    # 전역 CLAUDE.md
+    $b = 0
+    if ($globalClaude -and (Test-Path -LiteralPath $globalClaude)) { $b = (Get-Item -LiteralPath $globalClaude).Length }
+    $parts['global_claude_md'] = $b; $totalBytes += $b
+
+    # 프로젝트 CLAUDE.md
+    $b = 0
+    if (Test-Path -LiteralPath $projectClaude) { $b = (Get-Item -LiteralPath $projectClaude).Length }
+    $parts['project_claude_md'] = $b; $totalBytes += $b
+
+    # 라우터
+    $b = 0
+    if (Test-Path -LiteralPath $routerPath) { $b = (Get-Item -LiteralPath $routerPath).Length }
+    $parts['router'] = $b; $totalBytes += $b
+
+    # 패킷 전문 + Required Reading
+    $packetBytes = 0; $requiredReadingBytes = 0
+    $packetDir = Resolve-RepoPath '.agents/briefs/packets'
+    $archiveDir = Resolve-RepoPath '.agents/briefs/archive'
+    $packetPath = $null
+    foreach ($dir in @($packetDir, $archiveDir)) {
+        $match = Get-ChildItem -Path $dir -Filter "$TaskId-*.md" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($match) { $packetPath = $match.FullName; break }
+    }
+    if ($packetPath -and (Test-Path -LiteralPath $packetPath)) {
+        $packetBytes = (Get-Item -LiteralPath $packetPath).Length
+        $packetText = Get-Content -LiteralPath $packetPath -Raw -Encoding UTF8
+        $rrMatch = [regex]::Match($packetText, '(?s)##\s*Required Reading\s*\n(.+?)(?=\n##\s|\z)')
+        if ($rrMatch.Success) {
+            foreach ($m in [regex]::Matches($rrMatch.Groups[1].Value, '`([^`]+)`')) {
+                $relPath = $m.Groups[1].Value.Trim().TrimEnd('.')
+                $absPath = if ($relPath.StartsWith('~')) {
+                    if ($env:USERPROFILE) {
+                        Join-Path $env:USERPROFILE ($relPath.Substring(1).TrimStart('/\') -replace '/','\')
+                    } else { $null }
+                } elseif ([System.IO.Path]::IsPathRooted($relPath)) {
+                    $relPath
+                } else {
+                    Join-Path $RepoRoot ($relPath -replace '/','\')
+                }
+                if ($absPath -and (Test-Path -LiteralPath $absPath)) { $requiredReadingBytes += (Get-Item -LiteralPath $absPath).Length }
+            }
+        }
+    }
+    $parts['packet'] = $packetBytes; $totalBytes += $packetBytes
+    $parts['required_reading'] = $requiredReadingBytes; $totalBytes += $requiredReadingBytes
+
+    # DefaultPrompt
+    $promptBytes = 0
+    $p = $StageConfig[$Stage].DefaultPrompt
+    if ($p) { $promptBytes = [System.Text.Encoding]::UTF8.GetByteCount($p) }
+    $parts['default_prompt'] = $promptBytes; $totalBytes += $promptBytes
+
+    Write-Log "[context-size] stage=$Stage bytes=$totalBytes (global_claude=$($parts.global_claude_md) project_claude=$($parts.project_claude_md) router=$($parts.router) packet=$($parts.packet) required_reading=$($parts.required_reading) prompt=$($parts.default_prompt))" INFO
 }
 
 # 한 단계 디스패치 + hang 감지 + 판정. 성공(종료 코드 정상 + verify 통과) 시 $true.
@@ -1713,6 +1845,15 @@ function Dispatch-Stage {
     param([string]$Stage, [string]$PromptOverride)
     $config = $StageConfig[$Stage]
     $logRel = $config.LogFile
+
+    # CFG026: 스테이지 시작 시 착수 컨텍스트 크기를 로그에 한 줄로 남긴다.
+    Measure-ContextBytes -Stage $Stage
+
+    # CFG025: 헤드리스 antigravity는 명령 내용과 무관하게 모든 run_command를 승인 대기로 거부한다
+    # (BOM 수정·verify.ps1 실행·sync-configs.ps1 Push 등에서 반복 관측 — 2026-08-19). QA는 이미
+    # "직접 수정" 권한을 가진 신뢰된 단계이므로, 사용자 승인(2026-08-19)에 따라 QA 단계는 항상
+    # --dangerously-skip-permissions를 부여해 이 실패 클래스 자체를 구조적으로 제거한다.
+    if ($Stage -eq 'qa') { $BypassToolPermissions = $true }
 
     # CFG024: 디스패치 시작 전 원장/차단 마커 검사 — 이미 상한에 도달한 경우 모델을 띄우기 전에 즉시 거부한다.
     $allowed = Test-StageDispatchAllowed -Stage $Stage
@@ -2216,6 +2357,17 @@ function Invoke-DispatcherCleanup {
 
 # ── 메인 ─────────────────────────────────────────────────────────────────────
 Validate-TaskId -Id $TaskId
+
+if ($ResetStageLedger) {
+    if (-not $Stage) { Write-Log '오류: -ResetStageLedger는 -Stage와 함께 사용하세요 (예: -Stage qa).' ERROR; exit 1 }
+    if ([string]::IsNullOrWhiteSpace($ResetReason)) {
+        Write-Log '오류: -ResetStageLedger는 -ResetReason으로 초기화 사유를 반드시 남기세요 (예: "구조적 원인 수정 완료 — BypassToolPermissions 적용").' ERROR
+        exit 1
+    }
+    Reset-StageLedger -Stage $Stage -Reason $ResetReason
+    exit 0
+}
+
 if ($Chain -and $Stage) { Write-Log '-Chain and -Stage are mutually exclusive.' ERROR; exit 1 }
 if ($Chain -and $Prompt) { Write-Log '-Prompt is ignored in -Chain mode; using each stage default prompt.' WARN }
 if (-not $Chain -and $Stage -ne 'impl' -and $Model) { Write-Log "-Model is ignored for [$Stage]." WARN }
