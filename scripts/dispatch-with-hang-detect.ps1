@@ -284,7 +284,8 @@ function Resolve-AntigravityProjectId {
     $projectsDir = Join-Path $env:USERPROFILE '.gemini\config\projects'
     if (-not (Test-Path -LiteralPath $projectsDir)) { throw "Antigravity projects directory not found: $projectsDir" }
     $wanted = [IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\').Replace('\','/').ToLowerInvariant()
-    foreach ($file in @(Get-ChildItem -LiteralPath $projectsDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+    $matchedProjects = @()
+    foreach ($file in @(Get-ChildItem -LiteralPath $projectsDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
         try { $project = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
         foreach ($resource in @($project.projectResources.resources)) {
             $uri = if ($resource.folderUri) { [string]$resource.folderUri } elseif ($resource.gitFolder.folderUri) { [string]$resource.gitFolder.folderUri } else { '' }
@@ -294,11 +295,21 @@ function Resolve-AntigravityProjectId {
             if ($candidate -eq $wanted) {
                 $id = [string]$project.id
                 if ($id -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,127}$') { throw "Invalid Antigravity project id in $($file.FullName)" }
-                return $id
+                $matchedProjects += [pscustomobject]@{ Id = $id; File = $file.Name; FullPath = $file.FullName }
+                break
             }
         }
     }
-    throw "No Antigravity project maps repository '$RepositoryRoot'. Run 'agy --new-project' from that repository root after explicit user approval."
+    if ($matchedProjects.Count -eq 0) {
+        throw "No Antigravity project maps repository '$RepositoryRoot'. Run 'agy --new-project' from that repository root after explicit user approval."
+    }
+    if ($matchedProjects.Count -gt 1) {
+        $candidateList = ($matchedProjects | ForEach-Object { "$($_.Id) ($($_.File))" }) -join ', '
+        if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+            Write-Log "⚠️ 저장소 '$RepositoryRoot'에 매핑된 Antigravity 프로젝트가 $($matchedProjects.Count)개 발견되었습니다: $candidateList — 결정적 첫 번째($($matchedProjects[0].Id))를 사용합니다" WARN
+        }
+    }
+    return $matchedProjects[0].Id
 }
 
 # CFG017: Antigravity 어댑터 단계의 읽기 전용 preflight. PATH·버전·project mapping을 진단만 하고
@@ -341,30 +352,17 @@ function Test-AntigravityPreflight {
         return $result
     }
 
-    # 3) project mapping — 읽기 전용(같은 디렉터리를 Resolve-AntigravityProjectId처럼 탐색하되 throw 하지 않는다).
-    $projectsDir = Join-Path $env:USERPROFILE '.gemini\config\projects'
-    $mapped = $false
-    if (Test-Path -LiteralPath $projectsDir) {
-        $wanted = [IO.Path]::GetFullPath($RepoRoot).TrimEnd('\').Replace('\','/').ToLowerInvariant()
-        foreach ($file in @(Get-ChildItem -LiteralPath $projectsDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
-            try { $project = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
-            foreach ($resource in @($project.projectResources.resources)) {
-                $uri = if ($resource.folderUri) { [string]$resource.folderUri } elseif ($resource.gitFolder.folderUri) { [string]$resource.gitFolder.folderUri } else { '' }
-                if ($uri.StartsWith('file:', [StringComparison]::OrdinalIgnoreCase)) {
-                    $decoded = [Uri]::UnescapeDataString(($uri -replace '^file:/+', '')).TrimEnd('/').ToLowerInvariant()
-                    if ($decoded -eq $wanted) { $mapped = $true; break }
-                }
-            }
-            if ($mapped) { break }
-        }
-    }
-    if (-not $mapped) {
+    # 3) project mapping — 읽기 전용(Resolve-AntigravityProjectId 호출로 진단; 중복 경고 공유).
+    $projectId = $null
+    try {
+        $projectId = Resolve-AntigravityProjectId -RepositoryRoot $RepoRoot
+    } catch {
         $result.Ready = $false
-        $result.Warnings += "저장소 '$RepoRoot'에 대한 Antigravity project mapping이 없습니다 — 승인 후 프로젝트 매핑을 만들어야 합니다(CS-BL-019)"
+        $result.Warnings += "저장소 '$RepoRoot'에 대한 Antigravity project mapping이 없습니다 ($($_.Exception.Message)) — 승인 후 프로젝트 매핑을 만들어야 합니다(CS-BL-019)"
         return $result
     }
 
-    $result.Diagnostics += "agy $version ($exe), project mapped"
+    $result.Diagnostics += "agy $version ($exe), project mapped ($projectId)"
     return $result
 }
 
@@ -437,7 +435,8 @@ function Get-RepeatedErrorObservation {
 function Get-ProcessTreeMetrics {
     param([int]$RootProcessId)
 
-    $cpu = [TimeSpan]::Zero; [Int64]$io = 0
+    $cpu = [TimeSpan]::Zero; [Int64]$io = 0; [Int64]$workingSet = 0; [int]$handleCount = 0
+    $pids = @()
     $queryStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
@@ -466,13 +465,24 @@ function Get-ProcessTreeMetrics {
         $processId = $pending.Dequeue()
         if ($seen.ContainsKey($processId)) { continue }
         $seen[$processId] = $true
+        $pids += $processId
 
-        try { $cpu += (Get-Process -Id $processId -ErrorAction Stop).TotalProcessorTime } catch { }
+        $procObj = $null
+        try {
+            $procObj = Get-Process -Id $processId -ErrorAction Stop
+            $cpu += $procObj.TotalProcessorTime
+            $workingSet += [Int64]$procObj.WorkingSet64
+            $handleCount += [int]$procObj.HandleCount
+        } catch { }
         if ($byId.ContainsKey($processId)) {
             $current = $byId[$processId]
             $read = if ($null -eq $current.ReadTransferCount) { 0 } else { [Int64]$current.ReadTransferCount }
             $write = if ($null -eq $current.WriteTransferCount) { 0 } else { [Int64]$current.WriteTransferCount }
             $io += $read + $write
+            if (-not $procObj) {
+                if ($current.WorkingSetSize) { $workingSet += [Int64]$current.WorkingSetSize }
+                if ($current.HandleCount) { $handleCount += [int]$current.HandleCount }
+            }
         }
         if ($children.ContainsKey($processId)) {
             foreach ($child in $children[$processId]) {
@@ -480,7 +490,16 @@ function Get-ProcessTreeMetrics {
             }
         }
     }
-    return @{ Cpu = $cpu; Io = $io; QueryMs = $queryStopwatch.ElapsedMilliseconds; CimFailures = $script:CimFailureCount }
+    return @{
+        Cpu = $cpu
+        Io = $io
+        WorkingSet = $workingSet
+        HandleCount = $handleCount
+        ProcessIds = @($pids)
+        ChildProcessIds = @($pids | Where-Object { $_ -ne $RootProcessId })
+        QueryMs = $queryStopwatch.ElapsedMilliseconds
+        CimFailures = $script:CimFailureCount
+    }
 }
 
 # 작업트리 스냅샷 — 단계가 실제로 무언가를 바꿨는지 판정하는 근거.
@@ -924,7 +943,14 @@ function Invoke-StageProcess {
                     Write-Log "강제 종료 [$Stage] (PID: $($proc.Id), 경과 $([math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1))초)" WARN
                     return 'hang'
                 } elseif (-not $hangReported) {
-                    Write-Log "⚠️ hang 후보 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 커밋·푸시 단계라 하드 상한까지 대기" WARN
+                    $wsMb = [math]::Round($metricsNow.WorkingSet / 1MB, 1)
+                    $handles = $metricsNow.HandleCount
+                    $childPids = if ($metricsNow.ChildProcessIds -and $metricsNow.ChildProcessIds.Count -gt 0) {
+                        $metricsNow.ChildProcessIds -join ', '
+                    } else {
+                        '없음'
+                    }
+                    Write-Log "⚠️ hang 후보 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 점유 자원: WS ${wsMb}MB, 핸들 ${handles}개, 자식 PID: [$childPids]; 커밋·푸시 단계라 하드 상한까지 대기" WARN
                     $hangReported = $true
                 }
             }
@@ -1914,14 +1940,18 @@ function Dispatch-Stage {
     Invoke-SessionHealthCheck -Stage $Stage
 
     # CFG017: Antigravity 어댑터 단계는 실행 전 읽기 전용 preflight로 PATH·버전·project mapping을
-    # 진단한다. 이 진단은 외부 설정(설치·매핑·환경 변수)을 절대 변경하지 않는다 — 문제는 재시도 불가능한
-    # config failure로 즉시 돌린다(모델 체인 폴백·자동 재시도 없음).
+    # 진단한다. 이 진단은 외부 설정(설치·매핑·환경 변수)을 절대 변경하지 않는다.
+    # CFG028: AdapterChain이 존재하면 슬롯 0 실패 시에도 후속 슬롯(opencode 등) 시도를 위해 즉시 실패시키지 않고 경고 후 계속 진행.
     $preflight = Test-AntigravityPreflight -Stage $Stage
     if (-not $preflight.Ready) {
         $reason = "Antigravity preflight 실패: $($preflight.Warnings -join '; ')"
-        Write-Log "❌ [$Stage] $reason" ERROR
-        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $reason -Model $null
-        return @{ Success = $false; FailureReason = $reason; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
+        if ($config.AdapterChain -and $config.AdapterChain.Count -gt 0) {
+            Write-Log "⚠️ [$Stage] $reason (AdapterChain 설정됨 — 슬롯별 폴백을 위해 모델 루프 계속 진행)" WARN
+        } else {
+            Write-Log "❌ [$Stage] $reason" ERROR
+            Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $reason -Model $null
+            return @{ Success = $false; FailureReason = $reason; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
+        }
     }
     if ($config.Adapter -eq 'antigravity' -and $preflight.Executable) { $config.Executable = $preflight.Executable }
     if ($preflight.Diagnostics.Count -gt 0) { Write-Log "[$Stage] preflight: $($preflight.Diagnostics -join ' | ')" INFO }
@@ -1951,12 +1981,21 @@ function Dispatch-Stage {
         # CFG024: qa·integration 폴백 체인은 슬롯마다 어댑터가 달라질 수 있다(예: gemini-qa는
         # antigravity → opencode). AdapterChain이 있으면 이번 슬롯의 어댑터로 $config를 갱신하고,
         # antigravity면 ProjectId·Executable도 그 슬롯 기준으로 다시 확인한다.
+        # CFG028: antigravity 매핑 실패 시 unhandled exception 방지 -> WARN + 다음 슬롯 모델로 전환.
         if ($config.AdapterChain -and $modelIndex -lt $config.AdapterChain.Count) {
             $config.Adapter = $config.AdapterChain[$modelIndex]
             if ($config.Adapter -eq 'antigravity') {
-                $config.ProjectId = Resolve-AntigravityProjectId -RepositoryRoot $RepoRoot
-                $slotPreflight = Test-AntigravityPreflight -Stage $Stage
-                if ($slotPreflight.Executable) { $config.Executable = $slotPreflight.Executable }
+                try {
+                    $config.ProjectId = Resolve-AntigravityProjectId -RepositoryRoot $RepoRoot
+                    $slotPreflight = Test-AntigravityPreflight -Stage $Stage
+                    if ($slotPreflight.Executable) { $config.Executable = $slotPreflight.Executable }
+                } catch {
+                    $slotReason = "슬롯 $($modelIndex + 1) antigravity 매핑/preflight 실패: $($_.Exception.Message)"
+                    Write-Log "⚠️ [$Stage] $slotReason — 다음 슬롯 모델로 전환합니다" WARN
+                    $attemptFailures += "model $($modelIndex + 1) ($model): $slotReason"
+                    $modelIndex++
+                    continue
+                }
             }
         }
         $toolCmd = Build-ToolCommand -Config $config -Stage $Stage -PromptOverride $PromptOverride -Model $model -BypassToolPermissions:$BypassToolPermissions

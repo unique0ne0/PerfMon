@@ -5,4 +5,5 @@ scripts/model-profiles.json linguist-generated=true
 scripts/model-profile.ps1 linguist-generated=true
 scripts/orchestrate-packet.ps1 linguist-generated=true
 scripts/session-health.ps1 linguist-generated=true
+scripts/gy-orchestrator-prompt.md linguist-generated=true
 # END harness-generated
