@@ -1,11 +1,18 @@
 {
   "schemaVersion": 2,
+  "modelCatalog": {
+    "opencode-go/mimo-v2.5-pro":       { "family": "mimo",     "principal": "opencode-go",   "tierUsd": 15, "cost": "paid" },
+    "opencode-go/deepseek-v4-flash":   { "family": "deepseek", "principal": "opencode-go",   "tierUsd": 30, "cost": "paid" },
+    "opencode-go/mimo-v2.5":           { "family": "mimo",     "principal": "opencode-go",   "tierUsd": 60, "cost": "paid" },
+    "opencode/deepseek-v4-flash-free": { "family": "deepseek", "principal": "opencode-free", "cost": "free" },
+    "opencode/big-pickle":             { "family": "unknown",  "principal": "opencode-free", "cost": "free" }
+  },
   "roles": {
     "planning": "claude-planning",
     "orchestration": "gemini-driver"
   },
   "profiles": {
-    "claude-planning": { "adapter": "claude", "family": "claude", "model": "opus", "tier": "quality", "fallbackProfiles": [] },
+    "claude-planning": { "adapter": "claude", "family": "claude", "model": "sonnet", "tier": "balanced", "fallbackProfiles": [] },
     "codex-planning": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "tier": "quality", "fallbackProfiles": [] },
     "gemini-planning": { "adapter": "gemini", "family": "gemini", "model": "gemini-2.5-pro", "tier": "quality", "fallbackProfiles": [] },
     "gemini-driver": { "adapter": "gemini", "family": "gemini", "model": "gemini-3.7-flash", "tier": "fast", "fallbackProfiles": ["claude-driver", "codex-driver"] },
@@ -14,16 +21,16 @@
     "codex-qa": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "tier": "balanced", "fallbackProfiles": [] },
     "gemini-qa": { "adapter": "antigravity", "family": "gemini", "model": "gemini-3.7-flash", "tier": "fast", "fallbackProfiles": ["gemini-qa-opencode"] },
     "gemini-qa-opencode": { "adapter": "opencode", "family": "gemini", "model": "google/gemini-3.7-flash", "tier": "fast", "fallbackProfiles": [] },
-    "claude-integration": { "adapter": "claude", "family": "claude", "model": "opus", "tier": "quality", "fallbackProfiles": [] },
+    "claude-integration": { "adapter": "claude", "family": "claude", "model": "sonnet", "tier": "balanced", "fallbackProfiles": [] },
     "codex-integration": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "tier": "quality", "fallbackProfiles": [] },
     "gemini-integration": { "adapter": "gemini", "family": "gemini", "model": "gemini-2.5-pro", "tier": "quality", "fallbackProfiles": [] }
   },
   "routes": {
-    "claude-planned": ["openai/gpt-5.6-terra", "opencode-go/deepseek-v4-flash", "opencode/big-pickle", "opencode/deepseek-v4-flash-free"],
-    "independent-planned": ["opencode-go/deepseek-v4-flash", "opencode/big-pickle", "opencode/deepseek-v4-flash-free", "openai/gpt-5.6-terra"]
+    "claude-planned":      ["opencode-go/mimo-v2.5-pro", "opencode-go/deepseek-v4-flash", "opencode-go/mimo-v2.5", "opencode/deepseek-v4-flash-free", "opencode/big-pickle"],
+    "independent-planned": ["opencode-go/mimo-v2.5-pro", "opencode-go/deepseek-v4-flash", "opencode-go/mimo-v2.5", "opencode/deepseek-v4-flash-free", "opencode/big-pickle"]
   },
   "plannerRouting": {
-    "claude": { "implementationRoute": "claude-planned", "qaProfile": "codex-qa", "integrationProfile": "claude-integration" },
+    "claude": { "implementationRoute": "claude-planned", "qaProfile": "gemini-qa", "integrationProfile": "claude-integration" },
     "codex": { "implementationRoute": "independent-planned", "qaProfile": "gemini-qa", "integrationProfile": "codex-integration" },
     "gemini": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "gemini-integration" }
   },

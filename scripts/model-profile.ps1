@@ -9,8 +9,8 @@ function Read-JsonFile {
 }
 
 function Test-ProfileGraph {
-    param([object]$Config)
-    if ($null -eq $Config -or $Config.schemaVersion -ne 2 -or $null -eq $Config.roles -or $null -eq $Config.profiles -or $null -eq $Config.routes -or $null -eq $Config.plannerRouting) { throw 'Invalid model profile schema.' }
+    param([object]$Config, [System.Collections.ArrayList]$Warnings = $null)
+    if ($null -eq $Config -or $Config.schemaVersion -ne 2 -or $null -eq $Config.roles -or $null -eq $Config.profiles -or $null -eq $Config.routes -or $null -eq $Config.plannerRouting -or $null -eq $Config.modelCatalog) { throw 'Invalid model profile schema.' }
     foreach ($role in @('planning', 'orchestration')) { if ([string]::IsNullOrWhiteSpace([string]$Config.roles.$role)) { throw "Missing role profile: $role" } }
     foreach ($property in @($Config.profiles.psobject.Properties)) {
         $profile = $property.Value
@@ -30,13 +30,23 @@ function Test-ProfileGraph {
     }
     $visitedProfiles = @{}
     foreach ($property in @($Config.profiles.psobject.Properties)) { Visit-ProfileFallback -Name $property.Name -Visiting @{} -Visited $visitedProfiles }
+    foreach ($catalogEntry in @($Config.modelCatalog.psobject.Properties)) {
+        $meta = $catalogEntry.Value
+        if ([string]$meta.family -notmatch '^[a-z][a-z0-9-]*$') { throw "Invalid family in modelCatalog: $($catalogEntry.Name)" }
+        if ([string]::IsNullOrWhiteSpace([string]$meta.principal)) { throw "Missing principal in modelCatalog: $($catalogEntry.Name)" }
+    }
     foreach ($route in @($Config.routes.psobject.Properties)) {
         $models = @($route.Value)
-        if ($models.Count -eq 0 -or -not ($models -contains 'opencode/big-pickle')) { throw "Route $($route.Name) must retain opencode/big-pickle." }
-        $openCodeFree = @($models | Where-Object { $_ -match '^opencode/' })
-        if ($openCodeFree.Count -eq 0 -or $openCodeFree[0] -ne 'opencode/big-pickle') { throw 'Big Pickle must be the first OpenCode free fallback.' }
-        if ($route.Name -eq 'independent-planned' -and $models[-1] -ne 'openai/gpt-5.6-terra') { throw 'Independent route must end with emergency GPT Terra.' }
-        foreach ($model in $models) { if ([string]$model -notmatch '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$') { throw "Invalid route model: $model" } }
+        if ($models.Count -eq 0) { throw "Route $($route.Name) must have at least one model." }
+        foreach ($model in $models) {
+            if ([string]$model -notmatch '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$') { throw "Invalid route model: $model" }
+            if ($null -eq $Config.modelCatalog.$model) { throw "Route $($route.Name) contains unregistered model: $model" }
+        }
+        $lastModel = $models[-1]
+        $lastCatalog = $Config.modelCatalog.$lastModel
+        if ($null -eq $lastCatalog -or [string]$lastCatalog.cost -ne 'free') { throw "Route $($route.Name) last slot must be a free model." }
+        $unique = @($models | Sort-Object -Unique)
+        if ($unique.Count -ne $models.Count) { throw "Route $($route.Name) contains duplicate models." }
     }
     foreach ($adapter in @('claude', 'codex', 'gemini')) {
         $route = $Config.plannerRouting.$adapter
@@ -45,24 +55,58 @@ function Test-ProfileGraph {
         $integrationName = if ($route) { [string]$route.integrationProfile } else { '' }
         if ($null -eq $route -or $null -eq $Config.routes.$routeName -or $null -eq $Config.profiles.$qaName -or $null -eq $Config.profiles.$integrationName) { throw "Invalid planner routing for $adapter" }
         $qa = $Config.profiles.$qaName
-        if ($qa.family -eq $adapter) { throw "Planner $adapter cannot use same-family QA profile $($route.qaProfile)" }
-        if ($Config.profiles.$integrationName.family -ne $adapter) { throw "Planner $adapter must use its own family for Integration" }
+        if ($qa.family -eq $adapter) {
+            $msg = "Planner $adapter uses same-family QA profile $($route.qaProfile) (prefer violation)"
+            if ($null -ne $Warnings) { $null = $Warnings.Add($msg) } else { throw $msg }
+        }
+        if ($Config.profiles.$integrationName.family -ne $adapter) {
+            $msg = "Planner $adapter does not use its own family for Integration (prefer violation)"
+            if ($null -ne $Warnings) { $null = $Warnings.Add($msg) } else { throw $msg }
+        }
+        $implModels = @($Config.routes.$routeName)
+        foreach ($m in $implModels) {
+            $mFamily = if ($Config.modelCatalog.$m) { [string]$Config.modelCatalog.$m.family } else { '' }
+            if ($mFamily -ne '' -and $mFamily -ne 'unknown' -and $mFamily -eq $qa.family) {
+                throw "Implementation model $m (family=$mFamily) shares family with QA profile $($route.qaProfile) (family=$($qa.family)) — must violation"
+            }
+        }
     }
 }
 
 function Read-ModelProfileConfig {
     param([string]$CentralPath, [string]$LocalPath)
-    $config = Read-JsonFile -Path $CentralPath; Test-ProfileGraph -Config $config
+    $config = Read-JsonFile -Path $CentralPath
+    $graphWarnings = [System.Collections.ArrayList]@()
+    Test-ProfileGraph -Config $config -Warnings $graphWarnings
+    foreach ($w in $graphWarnings) { Write-Warning $w }
+    $graphWarnings.Clear()
     $local = Read-JsonFile -Path $LocalPath
     if ($null -ne $local) {
-        $unexpectedTopLevel = @($local.psobject.Properties.Name | Where-Object { $_ -ne 'roles' })
-        if ($unexpectedTopLevel.Count -gt 0) { throw "Local model profile config only permits 'roles'." }
+        $unexpectedTopLevel = @($local.psobject.Properties.Name | Where-Object { $_ -notin @('roles', 'plannerRouting') })
+        if ($unexpectedTopLevel.Count -gt 0) { throw "Local model profile config only permits 'roles' and 'plannerRouting'." }
         if ($null -ne $local.roles) {
             $unexpectedRoles = @($local.roles.psobject.Properties.Name | Where-Object { $_ -notin @('planning', 'orchestration') })
             if ($unexpectedRoles.Count -gt 0) { throw 'Local model profile config contains an unsupported role.' }
             foreach ($role in @('planning', 'orchestration')) { if ($null -ne $local.roles.$role) { $config.roles.$role = [string]$local.roles.$role } }
         }
-        Test-ProfileGraph -Config $config
+        if ($null -ne $local.plannerRouting) {
+            foreach ($adapter in @($local.plannerRouting.psobject.Properties)) {
+                if ($null -eq $config.plannerRouting) { $config.plannerRouting = [pscustomobject]@{} }
+                $centralRoute = $config.plannerRouting.($adapter.Name)
+                if ($null -eq $centralRoute) { $config.plannerRouting | Add-Member -NotePropertyName $adapter.Name -NotePropertyValue $adapter.Value }
+                else { foreach ($prop in @($adapter.Value.psobject.Properties)) { $centralRoute | Add-Member -NotePropertyName $prop.Name -NotePropertyValue $prop.Value -Force } }
+            }
+            $forbiddenFields = @('command', 'apiKey', 'token', 'secret', 'password')
+            foreach ($adapter in @($local.plannerRouting.psobject.Properties)) {
+                if ($null -ne $adapter.Value) {
+                    foreach ($prop in @($adapter.Value.psobject.Properties)) {
+                        if ($prop.Name -in $forbiddenFields) { throw "Local plannerRouting for '$($adapter.Name)' contains forbidden field: $($prop.Name)" }
+                    }
+                }
+            }
+        }
+        Test-ProfileGraph -Config $config -Warnings $graphWarnings
+        foreach ($w in $graphWarnings) { Write-Warning $w }
     }
     return $config
 }
@@ -75,6 +119,26 @@ function Resolve-RoleProfile {
     return [pscustomobject]@{ Name = $name; Adapter = [string]$profile.adapter; Family = [string]$profile.family; Model = [string]$profile.model; FallbackProfiles = @($profile.fallbackProfiles) }
 }
 
+function Resolve-ProfileChain {
+    param([string]$ProfileName, [object]$Config)
+    $visited = @{}
+    $chain = @()
+    $visit = {
+        param([string]$name)
+        if ($visited.ContainsKey($name)) { return }
+        $visited[$name] = $true
+        $p = $Config.profiles.$name
+        if ($null -eq $p) { return }
+        $script:resolvedProfileChain += $name
+        foreach ($fb in @($p.fallbackProfiles)) {
+            & $visit ([string]$fb)
+        }
+    }
+    $script:resolvedProfileChain = @()
+    & $visit $ProfileName
+    return $script:resolvedProfileChain
+}
+
 function Resolve-PipelineRouting {
     param([object]$Config, [string]$PlanningProfile, [string]$PlanningAdapter)
     $planner = $Config.profiles.$PlanningProfile
@@ -84,8 +148,16 @@ function Resolve-PipelineRouting {
     if ($null -eq $route) { throw "No downstream route for planner adapter: $PlanningAdapter" }
     $qa = Resolve-RoleProfile -Role planning -Config $Config -ExplicitProfile ([string]$route.qaProfile)
     $integration = Resolve-RoleProfile -Role planning -Config $Config -ExplicitProfile ([string]$route.integrationProfile)
-    if ($qa.Family -eq $planner.family) { throw "Same-family QA is forbidden for planner: $PlanningAdapter" }
     $routeName = [string]$route.implementationRoute
+    foreach ($m in @($Config.routes.$routeName)) {
+        $mFamily = if ($Config.modelCatalog.$m) { [string]$Config.modelCatalog.$m.family } else { '' }
+        if ($mFamily -ne '' -and $mFamily -ne 'unknown' -and $mFamily -eq $qa.Family) {
+            throw "Implementation model $m (family=$mFamily) shares family with QA profile $($qa.Name) (family=$($qa.Family)) — must violation"
+        }
+    }
+    if ($qa.Family -eq $planner.family) {
+        Write-Warning "Planner $PlanningAdapter uses same-family QA profile $($qa.Name) (prefer violation)"
+    }
     return [pscustomobject]@{ PlanningProfile = $PlanningProfile; PlanningAdapter = $PlanningAdapter; ImplementationRoute = $routeName; ImplementationModels = @($Config.routes.$routeName); QaProfile = $qa; IntegrationProfile = $integration }
 }
 

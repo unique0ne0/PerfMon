@@ -85,32 +85,13 @@ $script:CimFailureCount = 0
 $script:CleanupStarted = $false
 
 # ── 단계별 설정 (모델·프롬프트는 CLAUDE.md verbatim) ─────────────────────────
-# 2026-08-18 사용자 지시로 개발1팀(impl) 체인에서 gemini/gpt 계열을 전부 제거하고 go/free 모델로만
-# 구성한다 — openai/gpt-5.6-terra 슬롯 삭제. ModelFallback은 opencode 계열 3슬롯으로 축소.
-#
-# ModelFallback (impl 전용):
-# 체인 구성 원칙: 슬롯의 과금·인증 주체를 다르게 둔다. 하나가 막혀도 나머지가 같이 막히지 않는다.
-#   1번 opencode/     = opencode.ai 워크스페이스. big-pickle은 그 안에서 크레딧을 안 쓰는 무료 최후 수단
-#   2번 opencode-go/  = 별도 opencode-go API 키. mimo-v2.5(사용자 지시, 2026-08-18 재도입)
-#   3번 opencode/     = opencode.ai 워크스페이스 free 모델(deepseek-v4-flash-free)
-#
-# 이력: 2번 모델은 kimi-k2.7-code → deepseek-v4-flash(2026-08-09, 사용자 지시) → 2026-08-10
-# 베이크오프로 deepseek-v4-flash 확정(mimo는 가짜 패킷 생성·완료 보고로 프로토콜 오염 이력 있음) →
-# 2026-08-18 사용자가 이력 인지 후에도 mimo-v2.5로 재도입 지시. 재발 시 packet/handoff 오염 여부를
-# 특히 주의해서 모니터링할 것.
-# 쿼터 소진 등 다른 이유로 이 체인이 안 맞으면 -Prompt는 프롬프트만 override하므로 모델은 이 파일에서 고친다.
-#
-# KillOnHang: 로그 무변화 시 프로세스 트리를 죽여도 되는가.
-#   impl/qa 는 재시작이 안전하므로 $true.
-#   integration(⑤)은 커밋·푸시를 수행하므로 $false — 도중 kill 시 경합/절반 커밋 위험이다
-#   (2026-07-25 ai0033 실측: 이미 커밋이 끝난 ⑤ 프로세스를 워처가 오탐 kill). stream-json 으로
-#   flush 빈도를 올려 오탐을 줄였지만, 단일 도구 호출이 길면 여전히 조용할 수 있어 하드 상한에만 위임한다.
-# Retry: hang 으로 죽인 뒤 동일 명령으로 1회 재디스패치할 것인가(hang-detect-agent Iron Law — 재시도는 최대 1회).
-#   impl은 ModelFallback이 이 역할을 대신하므로 Retry=false(동일 모델 재시도 대신 다음 모델로 즉시 전환).
+# model-profiles.json의 modelCatalog + routes가 체인의 정본이다.
+# 아래 ModelFallback은 JSON 로드 실패 시의 비상 기본값으로만 쓰인다.
+# 새 5슬롯 체인: opencode-go/mimo-v2.5-pro → deepseek-v4-flash → mimo-v2.5 → deepseek-v4-flash-free → big-pickle
 $StageConfig = @{
     'impl' = @{
         Command = 'opencode run --pure --auto -m {MODEL} --variant medium'
-        ModelFallback = @('opencode/big-pickle', 'opencode-go/mimo-v2.5', 'opencode/deepseek-v4-flash-free')
+        ModelFallback = @('opencode-go/mimo-v2.5-pro', 'opencode-go/deepseek-v4-flash', 'opencode-go/mimo-v2.5', 'opencode/deepseek-v4-flash-free', 'opencode/big-pickle')
         DefaultPrompt = "작업 $TaskId — [②구현] handoff 확인하고 패킷의 Done When과 Amendments를 충실히 따라 다음 단계 구현을 진행해. 구현 완료 후 [③자체리뷰] 제로베이스에서 개발 의도·계획 반영 여부와 로직·코드 품질을 점검하고 필요시 수정해. 이어서 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ②③을 갱신해"
         LogFile = "$TaskLogPrefix-impl.log"
         KillOnHang = $true
@@ -1004,7 +985,12 @@ function Resolve-ModelChain {
     # 단일 원소 언랩으로 $models 자체가 $null이 되어버린다(2026-08-08 CFG-001 QA 무동작 실측 —
     # while ($modelIndex -lt $models.Count)가 0 -lt 0으로 죽어 프로세스가 아예 안 뜸). 분기 안에서
     # 직접 대입해야 배열이 보존된다.
-    if ($config.ModelFallback) { $models = @($config.ModelFallback) } elseif ($config.Model) { $models = @($config.Model) } else { $models = @($null) }
+    # CFG024: qa·integration은 modelCatalog(어댑터 고정, opencode-go/big-pickle식 slash 식별자)가
+    # 아니라 profiles(어댑터가 슬롯마다 달라질 수 있는 model-profile 체인)에서 해석되므로 별도 필드로
+    # 구분한다 — ModelFallback의 slash-format Assert-ModelIdentifier 검증을 우회하지 않기 위함이다.
+    # ContainsKey로 판정하는 이유: 후보가 전부 family 충돌로 걸러지면 @() 빈 배열을 명시적으로 넣어
+    # "슬롯 없음"을 뒤 elseif(.Model)로 조용히 새지 않게 만든다(§Done When 4 — 사람 개입 필요 실패).
+    if ($config.ContainsKey('ModelChain')) { $models = @($config.ModelChain) } elseif ($config.ModelFallback) { $models = @($config.ModelFallback) } elseif ($config.Model) { $models = @($config.Model) } else { $models = @($null) }
 
     # -Model: 작업 성격에 맞는 1번 모델을 기획 단계에서 지정한다(예: 리팩토링 위주면 코딩 특화 모델).
     # 폴백 체인의 나머지는 '이 모델/프로바이더가 막혔을 때의 탈출 경로'라 성격과 무관하게 유지해야 하므로,
@@ -1022,23 +1008,51 @@ function Resolve-ModelChain {
 
     if ($Stage -eq 'impl' -and $script:ProviderHealthPath) {
         $health = Read-ProviderHealth -Path $script:ProviderHealthPath
-        $go = $health.providers.'opencode-go'
-        # A temporary provider outage is handled exactly like quota: skip only until its
-        # bounded re-probe time, then restore the configured GO-first order automatically.
-        # Authentication is deliberately excluded here: a sandbox credential denial is a
-        # context problem, not evidence that the shared provider account was logged out.
-        if ($go -and $go.reason -in @('quota', 'billing', 'unavailable') -and $go.nextProbeAt) {
-            [datetime]$nextProbe = [datetime]::MinValue
-            if (-not [datetime]::TryParse([string]$go.nextProbeAt, [ref]$nextProbe)) {
-                Write-Log "provider health nextProbeAt is unreadable for opencode-go; ignoring the corrupt cooldown entry" WARN
-            } elseif ($nextProbe.ToUniversalTime() -gt [datetime]::UtcNow) {
-                $models = @($models | Where-Object { $_ -notmatch '^opencode-go/' })
-                # The free emergency model is the first usable slot while GO is known unavailable.
-                # Keep the remaining configured order so the normal reprobe contract is unchanged.
-                $bigPickle = @($models | Where-Object { $_ -eq 'opencode/big-pickle' })
-                $models = $bigPickle + @($models | Where-Object { $_ -ne 'opencode/big-pickle' })
-                Write-Log "[$Stage] GO $($go.reason) cooldown until $($nextProbe.ToUniversalTime().ToString('o')); big-pickle fast-path로 시작" WARN
+        $filtered = @()
+        foreach ($m in $models) {
+            $mKey = "model:$m"
+            $mEntry = $health.providers.$mKey
+            if ($mEntry -and $mEntry.nextProbeAt) {
+                [datetime]$nextProbe = [datetime]::MinValue
+                if (-not [datetime]::TryParse([string]$mEntry.nextProbeAt, [ref]$nextProbe)) {
+                    Write-Log "provider health nextProbeAt is unreadable for $m; ignoring the corrupt cooldown entry" WARN
+                } elseif ($nextProbe.ToUniversalTime() -gt [datetime]::UtcNow) {
+                    Write-Log "[$Stage] preflight skip: $m (cooldown until $($nextProbe.ToUniversalTime().ToString('o')))" INFO
+                    continue
+                }
             }
+            $mCatalog = $null
+            if ($script:ProfileConfig.modelCatalog) { $mCatalog = $script:ProfileConfig.modelCatalog.$m }
+            if ($mCatalog) {
+                $principal = [string]$mCatalog.principal
+                $pKey = "principal:$principal"
+                $pEntry = $health.providers.$pKey
+                if ($pEntry -and $pEntry.nextProbeAt) {
+                    [datetime]$pProbe = [datetime]::MinValue
+                    if ([datetime]::TryParse([string]$pEntry.nextProbeAt, [ref]$pProbe) -and $pProbe.ToUniversalTime() -gt [datetime]::UtcNow) {
+                        Write-Log "[$Stage] preflight skip: $m (principal $principal cooldown until $($pProbe.ToUniversalTime().ToString('o')))" INFO
+                        continue
+                    }
+                }
+            }
+            $filtered += $m
+        }
+        if ($filtered.Count -eq 0) {
+            $blockedPrincipals = @()
+            foreach ($prop in @($health.providers.psobject.Properties | Where-Object { $_.Name -like 'principal:*' })) {
+                $pEntry = $health.providers.($prop.Name)
+                if ($pEntry.nextProbeAt) {
+                    [datetime]$pProbe = [datetime]::MinValue
+                    if ([datetime]::TryParse([string]$pEntry.nextProbeAt, [ref]$pProbe) -and $pProbe.ToUniversalTime() -gt [datetime]::UtcNow) {
+                        $blockedPrincipals += "$($prop.Name -replace 'principal:','') (until $($pProbe.ToUniversalTime().ToString('o')))"
+                    }
+                }
+            }
+            Write-Log "[$Stage] 모든 슬롯이 쿼터/health cooldown 중 — 모델을 띄우지 않고 즉시 실패. Blocked: $($blockedPrincipals -join '; ')" ERROR
+            $models = @()
+        } else {
+            $models = $filtered
+            Write-Log "[$Stage] preflight 결과: $($models.Count)개 슬롯 가용 ($($models -join ' → '))" INFO
         }
     }
 
@@ -1062,6 +1076,25 @@ function Resolve-ModelChain {
     # Preserve a one-slot chain for stages without ModelFallback. PowerShell unwraps a
     # one-item array on normal return, turning @($null) into $null for the caller.
     return ,$models
+}
+
+# CFG024: Resolve-ProfileChain이 반환한 프로필 이름 목록을 (Adapter, Model) 슬롯으로 해석한다.
+# -ImplementerFamilies가 주어지면(§Done When 4 — QA 폴백 후보에만 적용) 구현자와 family가 겹치는
+# 후보를 건너뛴다. 후보가 전부 걸러지면 빈 배열을 반환한다 — 자동 대체하지 않고 사람이 봐야 하는 실패다.
+function Resolve-StageProfileSlots {
+    param([string[]]$ProfileNames, [object]$Config, [string[]]$ImplementerFamilies = @(), [string]$Stage)
+    $slots = @()
+    foreach ($name in $ProfileNames) {
+        $p = $Config.profiles.$name
+        if ($null -eq $p) { Write-Log "[$Stage] 알 수 없는 프로필 건너뜀: $name" WARN; continue }
+        $family = [string]$p.family
+        if ($family -and $family -ne 'unknown' -and $ImplementerFamilies -contains $family) {
+            Write-Log "[$Stage] 후보 건너뜀: $name (family=$family, 구현자와 동일 — must 위반)" WARN
+            continue
+        }
+        $slots += [pscustomobject]@{ Name = $name; Adapter = [string]$p.adapter; Model = [string]$p.model }
+    }
+    return ,$slots
 }
 
 # CFG017: TaskId/단계별 사이클 상태 파일 — 재디스패치마다 단조 증가하는 durable cycle 번호를 보존한다.
@@ -1354,6 +1387,149 @@ function Classify-AttemptFailure {
     return (Get-SwitchableFailureClass -Tail $tail -LogBytes $logBytes -ElapsedSeconds $Attempt.ElapsedSeconds -TreeChanged $treeChanged -LogStartBytes $startBytes)
 }
 
+function Get-FailureClass {
+    param([string]$Outcome)
+    if ($Outcome -in @('quota', 'billing', 'authentication', 'pollution', 'approval_required', 'config')) {
+        return 'deterministic'
+    }
+    return 'transient'
+}
+
+function Get-FailureSignature {
+    param([string]$FailureClass, [string]$Adapter, [string]$Reason)
+    $cleanReason = if ($Reason) { $Reason } else { 'unknown' }
+    $cleanReason = $cleanReason -replace '\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', ''
+    $cleanReason = $cleanReason -replace '[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}', ''
+    $cleanReason = $cleanReason -replace '\b(?:PID|pid)\s*[:=]?\s*\d+\b', ''
+    $cleanReason = $cleanReason -replace '[A-Za-z]:\\[^\s"'']+', ''
+    $cleanReason = ($cleanReason -replace '\s+', ' ').Trim()
+    if ($cleanReason.Length -gt 60) { $cleanReason = $cleanReason.Substring(0, 60) }
+    $safeAdapter = if ($Adapter) { $Adapter } else { 'default' }
+    return "${FailureClass}:${safeAdapter}:${cleanReason}"
+}
+
+function Get-StageLedgerPath {
+    param([string]$Stage)
+    return (Resolve-RepoPath "$LogDir/$TaskId-$Stage-ledger.json")
+}
+
+function Read-StageLedger {
+    param([string]$Stage)
+    $path = Get-StageLedgerPath $Stage
+    if (-not (Test-Path -LiteralPath $path)) { return [pscustomobject]@{ schemaVersion = 1; attempts = [pscustomobject]@{} } }
+    try {
+        $json = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($null -eq $json.attempts) { $json | Add-Member -NotePropertyName attempts -NotePropertyValue ([pscustomobject]@{}) -Force }
+        return $json
+    } catch {
+        return [pscustomobject]@{ schemaVersion = 1; attempts = [pscustomobject]@{} }
+    }
+}
+
+function Write-StageLedger {
+    param([string]$Stage, [object]$Ledger)
+    $path = Get-StageLedgerPath $Stage
+    $parent = Split-Path -Parent $path
+    if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $body = $Ledger | ConvertTo-Json -Depth 6
+    [System.IO.File]::WriteAllText($path, $body, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Record-StageAttempt {
+    param([string]$Stage, [string]$Signature, [string]$FailureClass)
+    $ledger = Read-StageLedger -Stage $Stage
+    $prior = $ledger.attempts.$Signature
+    $count = if ($prior) { [int]$prior.count + 1 } else { 1 }
+    $entry = [pscustomobject]@{ count = $count; failureClass = $FailureClass; lastObservedAt = [datetime]::UtcNow.ToString('o') }
+    $ledger.attempts | Add-Member -NotePropertyName $Signature -NotePropertyValue $entry -Force
+    Write-StageLedger -Stage $Stage -Ledger $ledger
+
+    $maxAllowed = if ($FailureClass -eq 'deterministic') { 1 } else { 3 }
+    if ($count -ge $maxAllowed) {
+        Write-BlockedMarker -Stage $Stage -Reason "시도 한도 도달 (${Signature}: ${count}회 / 상한 ${maxAllowed}회)" -OwnerTaskId $TaskId -OwnerProcessId $PID
+        return @{ Blocked = $true; Count = $count; MaxAllowed = $maxAllowed }
+    }
+    return @{ Blocked = $false; Count = $count; MaxAllowed = $maxAllowed }
+}
+
+function Test-StageDispatchAllowed {
+    param([string]$Stage)
+    $blockedMarker = Get-BlockedMarkerPath $Stage
+    if (Test-Path -LiteralPath $blockedMarker) {
+        $markerText = Get-Content -LiteralPath $blockedMarker -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        return @{ Allowed = $false; Reason = "차단 마커 존재 ($markerText)" }
+    }
+    $ledger = Read-StageLedger -Stage $Stage
+    foreach ($prop in @($ledger.attempts.psobject.Properties)) {
+        $sig = $prop.Name
+        $entry = $prop.Value
+        $fClass = [string]$entry.failureClass
+        $cnt = [int]$entry.count
+        $max = if ($fClass -eq 'deterministic') { 1 } else { 3 }
+        if ($cnt -ge $max) {
+            Write-BlockedMarker -Stage $Stage -Reason "시도 한도 도달 (${sig}: ${cnt}회 / 상한 ${max}회)" -OwnerTaskId $TaskId -OwnerProcessId $PID
+            return @{ Allowed = $false; Reason = "원장 시도 한도 도달 (${sig}: ${cnt} / ${max})" }
+        }
+    }
+    return @{ Allowed = $true }
+}
+
+function Get-NormalizedTaskId {
+    param([string]$TaskId)
+    if ($null -eq $TaskId) { return '' }
+    return ($TaskId -replace '[^A-Za-z0-9]', '').ToUpperInvariant()
+}
+
+# CFG024: 프로토콜 오염 감지 — 구현(②) 단계 전후 스냅숏을 비교해 신규 패킷 생성 및 타 작업 라우터 행 변조를 기계적으로 차단한다.
+# 특정 모델을 겨냥한 것이 아니며 파이프라인 전체의 fail-closed 구조적 안전장치다.
+function Get-PacketFileSnapshot {
+    $packetDir = Resolve-RepoPath '.agents/briefs/packets'
+    if (-not (Test-Path -LiteralPath $packetDir)) { return @() }
+    return @(Get-ChildItem -LiteralPath $packetDir -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+}
+
+function Get-RouterTableSnapshot {
+    $routerPath = Resolve-RepoPath '.agents/briefs/handoff-log.md'
+    if (-not (Test-Path -LiteralPath $routerPath)) { return @{} }
+    $rows = @{}
+    $lines = Get-Content -LiteralPath $routerPath -Encoding UTF8 -ErrorAction SilentlyContinue
+    foreach ($line in $lines) {
+        if ($line -match '^\s*\|\s*([^|]+)\s*\|') {
+            $tId = $Matches[1].Trim()
+            if ($tId -and $tId -notmatch '^-+$' -and $tId -ne '작업 ID' -and $tId -ne 'Task ID') {
+                $rows[$tId] = $line.Trim()
+            }
+        }
+    }
+    return $rows
+}
+
+function Test-ProtocolPollution {
+    param(
+        [string]$Stage,
+        [string[]]$PacketsBefore,
+        [hashtable]$RouterBefore
+    )
+    if ($Stage -ne 'impl') { return @{ Polluted = $false } }
+    $packetsAfter = Get-PacketFileSnapshot
+    $newPackets = @($packetsAfter | Where-Object { $_ -notin $PacketsBefore })
+    if ($newPackets.Count -gt 0) {
+        $msg = "신규 패킷 파일 생성 감지 ($($newPackets -join ', ')) — 구현 단계 권한 초과"
+        Write-Log "❌ [$Stage] $msg" ERROR
+        return @{ Polluted = $true; Reason = $msg }
+    }
+    $routerAfter = Get-RouterTableSnapshot
+    foreach ($k in $RouterBefore.Keys) {
+        if ($k -eq $TaskId -or $k -eq (Get-NormalizedTaskId $TaskId)) { continue }
+        if ($routerAfter.ContainsKey($k) -and $routerAfter[$k] -ne $RouterBefore[$k]) {
+            $msg = "타 작업($k) 라우터 행 임의 변경 감지 — 구현 단계 권한 초과"
+            Write-Log "❌ [$Stage] $msg" ERROR
+            return @{ Polluted = $true; Reason = $msg }
+        }
+    }
+    return @{ Polluted = $false }
+}
+
 function Invoke-VerifyGate {
     param([string]$Stage)
 
@@ -1537,6 +1713,15 @@ function Dispatch-Stage {
     param([string]$Stage, [string]$PromptOverride)
     $config = $StageConfig[$Stage]
     $logRel = $config.LogFile
+
+    # CFG024: 디스패치 시작 전 원장/차단 마커 검사 — 이미 상한에 도달한 경우 모델을 띄우기 전에 즉시 거부한다.
+    $allowed = Test-StageDispatchAllowed -Stage $Stage
+    if (-not $allowed.Allowed) {
+        $failureReason = "디스패치 거부: $($allowed.Reason)"
+        Write-Log "❌ [$Stage] $failureReason" ERROR
+        return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $null }
+    }
+
     $models = Resolve-ModelChain -Config $config -Stage $Stage
     $qaDispatchedAt = $null
 
@@ -1600,6 +1785,10 @@ function Dispatch-Stage {
     if ($config.Adapter -eq 'antigravity' -and $preflight.Executable) { $config.Executable = $preflight.Executable }
     if ($preflight.Diagnostics.Count -gt 0) { Write-Log "[$Stage] preflight: $($preflight.Diagnostics -join ' | ')" INFO }
 
+    # CFG024: 구현(②) 단계 전 스냅숏 확보 (프로토콜 오염 감지용)
+    $packetsBefore = if ($Stage -eq 'impl') { Get-PacketFileSnapshot } else { @() }
+    $routerBefore = if ($Stage -eq 'impl') { Get-RouterTableSnapshot } else { @{} }
+
     $before = Get-TreeState
     # CFG018: provider print timeout can be resumed, but only inside one logical run.
     # The existing hard-timeout absolute maximum remains the total budget across segments.
@@ -1613,8 +1802,22 @@ function Dispatch-Stage {
     $attemptFailures = @()
     $modelIndex = 0
     $attemptNumber = 0
+    $lastDeterministicSig = $null
+    $consecutiveDeterministicCount = 0
+
     while ($modelIndex -lt $models.Count) {
         $model = $models[$modelIndex]
+        # CFG024: qa·integration 폴백 체인은 슬롯마다 어댑터가 달라질 수 있다(예: gemini-qa는
+        # antigravity → opencode). AdapterChain이 있으면 이번 슬롯의 어댑터로 $config를 갱신하고,
+        # antigravity면 ProjectId·Executable도 그 슬롯 기준으로 다시 확인한다.
+        if ($config.AdapterChain -and $modelIndex -lt $config.AdapterChain.Count) {
+            $config.Adapter = $config.AdapterChain[$modelIndex]
+            if ($config.Adapter -eq 'antigravity') {
+                $config.ProjectId = Resolve-AntigravityProjectId -RepositoryRoot $RepoRoot
+                $slotPreflight = Test-AntigravityPreflight -Stage $Stage
+                if ($slotPreflight.Executable) { $config.Executable = $slotPreflight.Executable }
+            }
+        }
         $toolCmd = Build-ToolCommand -Config $config -Stage $Stage -PromptOverride $PromptOverride -Model $model -BypassToolPermissions:$BypassToolPermissions
         $modelTag = if ($model) { " (모델 $($modelIndex + 1)/$($models.Count): $model)" } else { "" }
         Write-Log "작업 $TaskId [$Stage] 디스패치$modelTag" INFO
@@ -1630,6 +1833,16 @@ function Dispatch-Stage {
             $exit = $attemptResult.ExitCode
             $outcome = Classify-AttemptFailure -Attempt $attemptResult -Before $before -AttemptLog $attemptLog
             if ($Stage -eq 'impl' -and (Get-Command Update-ProviderHealth -ErrorAction SilentlyContinue)) { Update-ProviderHealth -Model $model -Outcome $outcome -AttemptLog $attemptLog }
+
+            if ($outcome -eq 'ok') {
+                # CFG024: 정상 종료 직전 프로토콜 오염 감지
+                $pollutionResult = Test-ProtocolPollution -Stage $Stage -PacketsBefore $packetsBefore -RouterBefore $routerBefore
+                if ($pollutionResult.Polluted) {
+                    $outcome = 'pollution'
+                    Write-Log "❌ [$Stage] 프로토콜 오염 감지: $($pollutionResult.Reason) → 실패 처리" ERROR
+                }
+            }
+
             if ($outcome -eq 'approval_required') {
                 # CFG017: headless 권한 요청은 재시도 불가능한 종결 상태다 — 모델 체인 전환·자동 재시도를
                 # 절대 하지 않는다. 정확 target을 추출해 승인 대기 기록을 남기고 즉시 돌아간다.
@@ -1642,6 +1855,7 @@ function Dispatch-Stage {
                 Write-Log "승인 기록: $approvalPath" INFO
                 Write-Log "동작: 대상 확인 후 headless 프로세스 밖에서 승인을 마치고, 명시적으로 새 사이클의 fresh 디스패치를 시작하세요." WARN
                 Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'approval_required' -ProcessId $PID -EvidencePaths @($logRel) -Reason $targetLabel -Model $model
+                $null = Record-StageAttempt -Stage $Stage -Signature "deterministic:$($config.Adapter):approval_required" -FailureClass 'deterministic'
                 return @{ Success = $false; Outcome = 'approval_required'; ApprovalPath = $approvalPath; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
             }
             if ($outcome -eq 'provider_timeout') {
@@ -1664,7 +1878,10 @@ function Dispatch-Stage {
                 }
                 Write-Log "⛔ [$Stage] provider print timeout 재개 불가: $continuationReason (cycle $($cycle.Token), 기록: $continuationPath)" ERROR
             }
-            if ($outcome -eq 'hang' -and $config.Retry -and $attempt -eq 1) {
+
+            # CFG024: 실패 부류(deterministic vs transient)에 따라 재시도 게이트
+            $fClass = Get-FailureClass -Outcome $outcome
+            if ($outcome -eq 'hang' -and $config.Retry -and $attempt -eq 1 -and $fClass -ne 'deterministic') {
                 # hang-detect-agent Iron Law: 재시도는 최대 1회. 두 번 멈추면 작업 자체가 깨진 것이다.
                 $attempt = 2
                 Write-Log "⚠️ HANG [1/2] $Stage — 동일 명령으로 1회 재디스패치" WARN
@@ -1685,15 +1902,52 @@ function Dispatch-Stage {
         elseif ($outcome -eq 'authentication') { $reason = '인증 실패' }
         elseif ($outcome -eq 'unavailable') { $reason = '모델·프로바이더 사용 불가' }
         elseif ($outcome -eq 'noop') { $reason = '무산출 조기 실패' }
+        elseif ($outcome -eq 'pollution') { $reason = '프로토콜 오염 감지' }
         else { $reason = '알 수 없는 실행 실패' }
         $attemptFailures += "${model}: $reason"
-        # provider timeout은 새로운 모델/새 대화로 우회하지 않는다. 위의 동일 대화
-        # continuation만 허용하고, 그 조건을 만족하지 못하면 현재 논리 실행을 끝낸다.
-        # 원인이 분류되지 않은 Exit 1은 폴백 근거가 아니다. 다음 모델을 태우지 않고
-        # 현재 cycle을 끝내야 반쯤 수정된 작업트리·토큰 낭비를 막을 수 있다.
-        if ($outcome -in @('provider_timeout', 'unknown')) { $modelIndex = $models.Count; continue }
+
+        $fClass = Get-FailureClass -Outcome $outcome
+        $sig = Get-FailureSignature -FailureClass $fClass -Adapter $config.Adapter -Reason $reason
+        $rec = Record-StageAttempt -Stage $Stage -Signature $sig -FailureClass $fClass
+
+        # CFG024 §6-4: 동일 결정적 실패 서명 연속 2회 발생 시 전역 실패 판정 (체인 중단)
+        if ($fClass -eq 'deterministic') {
+            if ($sig -eq $lastDeterministicSig) {
+                $consecutiveDeterministicCount++
+                if ($consecutiveDeterministicCount -ge 2) {
+                    Write-Log "⚠️ [$Stage] 동일 결정적 실패 서명($sig) 연속 2회 발생 — 전역 실패로 판정하고 체인 즉시 중단" WARN
+                    $modelIndex = $models.Count
+                    continue
+                }
+            } else {
+                $lastDeterministicSig = $sig
+                $consecutiveDeterministicCount = 1
+            }
+        }
+
+        # provider timeout / pollution / unknown 은 모델 폴백 없이 현재 cycle 종료
+        if ($outcome -in @('provider_timeout', 'unknown', 'pollution')) { $modelIndex = $models.Count; continue }
+
         $modelIndex++
         if ($modelIndex -lt $models.Count) {
+            # CFG024 §7-1: 슬롯 전진 전 이전 자식 프로세스 트리가 죽었음을 확인
+            if ($script:ActiveChildProcessId) {
+                try {
+                    $orphanProc = Get-Process -Id $script:ActiveChildProcessId -ErrorAction SilentlyContinue
+                    if ($orphanProc -and -not $orphanProc.HasExited) {
+                        Write-Log "⚠️ [$Stage] 이전 슬롯 프로세스(PID $($script:ActiveChildProcessId)) 정리 및 종료 확인" INFO
+                        Stop-ProcessTree -ProcessId $script:ActiveChildProcessId
+                        Start-Sleep -Milliseconds 500
+                        $checkProc = Get-Process -Id $script:ActiveChildProcessId -ErrorAction SilentlyContinue
+                        if ($checkProc -and -not $checkProc.HasExited) {
+                            Write-Log "❌ [$Stage] 프로세스 트리(PID $($script:ActiveChildProcessId)) 종료 확인 실패 — 좀비 방지를 위해 전진하지 않고 중단" ERROR
+                            $modelIndex = $models.Count
+                            continue
+                        }
+                    }
+                } catch { }
+                $script:ActiveChildProcessId = $null
+            }
             Write-Log "⚠️ [$Stage] $model 에서 $reason — 다음 모델로 전환: $($models[$modelIndex])" WARN
             Write-KilledLeftover -Before $before -Stage $Stage -Context "$reason — 모델 전환"
         }
@@ -1710,6 +1964,7 @@ function Dispatch-Stage {
         authentication = @{ Reason = '인증 실패'; KilledContext = $null; ShowLogTail = $true }
         unavailable = @{ Reason = '모델·프로바이더 사용 불가'; KilledContext = $null; ShowLogTail = $false }
         noop = @{ Reason = '무산출 조기 실패'; KilledContext = $null; ShowLogTail = $false }
+        pollution = @{ Reason = 'impl 폴루션 감지'; KilledContext = $null; ShowLogTail = $true }
     }
     if ($failureOutcomes.ContainsKey($outcome)) {
         $failure = $failureOutcomes[$outcome]
@@ -1797,16 +2052,23 @@ function Update-ProviderHealth {
     param([string]$Model, [string]$Outcome, [string]$AttemptLog)
     if (-not $script:ProviderHealthPath -or $Model -notmatch '^([^/]+)/') { return }
     $provider = $Matches[1]
-    if ($provider -ne 'opencode-go') { return }
     $state = Read-ProviderHealth -Path $script:ProviderHealthPath
     if ($null -eq $state.providers) { $state | Add-Member -NotePropertyName providers -NotePropertyValue ([pscustomobject]@{}) -Force }
     if ($Outcome -eq 'ok') {
-        $state.providers.psobject.Properties.Remove($provider)
+        $modelKey = "model:$Model"
+        $state.providers.psobject.Properties.Remove($modelKey)
+        $principal = if ($script:ProfileConfig.modelCatalog -and $script:ProfileConfig.modelCatalog.$Model) { [string]$script:ProfileConfig.modelCatalog.$Model.principal } else { '' }
+        if ($principal) {
+            $principalKey = "principal:$principal"
+            $principalModels = @($state.providers.psobject.Properties | Where-Object { $_.Name -like "model:*" -and [string]$_.Value.principal -eq $principal })
+            if ($principalModels.Count -eq 0) { $state.providers.psobject.Properties.Remove($principalKey) }
+        }
         Write-ProviderHealth -Path $script:ProviderHealthPath -Value $state
         return
     }
     if ($Outcome -notin @('quota', 'billing', 'unavailable')) { return }
-    $prior = $state.providers.$provider
+    $modelKey = "model:$Model"
+    $prior = $state.providers.$modelKey
     $count = if ($prior) { [int]$prior.consecutiveFailures + 1 } else { 1 }
     $hours = if ($count -gt 1) { [int]$script:ProfileConfig.providerCooldown.repeatedQuotaHours } elseif ($Outcome -eq 'unavailable') { 1 } else { [int]$script:ProfileConfig.providerCooldown.quotaDefaultHours }
     $nextProbe = [datetime]::UtcNow.AddHours($hours)
@@ -1818,7 +2080,27 @@ function Update-ProviderHealth {
         }
     }
     $entry = [pscustomobject]@{ reason = $Outcome; consecutiveFailures = $count; observedAt = [datetime]::UtcNow.ToString('o'); nextProbeAt = $nextProbe.ToString('o') }
-    $state.providers | Add-Member -NotePropertyName $provider -NotePropertyValue $entry -Force
+    $state.providers | Add-Member -NotePropertyName $modelKey -NotePropertyValue $entry -Force
+    $principal = if ($script:ProfileConfig.modelCatalog -and $script:ProfileConfig.modelCatalog.$Model) { [string]$script:ProfileConfig.modelCatalog.$Model.principal } else { '' }
+    if ($principal) {
+        $principalKey = "principal:$principal"
+        $principalModels = @($state.providers.psobject.Properties | Where-Object { $_.Name -like "model:*" -and [string]($state.providers.($_.Name)).reason -in @('quota', 'billing', 'unavailable') })
+        if ($principalModels.Count -ge 2) {
+            $longestHours = $hours
+            foreach ($pm in $principalModels) {
+                $pmEntry = $state.providers.($pm.Name)
+                if ($pmEntry.nextProbeAt) {
+                    try {
+                        $pmProbe = ([datetime]$pmEntry.nextProbeAt).ToUniversalTime()
+                        $diff = ($pmProbe - [datetime]::UtcNow).TotalHours
+                        if ($diff -gt $longestHours) { $longestHours = [math]::Ceiling($diff) }
+                    } catch { }
+                }
+            }
+            $principalEntry = [pscustomobject]@{ reason = $Outcome; consecutiveFailures = $count; observedAt = [datetime]::UtcNow.ToString('o'); nextProbeAt = [datetime]::UtcNow.AddHours($longestHours).ToString('o') }
+            $state.providers | Add-Member -NotePropertyName $principalKey -NotePropertyValue $principalEntry -Force
+        }
+    }
     Write-ProviderHealth -Path $script:ProviderHealthPath -Value $state
 }
 
@@ -1970,11 +2252,39 @@ if ($checkPipelinePacket) {
 }
 $script:PipelineRouting = Resolve-PipelineRouting -Config $script:ProfileConfig -PlanningProfile $planningProfile -PlanningAdapter $planningAdapter
 $StageConfig.impl.ModelFallback = @($script:PipelineRouting.ImplementationModels)
-$StageConfig.qa.Adapter = $script:PipelineRouting.QaProfile.Adapter
-$StageConfig.qa.Model = $script:PipelineRouting.QaProfile.Model
+
+# CFG024 §Done When 4: QA·Integration에 실제로 동작하는 폴백 체인을 배선한다.
+# ModelChain/AdapterChain이 Resolve-ModelChain에서 소비되며, Dispatch-Stage 루프가 슬롯마다
+# AdapterChain을 따라 $config.Adapter를 갱신한다(위 Dispatch-Stage 본문 참조).
+$implFamilies = @($script:PipelineRouting.ImplementationModels | ForEach-Object {
+    if ($script:ProfileConfig.modelCatalog.$_) { [string]$script:ProfileConfig.modelCatalog.$_.family }
+} | Where-Object { $_ -and $_ -ne 'unknown' } | Select-Object -Unique)
+
+$qaChainNames = Resolve-ProfileChain -ProfileName $script:PipelineRouting.QaProfile.Name -Config $script:ProfileConfig
+# QA 폴백 후보도 must 불변조건(구현자와 family 겹치면 안 됨)을 통과해야 한다 — 겹치는 후보는 건너뛴다.
+$qaSlots = Resolve-StageProfileSlots -ProfileNames $qaChainNames -Config $script:ProfileConfig -ImplementerFamilies $implFamilies -Stage 'qa'
+if ($qaSlots.Count -eq 0) {
+    $StageConfig.qa.ModelChain = @()
+    Write-Log "❌ [qa] 구현자와 family가 겹치지 않는 QA 후보가 없음 — 사람 개입 필요 (구현 family: $($implFamilies -join ', '))" ERROR
+} else {
+    $StageConfig.qa.ModelChain = @($qaSlots | ForEach-Object { $_.Model })
+    $StageConfig.qa.AdapterChain = @($qaSlots | ForEach-Object { $_.Adapter })
+    $StageConfig.qa.Adapter = $qaSlots[0].Adapter
+    $StageConfig.qa.Model = $qaSlots[0].Model
+}
 if ($StageConfig.qa.Adapter -eq 'antigravity') { $StageConfig.qa.ProjectId = Resolve-AntigravityProjectId -RepositoryRoot $RepoRoot }
-$StageConfig.integration.Adapter = $script:PipelineRouting.IntegrationProfile.Adapter
-$StageConfig.integration.Model = $script:PipelineRouting.IntegrationProfile.Model
+
+$integrationChainNames = Resolve-ProfileChain -ProfileName $script:PipelineRouting.IntegrationProfile.Name -Config $script:ProfileConfig
+$integrationSlots = Resolve-StageProfileSlots -ProfileNames $integrationChainNames -Config $script:ProfileConfig -Stage 'integration'
+if ($integrationSlots.Count -eq 0) {
+    $StageConfig.integration.ModelChain = @()
+    Write-Log "❌ [integration] Integration 후보를 하나도 해석하지 못함 — 사람 개입 필요" ERROR
+} else {
+    $StageConfig.integration.ModelChain = @($integrationSlots | ForEach-Object { $_.Model })
+    $StageConfig.integration.AdapterChain = @($integrationSlots | ForEach-Object { $_.Adapter })
+    $StageConfig.integration.Adapter = $integrationSlots[0].Adapter
+    $StageConfig.integration.Model = $integrationSlots[0].Model
+}
 $StageConfig.integration.ReportFile = "$TaskLogPrefix-integration-last.md"
 $stateRoot = if ($env:USERPROFILE) { Join-Path $env:USERPROFILE '.agents\harness\state' } else { Join-Path ([IO.Path]::GetTempPath()) 'agents-harness-state' }
 $script:ProviderHealthPath = Join-Path $stateRoot 'provider-health.json'
