@@ -1323,6 +1323,40 @@ function Get-AntigravityConversationId {
     return $ids[0]
 }
 
+# CFG029: opencode 로그에서 세션 ID 추출 — JSON 형식의 sessionID 필드에서 파싱
+function Get-OpencodeSessionId {
+    param([string]$AttemptLog)
+    $logAbs = Resolve-RepoPath $AttemptLog
+    if (-not (Test-Path -LiteralPath $logAbs)) { return $null }
+    $sessionIds = @()
+    foreach ($line in @(Get-Content -LiteralPath $logAbs -ErrorAction SilentlyContinue)) {
+        try { $event = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        $sid = [string]$event.sessionID
+        if ($sid -and $sid -match '^ses_[A-Za-z0-9]+$') {
+            $sessionIds += $sid
+        }
+    }
+    $sessionIds = @($sessionIds | Select-Object -Unique)
+    if ($sessionIds.Count -ne 1) { return $null }
+    return $sessionIds[0]
+}
+
+# CFG029: codex 로그에서 세션 ID 추출 — "session id:" 라인에서 파싱
+function Get-CodexSessionId {
+    param([string]$AttemptLog)
+    $logAbs = Resolve-RepoPath $AttemptLog
+    if (-not (Test-Path -LiteralPath $logAbs)) { return $null }
+    $sessionIds = @()
+    foreach ($line in @(Get-Content -LiteralPath $logAbs -ErrorAction SilentlyContinue)) {
+        if ($line -match 'session id:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})') {
+            $sessionIds += $Matches[1].ToLowerInvariant()
+        }
+    }
+    $sessionIds = @($sessionIds | Select-Object -Unique)
+    if ($sessionIds.Count -ne 1) { return $null }
+    return $sessionIds[0]
+}
+
 function Test-AntigravityPrintTimeout {
     param([string]$AttemptLog)
     $logAbs = Resolve-RepoPath $AttemptLog
@@ -1376,6 +1410,22 @@ function Build-AntigravityContinuationCommand {
     $agyCommand = if ($Config.Executable) { ConvertTo-BashSingleQuoted ([string]$Config.Executable).Replace('\\','/') } else { 'agy' }
     $prompt = ConvertTo-BashSingleQuoted 'Continue the same assigned stage from the existing conversation. Do not restart discovery, do not create a fresh dispatch cycle, and preserve all existing safety restrictions.'
     return "$agyCommand --project $($Config.ProjectId) --model $Model --mode accept-edits --output-format stream-json --print-timeout 25m --conversation $ConversationId --print $prompt"
+}
+
+# CFG029: opencode continuation 명령 생성 — 세션 ID로 기존 세션 이어받기
+function Build-OpencodeContinuationCommand {
+    param([hashtable]$Config, [string]$Model, [string]$SessionId)
+    if (-not $SessionId) { throw 'Opencode continuation requires session ID.' }
+    $prompt = ConvertTo-BashSingleQuoted 'Continue the same assigned stage from the existing session. Do not restart discovery, do not create a fresh dispatch cycle, and preserve all existing safety restrictions.'
+    return "opencode run --pure --auto -m $Model -s $SessionId $prompt"
+}
+
+# CFG029: codex continuation 명령 생성 — resume 서브커맨드로 기존 세션 이어받기
+function Build-CodexContinuationCommand {
+    param([hashtable]$Config, [string]$Model, [string]$SessionId)
+    if (-not $SessionId) { throw 'Codex continuation requires session ID.' }
+    $prompt = ConvertTo-BashSingleQuoted 'Continue the same assigned stage from the existing session. Do not restart discovery, do not create a fresh dispatch cycle, and preserve all existing safety restrictions.'
+    return "codex exec resume $SessionId -m $Model --dangerously-bypass-approvals-and-sandbox -o $(ConvertTo-BashSingleQuoted $Config.ReportFile) $prompt"
 }
 
 function Invoke-ModelAttempt {
@@ -2039,21 +2089,63 @@ function Dispatch-Stage {
                 return @{ Success = $false; Outcome = 'approval_required'; ApprovalPath = $approvalPath; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
             }
             if ($outcome -eq 'provider_timeout') {
-                $conversationId = Get-AntigravityConversationId -AttemptLog $attemptLog
-                $activityWindowMinutes = [Math]::Max(1, [Math]::Round($logicalHardLimit / 3.0, 2))
-                $active = Test-AntigravityContinuationActivity -AttemptLog $attemptLog -LogStartBytes $attemptResult.LogStartBytes -RecentWindowMinutes $activityWindowMinutes
+                # CFG029: opencode/codex 어댑터에도 continuation 지원 확장
+                $conversationId = $null
+                $sessionId = $null
+                $active = $false
                 $withinBudget = (Get-Date) -lt $logicalAbsoluteDeadline
-                $canContinue = $config.Adapter -eq 'antigravity' -and $active -and $conversationId -and $continuationCount -lt 2 -and $withinBudget
-                if (-not $conversationId) { $continuationReason = 'exact conversation ID missing or ambiguous' }
-                elseif (-not $active) { $continuationReason = 'no healthy stream-json activity' }
-                elseif (-not $withinBudget) { $continuationReason = 'logical absolute deadline reached' }
-                elseif ($continuationCount -ge 2) { $continuationReason = 'automatic continuation limit reached' }
-                else { $continuationReason = 'healthy provider timeout; resume same conversation' }
-                $continuationPath = Write-ContinuationRecord -Stage $Stage -CycleNumber $cycle.Id -AttemptNumber $attemptNumber -AttemptLog $attemptLog -ConversationId $conversationId -Active $active -Resumed $canContinue -Reason $continuationReason
+                $activityWindowMinutes = [Math]::Max(1, [Math]::Round($logicalHardLimit / 3.0, 2))
+
+                if ($config.Adapter -eq 'antigravity') {
+                    $conversationId = Get-AntigravityConversationId -AttemptLog $attemptLog
+                    $active = Test-AntigravityContinuationActivity -AttemptLog $attemptLog -LogStartBytes $attemptResult.LogStartBytes -RecentWindowMinutes $activityWindowMinutes
+                } elseif ($config.Adapter -eq 'opencode') {
+                    $sessionId = Get-OpencodeSessionId -AttemptLog $attemptLog
+                    $active = Test-AntigravityContinuationActivity -AttemptLog $attemptLog -LogStartBytes $attemptResult.LogStartBytes -RecentWindowMinutes $activityWindowMinutes
+                } elseif ($config.Adapter -eq 'codex') {
+                    $sessionId = Get-CodexSessionId -AttemptLog $attemptLog
+                    $active = Test-AntigravityContinuationActivity -AttemptLog $attemptLog -LogStartBytes $attemptResult.LogStartBytes -RecentWindowMinutes $activityWindowMinutes
+                }
+
+                $canContinue = $false
+                $continuationReason = ''
+                if ($config.Adapter -eq 'antigravity') {
+                    $canContinue = $active -and $conversationId -and $continuationCount -lt 2 -and $withinBudget
+                    if (-not $conversationId) { $continuationReason = 'exact conversation ID missing or ambiguous' }
+                    elseif (-not $active) { $continuationReason = 'no healthy stream-json activity' }
+                    elseif (-not $withinBudget) { $continuationReason = 'logical absolute deadline reached' }
+                    elseif ($continuationCount -ge 2) { $continuationReason = 'automatic continuation limit reached' }
+                    else { $continuationReason = 'healthy provider timeout; resume same conversation' }
+                } elseif ($config.Adapter -eq 'opencode') {
+                    $canContinue = $active -and $sessionId -and $continuationCount -lt 2 -and $withinBudget
+                    if (-not $sessionId) { $continuationReason = 'opencode session ID missing or ambiguous' }
+                    elseif (-not $active) { $continuationReason = 'no healthy log activity' }
+                    elseif (-not $withinBudget) { $continuationReason = 'logical absolute deadline reached' }
+                    elseif ($continuationCount -ge 2) { $continuationReason = 'automatic continuation limit reached' }
+                    else { $continuationReason = 'healthy provider timeout; resume same session' }
+                } elseif ($config.Adapter -eq 'codex') {
+                    $canContinue = $active -and $sessionId -and $continuationCount -lt 2 -and $withinBudget
+                    if (-not $sessionId) { $continuationReason = 'codex session ID missing or ambiguous' }
+                    elseif (-not $active) { $continuationReason = 'no healthy log activity' }
+                    elseif (-not $withinBudget) { $continuationReason = 'logical absolute deadline reached' }
+                    elseif ($continuationCount -ge 2) { $continuationReason = 'automatic continuation limit reached' }
+                    else { $continuationReason = 'healthy provider timeout; resume same session' }
+                }
+
+                # CFG029 Integration 수정: PowerShell -or는 불리언 $true/$false를 반환하므로 문자열
+                # 세션 ID가 그대로 전달되지 않고 "True"/"False"로 뭉개진다. 실제 값을 보존하려면 값 자체를 골라야 한다.
+                $recordConversationId = if ($conversationId) { $conversationId } elseif ($sessionId) { $sessionId } else { $null }
+                $continuationPath = Write-ContinuationRecord -Stage $Stage -CycleNumber $cycle.Id -AttemptNumber $attemptNumber -AttemptLog $attemptLog -ConversationId $recordConversationId -Active $active -Resumed $canContinue -Reason $continuationReason
                 if ($canContinue) {
                     $continuationCount++
-                    $toolCmd = Build-AntigravityContinuationCommand -Config $config -Model $model -ConversationId $conversationId
-                    Write-Log "⏳ [$Stage] provider print timeout 뒤 건강한 동일 대화 자동 재개 $continuationCount/2 (cycle $($cycle.Token), 기록: $continuationPath)" WARN
+                    if ($config.Adapter -eq 'antigravity') {
+                        $toolCmd = Build-AntigravityContinuationCommand -Config $config -Model $model -ConversationId $conversationId
+                    } elseif ($config.Adapter -eq 'opencode') {
+                        $toolCmd = Build-OpencodeContinuationCommand -Config $config -Model $model -SessionId $sessionId
+                    } elseif ($config.Adapter -eq 'codex') {
+                        $toolCmd = Build-CodexContinuationCommand -Config $config -Model $model -SessionId $sessionId
+                    }
+                    Write-Log "⏳ [$Stage] provider print timeout 뒤 건강한 동일 세션 자동 재개 $continuationCount/2 (cycle $($cycle.Token), 기록: $continuationPath)" WARN
                     continue
                 }
                 Write-Log "⛔ [$Stage] provider print timeout 재개 불가: $continuationReason (cycle $($cycle.Token), 기록: $continuationPath)" ERROR
@@ -2064,8 +2156,36 @@ function Dispatch-Stage {
             if ($outcome -eq 'hang' -and $config.Retry -and $attempt -eq 1 -and $fClass -ne 'deterministic') {
                 # hang-detect-agent Iron Law: 재시도는 최대 1회. 두 번 멈추면 작업 자체가 깨진 것이다.
                 $attempt = 2
-                Write-Log "⚠️ HANG [1/2] $Stage — 동일 명령으로 1회 재디스패치" WARN
                 Write-KilledLeftover -Before $before -Stage $Stage -Context "1차 시도 강제 종료"
+
+                # CFG029 Integration 수정: opencode/codex는 'provider_timeout'을 절대 만들어내지 못한다
+                # (Classify-AttemptFailure의 그 분기는 antigravity 전용 — L1458 참조). 이 두 어댑터가
+                # 실제로 거치는 유일한 동일-모델 재시도는 이 hang 재시도뿐이므로, continuation 배선은
+                # 여기 걸어야 실제로 실행된다. 강제 종료 직전 로그에 세션 ID가 남아 있고 최근까지 건강한
+                # 활동이 있었다면 처음부터 다시 읽히지 않고 그 세션을 이어받는다. 못 찾으면 기존과 동일하게
+                # 콜드 재시작으로 안전 폴백한다(스테이지를 실패시키지 않는다).
+                $hangSessionId = $null
+                $hangActive = $false
+                if ($config.Adapter -eq 'opencode') {
+                    $hangSessionId = Get-OpencodeSessionId -AttemptLog $attemptLog
+                } elseif ($config.Adapter -eq 'codex') {
+                    $hangSessionId = Get-CodexSessionId -AttemptLog $attemptLog
+                }
+                if ($hangSessionId) {
+                    $hangActivityWindowMinutes = [Math]::Max(1, [Math]::Round($logicalHardLimit / 3.0, 2))
+                    $hangActive = Test-AntigravityContinuationActivity -AttemptLog $attemptLog -LogStartBytes $attemptResult.LogStartBytes -RecentWindowMinutes $hangActivityWindowMinutes
+                }
+                if ($hangSessionId -and $hangActive) {
+                    $continuationPath = Write-ContinuationRecord -Stage $Stage -CycleNumber $cycle.Id -AttemptNumber $attemptNumber -AttemptLog $attemptLog -ConversationId $hangSessionId -Active $hangActive -Resumed $true -Reason 'hang retry; resume same session'
+                    if ($config.Adapter -eq 'opencode') {
+                        $toolCmd = Build-OpencodeContinuationCommand -Config $config -Model $model -SessionId $hangSessionId
+                    } else {
+                        $toolCmd = Build-CodexContinuationCommand -Config $config -Model $model -SessionId $hangSessionId
+                    }
+                    Write-Log "⚠️ HANG [1/2] $Stage — 강제 종료 전 세션($hangSessionId) 이어받아 1회 재디스패치 (기록: $continuationPath)" WARN
+                } else {
+                    Write-Log "⚠️ HANG [1/2] $Stage — 동일 명령으로 1회 재디스패치" WARN
+                }
                 Write-Log "⚠️ 재시도는 위 상태를 정리하지 않고 그대로 이어서 실행합니다." WARN
                 continue
             }

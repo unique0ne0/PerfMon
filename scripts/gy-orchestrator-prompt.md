@@ -4,6 +4,11 @@ Gemini 3.7 Flash + Antigravity CLI로 파이프라인 전체를 직접 모니터
 ## 현재 작업 컨텍스트
 {{CONTEXT}}
 
+`packetPath`가 가리키는 패킷 파일을 먼저 직접 읽으세요 — Amendments·Pipeline Status·Mission·Done When이
+전문 그대로 들어 있습니다(위 컨텍스트에는 경로만 있고 본문은 없습니다). `logsDir`와 `{{TASK_ID}}`로
+`{{TASK_ID}}-chain-summary.json`·`{{TASK_ID}}-orchestration.log`·`{{TASK_ID}}-qa-verdict.json` 등
+결과 파일 경로를 직접 조합해 필요할 때 읽으세요.
+
 ## 파이프라인 흐름
 
 1. **파이프라인 실행**: 아래 명령어로 파이프라인을 실행하세요:

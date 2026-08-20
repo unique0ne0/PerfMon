@@ -167,34 +167,7 @@ function Invoke-ApprovedAutopublish {
 function Build-CoordinatorContext {
     param([string]$PacketPath, [string]$TaskId, [string]$LogsDir)
 
-    # Read packet content
-    $packetContent = Get-Content -LiteralPath $PacketPath -Raw -Encoding UTF8
-
-    # Read stage-state if exists
-    $stageStatePath = Join-Path $LogsDir "$TaskId-stage-state.json"
-    $stageState = if (Test-Path $stageStatePath) {
-        Get-Content -LiteralPath $stageStatePath -Raw -Encoding UTF8
-    } else { $null }
-
-    # Read chain-summary if exists
-    $chainSummaryPath = Join-Path $LogsDir "$TaskId-chain-summary.json"
-    $chainSummary = if (Test-Path $chainSummaryPath) {
-        Get-Content -LiteralPath $chainSummaryPath -Raw -Encoding UTF8
-    } else { $null }
-
-    # Read qa-verdict if exists
-    $qaVerdictPath = Join-Path $LogsDir "$TaskId-qa-verdict.json"
-    $qaVerdict = if (Test-Path $qaVerdictPath) {
-        Get-Content -LiteralPath $qaVerdictPath -Raw -Encoding UTF8
-    } else { $null }
-
-    # Read last 100 lines of orchestration log
-    $orchLogPath = Join-Path $LogsDir "$TaskId-orchestration.log"
-    $orchLog = if (Test-Path $orchLogPath) {
-        Get-Content -LiteralPath $orchLogPath -Tail 100 -Encoding UTF8 | Out-String
-    } else { $null }
-
-    # Get git status
+    # Get git status (naturally small — current working-tree delta only)
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
@@ -207,26 +180,32 @@ function Build-CoordinatorContext {
     # Extract declared scope
     $declaredScope = Get-DeclaredPublishScope -PacketPath $PacketPath
 
-    # Extract pipeline status
-    $pipelineStatusText = Get-PacketSectionText -Path $PacketPath -Heading 'Pipeline Status'
-
-    # Build context object
+    # The coordinator agent has its own file-read tools and the prompt template
+    # already tells it to open chain-summary/orchestration-log/qa-verdict itself
+    # (fixed paths under LogsDir, keyed by TaskId). Inlining their full content
+    # here — plus the entire packet file and 100 log lines — used to balloon this
+    # context to tens of KB per dispatch (CFG029's own "context waste" finding),
+    # and pushed the rendered prompt past Windows' ~32K CreateProcess command-line
+    # limit when passed to `agy --print`, causing agy.exe invocation to fail
+    # silently. Pass pointers only; the agent reads what it needs on demand.
     $context = [ordered]@{
         taskId = $TaskId
         packetPath = $PacketPath
-        packetContent = $packetContent
         declaredScope = $declaredScope
-        pipelineStatus = $pipelineStatusText
-        stageState = $stageState
-        chainSummary = $chainSummary
-        qaVerdict = $qaVerdict
-        orchestrationLog = $orchLog
+        logsDir = $LogsDir
         gitStatus = $gitStatus
         gitDiffStat = $gitDiffStat
         repoRoot = $repoRoot
     }
 
-    return $context | ConvertTo-Json -Depth 10 -Compress
+    # Explicit -InputObject (not piped) avoids ConvertTo-Json enumerating the
+    # OrderedDictionary as a pipeline sequence; Depth 3 is ample headroom for
+    # this flat object and bounds worst-case serialization cost. Observed
+    # once in practice: piped + Depth 10 let a live orchestrate-packet.ps1
+    # run for CFG029 balloon to 8.6GB RSS and spin one core for 20+ minutes
+    # inside this call, with an isolated repro on identical input completing
+    # in milliseconds — state-dependent, not reproduced on demand.
+    return ConvertTo-Json -InputObject $context -Depth 3 -Compress
 }
 
 function Build-CoordinatorPrompt {
@@ -294,7 +273,8 @@ if ($DryRun) {
     Write-Host "[DryRun] direct-dispatch task=$TaskId agy coordinator execution omitted"
     Write-Host "[DryRun] Would build context from packet: $($packet[0].FullName)"
     Write-Host "[DryRun] Would render prompt from template: gy-orchestrator-prompt.md"
-    Write-Host "[DryRun] Would invoke: agy --project <id> --model $dryModel --mode accept-edits --dangerously-skip-permissions --output-format stream-json --print-timeout ${HardTimeoutMinutes}m --print <prompt>"
+    $dryEffortFlag = if ($dryModel -eq 'gemini-3.7-flash') { ' --effort medium' } else { '' }
+    Write-Host "[DryRun] Would invoke: agy --project <id> --model $dryModel$dryEffortFlag --mode accept-edits --dangerously-skip-permissions --output-format stream-json --print-timeout ${HardTimeoutMinutes}m --print <prompt>"
     exit 0
 }
 
@@ -318,7 +298,10 @@ if ($DriverProfile -and $script:ProfileConfig.profiles.$DriverProfile) {
     $orchProfile = $script:ProfileConfig.profiles.($script:ProfileConfig.roles.orchestration)
 }
 $agyModel = if ($orchProfile) { [string]$orchProfile.model } else { 'gemini-3.7-flash' }
-$agyCommand = "$agyExe --project $projectId --model $agyModel --mode accept-edits --dangerously-skip-permissions --output-format stream-json --print-timeout ${HardTimeoutMinutes}m --print"
+# agy requires --effort whenever --model selects a gemini-3.7-flash family model
+# (mirrors dispatch-with-hang-detect.ps1's Build-ToolCommand antigravity branch).
+$agyEffortFlag = if ($agyModel -eq 'gemini-3.7-flash') { ' --effort medium' } else { '' }
+$agyCommand = "$agyExe --project $projectId --model $agyModel$agyEffortFlag --mode accept-edits --dangerously-skip-permissions --output-format stream-json --print-timeout ${HardTimeoutMinutes}m --print"
 
 Write-StartingStageState
 
