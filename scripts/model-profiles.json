@@ -30,7 +30,7 @@
     "independent-planned": ["opencode-go/mimo-v2.5-pro", "opencode-go/deepseek-v4-flash", "opencode-go/mimo-v2.5", "opencode/deepseek-v4-flash-free", "opencode/big-pickle"]
   },
   "plannerRouting": {
-    "claude": { "implementationRoute": "claude-planned", "qaProfile": "gemini-qa", "integrationProfile": "claude-integration" },
+    "claude": { "implementationRoute": "claude-planned", "qaProfile": "codex-qa", "integrationProfile": "claude-integration" },
     "codex": { "implementationRoute": "independent-planned", "qaProfile": "gemini-qa", "integrationProfile": "codex-integration" },
     "gemini": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "gemini-integration" }
   },
