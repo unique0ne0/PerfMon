@@ -45,6 +45,26 @@ function Get-HarnessTargets {
     )
 }
 
+# ── native git 호출 헬퍼 ──────────────────────────────────────────────────────
+# PS 5.1 + $ErrorActionPreference='Stop' 조합에서는 git이 stderr에 쓰는 비치명적
+# 경고(예: LF/CRLF 줄바꿈 변환 안내)조차 터미네이팅 에러로 승격된다 — 2>$null로
+# 리다이렉트해도 승격은 stderr 라인 처리 시점에 먼저 일어나 리다이렉트보다 앞선다.
+# 그래서 이 헬퍼 안에서만 EAP를 로컬로 완화하고, 실패 판정은 원래 로직대로
+# $LASTEXITCODE로만 한다(예외에 의존하지 않음).
+function Invoke-GitQuiet {
+    param(
+        [Parameter(Mandatory)][string]$ProjRoot,
+        [Parameter(Mandatory)][string[]]$GitArgs
+    )
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & git -C $ProjRoot @GitArgs 2>$null
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+}
+
 # ── 락 마커 감지 (Read-DispatchLock 과 동일한 이중 검증) ─────────────────────────
 # dispatch-with-hang-detect.ps1 의 Read-DispatchLock 을 dot-source 하지 않고,
 # 같은 판정 로직(PID 존재 + StartTime 일치)을 독립 구현한다.
@@ -122,10 +142,10 @@ foreach ($proj in $targets) {
 
     # 전체 상태는 "무관한 변경만 있음"을 구분하는 데만 사용한다. 커밋 대상 판정은
     # 반드시 아래 pathspec-scoped status 결과로만 한다.
-    $allStatusOutput = @(& git -C $proj status --porcelain 2>$null)
+    $allStatusOutput = @(Invoke-GitQuiet -ProjRoot $proj -GitArgs @('status', '--porcelain'))
 
     # git status --porcelain -- <pathspec> 로 하네스 자산만 확인
-    $statusOutput = @(& git -C $proj status --porcelain -- $assetPaths 2>$null)
+    $statusOutput = @(Invoke-GitQuiet -ProjRoot $proj -GitArgs (@('status', '--porcelain', '--') + $assetPaths))
     $statusText = ($statusOutput -join "`n").Trim()
 
     if ([string]::IsNullOrWhiteSpace($statusText)) {
@@ -170,12 +190,12 @@ foreach ($proj in $targets) {
     $commitPaths = @($changedAssets | ForEach-Object { "scripts/$_" })
     try {
         $addArgs = @('add') + $commitPaths
-        & git -C $proj @addArgs 2>$null
+        Invoke-GitQuiet -ProjRoot $proj -GitArgs $addArgs | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "git add 실패 (exit $LASTEXITCODE)" }
 
         $commitMsg = "chore(harness): sync harness assets from ai-agents-config`n`nAssets: $($changedAssets -join ', ')"
         $commitArgs = @('commit', '-m', $commitMsg, '--') + $commitPaths
-        & git -C $proj @commitArgs 2>$null
+        Invoke-GitQuiet -ProjRoot $proj -GitArgs $commitArgs | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "git commit 실패 (exit $LASTEXITCODE)" }
 
         $entry.Status = 'committed'
