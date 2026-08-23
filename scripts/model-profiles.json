@@ -1,6 +1,7 @@
 {
   "schemaVersion": 2,
   "modelCatalog": {
+    "opencode-go/qwen3.7-plus":       { "family": "qwen",     "principal": "opencode-go",   "tierUsd": 15, "cost": "paid" },
     "opencode-go/mimo-v2.5-pro":       { "family": "mimo",     "principal": "opencode-go",   "tierUsd": 15, "cost": "paid" },
     "opencode-go/deepseek-v4-flash":   { "family": "deepseek", "principal": "opencode-go",   "tierUsd": 30, "cost": "paid" },
     "opencode-go/mimo-v2.5":           { "family": "mimo",     "principal": "opencode-go",   "tierUsd": 60, "cost": "paid" },
@@ -26,8 +27,8 @@
     "gemini-integration": { "adapter": "gemini", "family": "gemini", "model": "gemini-2.5-pro", "tier": "quality", "fallbackProfiles": [] }
   },
   "routes": {
-    "claude-planned":      ["opencode-go/mimo-v2.5-pro", "opencode-go/deepseek-v4-flash", "opencode-go/mimo-v2.5", "opencode/deepseek-v4-flash-free", "opencode/big-pickle"],
-    "independent-planned": ["opencode-go/mimo-v2.5-pro", "opencode-go/deepseek-v4-flash", "opencode-go/mimo-v2.5", "opencode/deepseek-v4-flash-free", "opencode/big-pickle"]
+    "claude-planned":      ["opencode-go/qwen3.7-plus", "opencode-go/mimo-v2.5-pro", "opencode-go/deepseek-v4-flash", "opencode-go/mimo-v2.5", "opencode/deepseek-v4-flash-free", "opencode/big-pickle"],
+    "independent-planned": ["opencode-go/qwen3.7-plus", "opencode-go/mimo-v2.5-pro", "opencode-go/deepseek-v4-flash", "opencode-go/mimo-v2.5", "opencode/deepseek-v4-flash-free", "opencode/big-pickle"]
   },
   "plannerRouting": {
     "claude": { "implementationRoute": "claude-planned", "qaProfile": "codex-qa", "integrationProfile": "claude-integration" },

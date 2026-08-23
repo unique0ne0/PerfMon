@@ -300,20 +300,76 @@ if ($DriverProfile -and $script:ProfileConfig.profiles.$DriverProfile) {
 $agyModel = if ($orchProfile) { [string]$orchProfile.model } else { 'gemini-3.7-flash' }
 # agy requires --effort whenever --model selects a gemini-3.7-flash family model
 # (mirrors dispatch-with-hang-detect.ps1's Build-ToolCommand antigravity branch).
-$agyEffortFlag = if ($agyModel -eq 'gemini-3.7-flash') { ' --effort medium' } else { '' }
-$agyCommand = "$agyExe --project $projectId --model $agyModel$agyEffortFlag --mode accept-edits --dangerously-skip-permissions --output-format stream-json --print-timeout ${HardTimeoutMinutes}m --print"
+$agyArgs = @('--project', $projectId, '--model', $agyModel)
+if ($agyModel -eq 'gemini-3.7-flash') { $agyArgs += @('--effort', 'medium') }
+$agyArgs += @('--mode', 'accept-edits', '--dangerously-skip-permissions', '--output-format', 'stream-json', '--print-timeout', "${HardTimeoutMinutes}m")
+$agyArgsLiteral = ($agyArgs | ForEach-Object { "'" + $_.Replace("'", "''") + "'" }) -join ', '
 
 Write-StartingStageState
 
 $runner = Join-Path ([IO.Path]::GetTempPath()) ("orchestrate-$driverCycleId.ps1")
+$promptFile = Join-Path ([IO.Path]::GetTempPath()) ("orchestrate-$driverCycleId-prompt.txt")
 try {
-    # Create runner script that invokes agy with the prompt
-    $escapedPrompt = $prompt -replace "'", "''"
+    # agy's prompt is NEVER handed to PowerShell's own `&` native-command
+    # invocation. PowerShell 5.1's argument-to-command-line marshalling
+    # corrupts a long string once it contains many embedded double-quote
+    # characters (the JSON coordinator context is full of "key":"value"
+    # pairs) — reproduced live twice: once with the prompt embedded as
+    # source text, once passed as a runtime variable to `& $agyExe ...`;
+    # both fragmented into 62 argv entries, one of them literally "M" (from
+    # a git-status " M " marker), which agy rejected as "unexpected
+    # argument \"M\"" (CFG-BL-031). `ProcessStartInfo.ArgumentList` (which
+    # does its own correct per-element escaping) is unavailable on this
+    # .NET Framework build, so the runner instead escapes every argument
+    # itself using the documented CommandLineToArgvW quoting algorithm and
+    # invokes agy via System.Diagnostics.Process with a pre-escaped
+    # .Arguments string, bypassing PowerShell's marshalling entirely.
+    # Verified via a harmless echo-args stand-in before wiring this in:
+    # a 2052-char, 104-quote synthetic prompt (with an embedded " M "
+    # marker) arrived as exactly one argv token, unfragmented. Bare
+    # `--print` with no value is separately invalid: agy 1.1.18 hardened
+    # --print to require an explicit value ("a valueless prompt flag
+    # swallowing the next flag as its prompt ... is now an error").
+    [IO.File]::WriteAllText($promptFile, $prompt, (New-Object Text.UTF8Encoding($true)))
     $runnerText = @"
 `$env:ORCHESTRATION_DRIVER_CYCLE_ID = '$driverCycleId'
 Set-Location -LiteralPath '$($repoRoot.Replace("'", "''"))'
-& $agyCommand '$escapedPrompt'
-exit `$LASTEXITCODE
+`$promptText = [IO.File]::ReadAllText('$($promptFile.Replace("'", "''"))', [Text.Encoding]::UTF8)
+function ConvertTo-EscapedArgument {
+    param([string]`$Arg)
+    if (`$Arg.Length -gt 0 -and `$Arg -notmatch '[\s"]') { return `$Arg }
+    `$sb = New-Object Text.StringBuilder
+    [void]`$sb.Append('"')
+    `$len = `$Arg.Length
+    `$i = 0
+    while (`$true) {
+        `$backslashes = 0
+        while (`$i -lt `$len -and `$Arg[`$i] -eq '\') { `$backslashes++; `$i++ }
+        if (`$i -eq `$len) {
+            [void]`$sb.Append('\', (`$backslashes * 2))
+            break
+        } elseif (`$Arg[`$i] -eq '"') {
+            [void]`$sb.Append('\', (`$backslashes * 2 + 1))
+            [void]`$sb.Append('"')
+            `$i++
+        } else {
+            [void]`$sb.Append('\', `$backslashes)
+            [void]`$sb.Append(`$Arg[`$i])
+            `$i++
+        }
+    }
+    [void]`$sb.Append('"')
+    return `$sb.ToString()
+}
+`$argTokens = @($agyArgsLiteral, '--print', `$promptText)
+`$commandLine = (`$argTokens | ForEach-Object { ConvertTo-EscapedArgument `$_ }) -join ' '
+`$psi = New-Object System.Diagnostics.ProcessStartInfo
+`$psi.FileName = '$agyExe'
+`$psi.Arguments = `$commandLine
+`$psi.UseShellExecute = `$false
+`$proc = [System.Diagnostics.Process]::Start(`$psi)
+`$proc.WaitForExit()
+exit `$proc.ExitCode
 "@
     [IO.File]::WriteAllText($runner, $runnerText, (New-Object Text.UTF8Encoding($true)))
 
@@ -345,4 +401,4 @@ exit `$LASTEXITCODE
     $decisionNeeded = if ($reason -eq 'approval_required') { 'Inspect the exact target, arrange approval outside the headless process, then start one explicit fresh direct stage dispatch (new cycle).' } else { 'Inspect the chain summary and evidence before an explicit fresh restart.' }
     $path = Write-OrchestrationEscalation -ReasonCode $(if ($summaryCheck.Valid) { $reason } else { $summaryCheck.Reason }) -Summary "Agy coordinator exited $($process.ExitCode)." -EvidencePaths @(@($summaryPath, $logPath) + @($approvalEvidence)) -Attempts $attempts -DecisionNeeded $decisionNeeded
     Write-Host "Escalation: $path"; exit 1
-} finally { if (Test-Path $runner) { Remove-Item $runner -Force } }
+} finally { if (Test-Path $runner) { Remove-Item $runner -Force }; if (Test-Path $promptFile) { Remove-Item $promptFile -Force } }

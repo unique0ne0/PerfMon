@@ -507,6 +507,11 @@ function Get-ProcessTreeMetrics {
 function Get-TreeState {
     $head = $null; $dirty = $null; $fingerprint = $null
     Push-Location $RepoRoot
+    # PS 5.1 + 전역 $ErrorActionPreference='Stop' 조합에서 native 명령의 stderr 한 줄이
+    # NativeCommandError로 승격되어 스크립트가 죽는다(CFG-BL-019). Invoke-VerifyGate와 동일하게
+    # 이 호출 구간만 Continue로 낮춘다.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     try {
         $head = (& git rev-parse HEAD 2>$null | Out-String).Trim()
         if ($LASTEXITCODE -ne 0) { throw 'git rev-parse failed' }
@@ -553,6 +558,7 @@ function Get-TreeState {
         # 실제로는 판정에 실패한 실행을 "변경 없음"으로 단정한다. 실패는 실패로 남긴다.
         Write-Log "[$($MyInvocation.MyCommand.Name)] 작업트리 지문 계산 실패 — 변경 판정을 건너뜁니다: $($_.Exception.Message)" WARN
     } finally {
+        $ErrorActionPreference = $prevEap
         Pop-Location
     }
     if ([string]::IsNullOrEmpty($head)) { return $null }

@@ -70,7 +70,7 @@ Gemini 3.7 Flash + Antigravity CLI로 파이프라인 전체를 직접 모니터
 7. **Git 금지**: commit/push하지 않는다 (autopublish는 해네스가 처리)
 
 ## 보고 형식
-stdout에 평문으로 상태 메시지를 작성하세요. 특별히 지시된 경우 외에는 JSON을Producing하지 마세요.
+stdout에 평문으로 상태 메시지를 작성하세요. 특별히 지시된 경우 외에는 JSON을 생성하지 마세요.
 완료 시 다음을 보고하세요:
 - 작업 ID와 제목
 - 실행한 단계와 결과
