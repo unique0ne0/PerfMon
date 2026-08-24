@@ -102,68 +102,6 @@ function Get-DeclaredPublishScope {
     } | Where-Object { $_ })
 }
 
-function Get-GitWorktreePaths {
-    param([string]$RepositoryRoot)
-    $paths = @()
-    foreach ($command in @(@('diff', '--name-only', 'HEAD'), @('diff', '--cached', '--name-only'), @('ls-files', '--others', '--exclude-standard'))) {
-        # PS 5.1: 2>$null alone does not prevent $ErrorActionPreference = 'Stop'
-        # from converting native stderr warnings (e.g. git CRLF notices) into
-        # terminating NativeCommandError. Temporarily relax EAP around the call.
-        $prevEAP = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        try {
-            $output = @(& git -C $RepositoryRoot @command 2>$null)
-        } finally {
-            $ErrorActionPreference = $prevEAP
-        }
-        if ($LASTEXITCODE -ne 0) { throw "Git baseline command failed: git $($command -join ' ')" }
-        $paths += @($output | ForEach-Object { ([string]$_).Trim().Replace('\', '/') } | Where-Object { $_ })
-    }
-    return @($paths | Sort-Object -Unique)
-}
-
-function Test-PathInDeclaredScope {
-    param([string]$Path, [string[]]$Scope)
-    foreach ($allowed in $Scope) {
-        if ($Path -eq $allowed -or $Path.StartsWith($allowed.TrimEnd('/') + '/')) { return $true }
-    }
-    return $false
-}
-
-function Invoke-ApprovedAutopublish {
-    param([string]$PacketPath, [string[]]$BaselinePaths, [object]$ChainSummary)
-    $permission = Get-PacketSectionText -Path $PacketPath -Heading 'Permission Handoff'
-    $scope = Get-DeclaredPublishScope -PacketPath $PacketPath
-    if ($permission -notmatch '(?i)conditional autopublish authority') { throw 'Autopublish escalation: packet Permission Handoff lacks conditional autopublish authority.' }
-    if ($scope.Count -eq 0) { throw 'Autopublish escalation: packet Declared Scope is missing or empty.' }
-    if (@($BaselinePaths | Where-Object { Test-PathInDeclaredScope -Path $_ -Scope $scope }).Count -gt 0) { throw 'Autopublish escalation: the baseline already contains a dirty file inside the declared scope.' }
-    if (@(& git -C $repoRoot diff --cached --name-only 2>$null).Count -gt 0) { throw 'Autopublish escalation: pre-existing staged changes prevent selective staging.' }
-    if ($ChainSummary.state -ne 'completed' -or @($ChainSummary.stages | Where-Object { -not $_.success }).Count -gt 0) { throw 'Autopublish escalation: chain completion and Verify evidence are incomplete.' }
-
-    $currentPaths = Get-GitWorktreePaths -RepositoryRoot $repoRoot
-    $newPaths = @($currentPaths | Where-Object { $BaselinePaths -notcontains $_ })
-    $scopeDrift = @($newPaths | Where-Object { -not (Test-PathInDeclaredScope -Path $_ -Scope $scope) })
-    if ($scopeDrift.Count -gt 0) { throw "Autopublish escalation: scope drift detected: $($scopeDrift -join ', ')" }
-    if ($newPaths -notcontains 'history.md') { throw 'Autopublish escalation: successful Integration did not add the required history.md record.' }
-    if ($newPaths.Count -eq 0) { throw 'Autopublish escalation: no declared-scope changes are available to publish.' }
-
-    $upstream = (& git -C $repoRoot rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>$null | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($upstream)) { throw 'Autopublish escalation: the current branch has no tracking branch.' }
-    & git -C $repoRoot fetch --quiet
-    if ($LASTEXITCODE -ne 0) { throw 'Autopublish escalation: remote authentication or fetch failed.' }
-    & git -C $repoRoot merge-base --is-ancestor $upstream HEAD 2>$null
-    if ($LASTEXITCODE -ne 0) { throw 'Autopublish escalation: local branch is behind its tracking branch (non-fast-forward risk).' }
-
-    & git -C $repoRoot add -- $scope
-    if ($LASTEXITCODE -ne 0) { throw 'Autopublish escalation: selective staging failed.' }
-    $staged = @(& git -C $repoRoot diff --cached --name-only 2>$null | ForEach-Object { ([string]$_).Trim().Replace('\', '/') } | Where-Object { $_ })
-    if ($staged.Count -eq 0 -or @($staged | Where-Object { -not (Test-PathInDeclaredScope -Path $_ -Scope $scope) }).Count -gt 0) { throw 'Autopublish escalation: staged set is empty or exceeds the declared scope.' }
-    & git -C $repoRoot commit -m "feat(harness): complete $TaskId autopublish contract"
-    if ($LASTEXITCODE -ne 0) { throw 'Autopublish escalation: selective commit failed.' }
-    & git -C $repoRoot push
-    if ($LASTEXITCODE -ne 0) { throw 'Autopublish escalation: tracking-branch push failed.' }
-}
-
 function Build-CoordinatorContext {
     param([string]$PacketPath, [string]$TaskId, [string]$LogsDir)
 
@@ -248,7 +186,6 @@ $existingEscalation = Join-Path $logs "$TaskId-orchestration-escalation.json"
 if (Test-Path $existingEscalation) { throw "Existing escalation blocks automatic restart: $existingEscalation" }
 $driverCycleId = [guid]::NewGuid().ToString('N')
 $summaryPath = Join-Path $logs "$TaskId-chain-summary.json"
-$publishBaseline = if ($DryRun) { @() } else { Get-GitWorktreePaths -RepositoryRoot $repoRoot }
 if (-not $DryRun -and (Test-Path -LiteralPath $summaryPath)) { Remove-Item -LiteralPath $summaryPath -Force }
 $logPath = Join-Path $logs "$TaskId-orchestration.log"
 $attempts = @()
@@ -386,14 +323,8 @@ exit `$proc.ExitCode
     $summaryCheck = Test-CompletedChainSummary -Path $summaryPath
 
     if ($process.ExitCode -eq 0 -and $summaryCheck.Valid) {
-        try {
-            $summary = Get-Content -LiteralPath $summaryPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            Invoke-ApprovedAutopublish -PacketPath $packet[0].FullName -BaselinePaths $publishBaseline -ChainSummary $summary
-            exit 0
-        } catch {
-            $path = Write-OrchestrationEscalation -ReasonCode 'autopublish_precondition_failed' -Summary $_.Exception.Message -EvidencePaths @($summaryPath, $logPath) -Attempts $attempts -DecisionNeeded 'Resolve the reported safety precondition, then start one explicit fresh direct stage dispatch.'
-            Write-Host "Escalation: $path"; exit 1
-        }
+        Write-Host "Completed: $summaryPath"
+        exit 0
     }
 
     $reason = Get-DriverFailureReason -LogPath $logPath

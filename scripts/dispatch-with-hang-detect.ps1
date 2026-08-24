@@ -502,6 +502,25 @@ function Get-ProcessTreeMetrics {
     }
 }
 
+# hang 후보 시점에 git 작업(커밋/머지/체크아웃 등)이 진행 중인지 판정한다.
+# (a) $RepoRoot\.git\index.lock 존재 여부, (b) 이미 수집한 자식 PID 중 프로세스명 'git' 존재 여부.
+# 새 git 프로세스를 spawn하지 않는다 — hang 후보 자체가 "멈춰 있을 수 있는" 시점이므로
+# 판정 로직이 추가 지연/행 리스크를 만들지 않아야 한다(CFG031).
+function Test-GitOperationInFlight {
+    param([string]$RepoRoot, [int[]]$ChildProcessIds)
+    $indexLock = Join-Path $RepoRoot '.git\index.lock'
+    if (Test-Path -LiteralPath $indexLock -PathType Leaf) { return $true }
+    if ($ChildProcessIds -and $ChildProcessIds.Count -gt 0) {
+        foreach ($childPid in $ChildProcessIds) {
+            try {
+                $childProc = Get-Process -Id $childPid -ErrorAction Stop
+                if ($childProc.ProcessName -eq 'git') { return $true }
+            } catch { }
+        }
+    }
+    return $false
+}
+
 # 작업트리 스냅샷 — 단계가 실제로 무언가를 바꿨는지 판정하는 근거.
 # 로그 디렉터리는 gitignore 대상이므로 이 스냅샷을 오염시키지 않는다.
 function Get-TreeState {
@@ -949,6 +968,9 @@ function Invoke-StageProcess {
                     Write-Log "강제 종료 [$Stage] (PID: $($proc.Id), 경과 $([math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1))초)" WARN
                     return 'hang'
                 } elseif (-not $hangReported) {
+                    # CFG031 3분법: KillOnHang=$false 스테이지에서 git 진행 중이면 대기, 아니면 즉시 종료.
+                    # 특정 스테이지 이름을 하드코딩하지 않는다 — $Config.KillOnHang=$false인 모든 스테이지에 일반 적용.
+                    $gitInFlight = Test-GitOperationInFlight -RepoRoot $RepoRoot -ChildProcessIds $metricsNow.ChildProcessIds
                     $wsMb = [math]::Round($metricsNow.WorkingSet / 1MB, 1)
                     $handles = $metricsNow.HandleCount
                     $childPids = if ($metricsNow.ChildProcessIds -and $metricsNow.ChildProcessIds.Count -gt 0) {
@@ -956,8 +978,16 @@ function Invoke-StageProcess {
                     } else {
                         '없음'
                     }
-                    Write-Log "⚠️ hang 후보 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 점유 자원: WS ${wsMb}MB, 핸들 ${handles}개, 자식 PID: [$childPids]; 커밋·푸시 단계라 하드 상한까지 대기" WARN
-                    $hangReported = $true
+                    if ($gitInFlight) {
+                        Write-Log "⚠️ hang 후보 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 점유 자원: WS ${wsMb}MB, 핸들 ${handles}개, 자식 PID: [$childPids]; git 작업 중이라 하드 상한까지 대기" WARN
+                        $hangReported = $true
+                    } else {
+                        Write-Log "⚠️ hang 감지 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 진행 중인 git 커밋/푸시 없음(index.lock 없음, git 자식 프로세스 없음) — 프로세스 트리 종료" WARN
+                        Stop-ProcessTree $proc.Id
+                        $policyKilled = $true
+                        Write-Log "강제 종료 [$Stage] (PID: $($proc.Id), 경과 $([math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1))초)" WARN
+                        return 'hang'
+                    }
                 }
             }
             if ((Get-Date) -gt $deadline) {
