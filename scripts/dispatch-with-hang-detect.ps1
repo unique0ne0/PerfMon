@@ -1568,6 +1568,59 @@ function Record-StageAttempt {
     return @{ Blocked = $false; Count = $count; MaxAllowed = $maxAllowed }
 }
 
+# CFG037: QA 단계가 완료된 후 qa-verdict.json이 없으면 하네스가 직접 기록한다.
+# QA 모델이 프롬프트 지시를 따르지 않거나 크래시·hang으로 파일 작성 전에 종료되면
+# "verdict=fail"이 영원히 기록되지 않아 대시보드가 실제 QA 실패를 숨기는 결함이 있었다
+# (실측: 34개 qa-verdict.json 전부 pass, fail 0건).
+function Write-SyntheticQaVerdict {
+    param([string]$Stage, [object]$Result, [int]$CycleNumber)
+    if ($Stage -ne 'qa') { return }
+    $verdictRel = $StageConfig['qa'].VerdictFile
+    $verdictAbs = Resolve-RepoPath $verdictRel
+    if (Test-Path -LiteralPath $verdictAbs) { return }
+    $verdictValue = 'blocked'
+    $reasonText = 'QA stage completed but no verdict file was written by the model'
+    if ($Result.Success) {
+        $verdictValue = 'pass'
+        $reasonText = 'QA stage succeeded (verify passed) but model did not write verdict file — synthetic pass recorded by harness'
+    } elseif ($Result.FailureReason) {
+        $reasonText = [string]$Result.FailureReason
+    }
+    $value = [ordered]@{
+        schemaVersion = 1
+        taskId = $TaskId
+        stage = 'qa'
+        cycle = $CycleNumber
+        verdict = $verdictValue
+        reason = $reasonText
+        doneWhen = @()
+        synthetic = $true
+        syntheticReason = 'model did not write qa-verdict.json; harness recorded outcome'
+        observedAt = [datetime]::UtcNow.ToString('o')
+    }
+    $parent = Split-Path -Parent $verdictAbs
+    if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $temporary = "$verdictAbs.$([guid]::NewGuid().ToString('N')).tmp"
+    [System.IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($true)))
+    Move-Item -LiteralPath $temporary -Destination $verdictAbs -Force
+    Write-Log "⚠️ [qa] 합성 qa-verdict 기록: verdict=$verdictValue ($reasonText)" WARN
+}
+
+# CFG037: 모든 QA 라운드에서 qa-ledger.json이 작성되도록 한다.
+# 기존 Record-StageAttempt는 실패만 기록하므로, 성공 라운드에서는 ledger가 작성되지 않았다
+# (실측: 589개 로그 중 qa-ledger.json 2개뿐). 이 함수가 성공·실패 모두에서 ledger를 보장한다.
+function Ensure-QaLedger {
+    param([string]$Stage, [object]$Result)
+    if ($Stage -ne 'qa') { return }
+    $ledger = Read-StageLedger -Stage 'qa'
+    $hasEntries = @($ledger.attempts.psobject.Properties).Count -gt 0
+    if (-not $hasEntries) {
+        $outcome = if ($Result.Success) { 'ok' } else { 'qa_failed' }
+        $sig = "success:qa:$outcome"
+        $rec = Record-StageAttempt -Stage 'qa' -Signature $sig -FailureClass 'transient'
+    }
+}
+
 # CFG027: 구조적 원인 수정을 확인한 뒤 원장을 감사 가능하게 초기화하는 유일한 공식 경로.
 # 이전에는 CFG025 QA 원장을 Write 툴로 직접 덮어쓰는 수동 워크어라운드가 두 번 반복됐다 —
 # 사유 없는 초기화를 막기 위해 -ResetReason을 필수로 요구하고 초기화 이력을 별도 로그에 남긴다.
@@ -2488,6 +2541,9 @@ function Invoke-StageWithLock {
         if ($CheckPipelineBefore) { Test-RequestedPipelineStage -Stage $Stage -PacketPath $CheckPipelinePacket }
         # 성공/실패 어느 쪽이든 마커 상태를 확정한다 — 실패는 다음 실행까지 눈에 남고, 성공은 즉시 지운다.
         $result = Dispatch-Stage -Stage $Stage -PromptOverride $PromptOverride
+        $cycleId = if ($result.CycleId) { [int]$result.CycleId } else { 0 }
+        Write-SyntheticQaVerdict -Stage $Stage -Result $result -CycleNumber $cycleId
+        Ensure-QaLedger -Stage $Stage -Result $result
         if ($result.Success) { Test-PipelineStageUpdated -Stage $Stage -PacketPath $CheckPipelinePacket }
         if ($result.Success) { Clear-FailureMarker -Stage $Stage }
         elseif ($result.Outcome -eq 'approval_required') {
@@ -2708,6 +2764,15 @@ if ($Chain) {
             # 이 상태를 보고 재시도하지 않고 judgment_required로 멈춘다.
             $chainState = if ($result.Outcome -eq 'approval_required') { 'approval_required' } else { 'failed' }
             $chainWarnings = if ($result.Outcome -eq 'approval_required') { @("승인 대기 — 기록: $($result.ApprovalPath)") } else { @($result.FailureReason) }
+            if ($stage -eq 'qa') {
+                try {
+                    $vfPath = Resolve-RepoPath ($StageConfig['qa'].VerdictFile)
+                    if (Test-Path -LiteralPath $vfPath) {
+                        $vfJson = Get-Content -LiteralPath $vfPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                        $chainQaVerdict = @{ verdict = [string]$vfJson.verdict; reason = [string]$vfJson.reason; fresh = $true; synthetic = [bool]$vfJson.synthetic }
+                    }
+                } catch { }
+            }
             Write-ChainSummary -State $chainState -Stages $chainStages -Warnings $chainWarnings -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
             Write-Log "❌ [$stage] 파이프라인 중단 (상태: $chainState, 로그: $($StageConfig[$stage].LogFile))" ERROR
             exit 1
@@ -2715,11 +2780,30 @@ if ($Chain) {
         # QA 자체는 성공했어도 verdict가 ⑤를 막으면 파이프라인은 거기서 멈춘다 —
         # 사용자 눈에는 이것도 "중단"이므로 마커를 남긴다.
         if ($stage -eq 'qa' -and -not $DryRun -and -not (Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt)) {
+            $actualQaVerdict = $null
+            try {
+                $vfPath = Resolve-RepoPath ($StageConfig['qa'].VerdictFile)
+                if (Test-Path -LiteralPath $vfPath) {
+                    $vfJson = Get-Content -LiteralPath $vfPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                    $actualQaVerdict = @{ verdict = [string]$vfJson.verdict; reason = [string]$vfJson.reason; fresh = $true; synthetic = [bool]$vfJson.synthetic }
+                }
+            } catch { }
+            if ($actualQaVerdict) { $chainQaVerdict = $actualQaVerdict }
             Write-FailureMarker -Stage 'qa' -Reason 'QA verdict 미통과 — ⑤ 진행 중단'
             Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @('QA verdict 미통과 — ⑤ 진행 중단') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
             exit 1
         }
-        if ($stage -eq 'qa') { $chainQaVerdict = @{ verdict = 'pass'; fresh = $true } }
+        if ($stage -eq 'qa') {
+            $actualQaVerdict = $null
+            try {
+                $vfPath = Resolve-RepoPath ($StageConfig['qa'].VerdictFile)
+                if (Test-Path -LiteralPath $vfPath) {
+                    $vfJson = Get-Content -LiteralPath $vfPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                    $actualQaVerdict = @{ verdict = [string]$vfJson.verdict; fresh = $true; synthetic = [bool]$vfJson.synthetic }
+                }
+            } catch { }
+            $chainQaVerdict = if ($actualQaVerdict) { $actualQaVerdict } else { @{ verdict = 'pass'; fresh = $true } }
+        }
         # CFG017: QA 승인 대기는 fresh verdict pass를 확인한 뒤에만 해소한다 — Dispatch-Stage 안에서
         # 해소하면 "실행 성공이지만 verdict 미통과" 케이스에 승인 기록이 조기 해소된다.
         if ($stage -eq 'qa' -and -not $DryRun -and $result.CycleId) { Resolve-ApprovalRecords -Stage 'qa' -ResolvingCycle $result.CycleId }
