@@ -21,7 +21,25 @@ Add-Type -AssemblyName System.Drawing
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $stages = @('impl', 'qa', 'integration')
-$hangThresholds = @{ impl = 600; qa = 600; integration = 900 }
+
+# ── 단계별 임계 정본 로드 (stage-thresholds.json) ────────────────────────────
+# CFG039: dispatcher($StageConfig.HangSeconds)와 dashboard($hangThresholds)는 같은
+# stage-thresholds.json을 읽는다. 파일에서 읽지 못한 단계만 안전 폴백(대시보드 기존 기본 600)을
+# 채우며, 단계별 임계 자체를 하드코딩하지 않는다.
+$hangThresholds = @{}
+$stageThresholdsPath = Join-Path $PSScriptRoot 'stage-thresholds.json'
+if (-not (Test-Path -LiteralPath $stageThresholdsPath)) {
+    $stageThresholdsPath = Join-Path $root 'stage-thresholds.json'
+}
+$stageThresholdsRaw = $null
+if (Test-Path -LiteralPath $stageThresholdsPath) {
+    try { $stageThresholdsRaw = Get-Content -LiteralPath $stageThresholdsPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $stageThresholdsRaw = $null }
+}
+foreach ($st in $stages) {
+    $t = $null
+    if ($stageThresholdsRaw) { try { $t = $stageThresholdsRaw.stages.$st } catch { $t = $null } }
+    if ($t -and $t.hangSeconds) { $hangThresholds[$st] = [int]$t.hangSeconds } else { $hangThresholds[$st] = 600 }
+}
 
 # 작업 ID는 하네스가 파일명·락·로그에 그대로 쓰므로 -, 공백, 밑줄 등은 동일 ID를
 # 서로 다른 문자열로 쪼개 대시보드가 같은 작업을 다른 것으로 오인한다(예: CS-030 락과
@@ -43,6 +61,61 @@ function Get-HarnessProjects {
             Where-Object { $_ -and -not $_.StartsWith('#') } |
             Where-Object { Test-Path $_ }
     )
+}
+
+# ── CFG042: 사본 classified as local exception(오버라이드)인지 판정 ─────────────────
+# verify.ps1의 'Harness deploy drift' 단계와 sync-configs.ps1의 Test-HarnessDrift가 쓰는
+# 엄격 조건을 그대로 옮긴다(단일 엔트리 + localOverride + 비어 있지 않은 기준 해시 + 정본/사본 존재 +
+# 해시 상이). 대시보드는 읽기 전용 모니터이므로 여기 어긋나게 전시하면 운영자가 어느 쪽을 봐도
+# 같은 결론을 못 낸다 — 세 곳이 항상 같은 판정을 공유해야 한다(CFG042 드리프트 행렬이 이를 강제).
+function Test-HarnessOverrideState {
+    param([hashtable]$OverrideLookup, [string]$Target, [string]$Asset, [string]$Master)
+    $key = "$([System.IO.Path]::GetFullPath($Target))|$Asset"
+    $entries = @($OverrideLookup[$key])
+    if ($entries.Count -ne 1 -or $entries[0].localOverride -ne $true -or [string]::IsNullOrWhiteSpace([string]$entries[0].lastSyncedHash)) { return $false }
+    $copy = Join-Path $Target "scripts\$Asset"
+    return (Test-Path -LiteralPath $copy) -and ((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne $Master)
+}
+
+# ── CFG042: 하네스 배포 동기화 요약 — 오버라이드(추적 가능한 로컬 예외)와 드리프트 분리 ──
+# 정본 자산 목록은 이 저장소(실행 지점)의 global/harness 파일 목록에서 읽는다. 각 대상 사본이
+# 정본과 다르면 상태 파일의 엄격 조건을 위반하는지 확인해, 유효 오버라이드는 예외로, 나머지는
+# 드리프트로 집계한다. 순수 함수라 WinForms 없이 AST 임포트로 자동 검증할 수 있다.
+function Get-HarnessSyncSummary {
+    $masterDir = Join-Path $root 'global\harness'
+    $assets = @(Get-ChildItem -LiteralPath $masterDir -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $harnessProjects = @(Get-HarnessProjects)
+
+    $overrideLookup = @{}
+    $statePath = Join-Path $root '.agents\briefs\.harness-sync-state.json'
+    if (Test-Path -LiteralPath $statePath) {
+        try {
+            $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($entry in @($state.entries)) {
+                $key = "$([System.IO.Path]::GetFullPath($entry.target))|$($entry.asset)"
+                if (-not $overrideLookup.ContainsKey($key)) { $overrideLookup[$key] = @() }
+                $overrideLookup[$key] += $entry
+            }
+        } catch { $overrideLookup = @{} }
+    }
+
+    $overrides = @(); $drifts = @(); $checked = 0
+    foreach ($proj in $harnessProjects) {
+        foreach ($asset in $assets) {
+            $master = Join-Path $masterDir $asset
+            $masterHash = (Get-FileHash -LiteralPath $master -Algorithm SHA256).Hash
+            $copy = Join-Path $proj "scripts\$asset"
+            if (-not (Test-Path -LiteralPath $copy)) { $drifts += "$proj|$asset (missing)"; continue }
+            $copyHash = (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash
+            if ($copyHash -eq $masterHash) { $checked++; continue }
+            if (Test-HarnessOverrideState -OverrideLookup $overrideLookup -Target $proj -Asset $asset -Master $masterHash) {
+                $overrides += "$proj|$asset"
+            } else {
+                $drifts += "$proj|$asset"
+            }
+        }
+    }
+    return [pscustomobject]@{ MasterChecks = $checked; Overrides = @($overrides); Drifts = @($drifts); Projects = @($harnessProjects) }
 }
 
 # 라우터 표의 헤더 행이면 컬럼 이름 → 인덱스 매핑을 돌려주고, 아니면 $null.
@@ -1027,12 +1100,44 @@ function Update-Dashboard {
         [System.Windows.Forms.Label]$TierBadge = $null,
         [System.Windows.Forms.Label]$SessionBadge = $null,
         [System.Windows.Forms.Label]$ApprovalBadge = $null,
+        [System.Windows.Forms.Label]$HarnessBadge = $null,
         [System.Windows.Forms.DataGridView]$SessionGrid = $null,
         [System.Windows.Forms.ToolTip]$ToolTip = $null,
         [switch]$ShowAll
     )
 
     $harnessProjects = @(Get-HarnessProjects)
+    if ($HarnessBadge) {
+        # CFG042: 하네스 배포 동기화를 한 번에 보여준다. 드리프트가 있으면 Push가 필요하다는
+        # 뜻이므로 가장 강하게, 유효 오버라이드만 있으면 기록된 로컬 예외이므로 그 다음 강도로,
+        # 전부 정본과 같으면 동기화 완료로 표시한다. 세부 항목은 툴팁에 담는다.
+        $summary = Get-HarnessSyncSummary
+        if ($summary.Drifts.Count -gt 0) {
+            $HarnessBadge.Text = "🔗 하네스: 드리프트 $($summary.Drifts.Count) · 오버라이드 $($summary.Overrides.Count)"
+            $HarnessBadge.ForeColor = [System.Drawing.Color]::Crimson
+        } elseif ($summary.Overrides.Count -gt 0) {
+            $HarnessBadge.Text = "🔗 하네스: 오버라이드 $($summary.Overrides.Count)"
+            $HarnessBadge.ForeColor = [System.Drawing.Color]::DarkGoldenrod
+        } else {
+            $HarnessBadge.Text = '🔗 하네스: 동기화됨'
+            $HarnessBadge.ForeColor = [System.Drawing.Color]::DarkOliveGreen
+        }
+        if ($ToolTip) {
+            $tipLines = @()
+            if ($summary.Overrides.Count -gt 0) {
+                $tipLines += "오버라이드 — 기록된 로컬 예외 (동기화 제외 대상):"
+                $summary.Overrides | ForEach-Object { $tipLines += "  $_" }
+            }
+            if ($summary.Drifts.Count -gt 0) {
+                $tipLines += "드리프트 — 미등록·누락·충돌 (Push 필요):"
+                $summary.Drifts | ForEach-Object { $tipLines += "  $_" }
+            }
+            if ($tipLines.Count -eq 0) {
+                $tipLines += "전 대상 자산 $($summary.MasterChecks)개가 정본과 동기화됨"
+            }
+            $ToolTip.SetToolTip($HarnessBadge, ($tipLines -join "`n"))
+        }
+    }
     if ($TierBadge -or $SessionBadge -or $ApprovalBadge) {
         $health = Get-DefenseHealthSummary -Projects $harnessProjects
         if ($TierBadge) {
@@ -1239,9 +1344,19 @@ $approvalBadge.Text = '▶ 실행중: 0 · ⏳ 승인대기: 0 · ✖ 실패: 0'
 $approvalBadge.Cursor = [System.Windows.Forms.Cursors]::Hand
 $approvalBadge.AccessibleName = '파이프라인 및 승인 요약'
 
+$harnessBadge = New-Object System.Windows.Forms.Label
+$harnessBadge.AutoSize = $true
+$harnessBadge.Margin = New-Object System.Windows.Forms.Padding(4, 2, 8, 2)
+$harnessBadge.Font = New-Object System.Drawing.Font($form.Font.FontFamily, 9, [System.Drawing.FontStyle]::Bold)
+$harnessBadge.ForeColor = [System.Drawing.Color]::DarkSlateGray
+$harnessBadge.Text = '🔗 하네스: 확인중...'
+$harnessBadge.Cursor = [System.Windows.Forms.Cursors]::Hand
+$harnessBadge.AccessibleName = '하네스 동기화 상태 (오버라이드·드리프트)'
+
 $summaryPanel.Controls.Add($tierBadge)
 $summaryPanel.Controls.Add($sessionBadge)
 $summaryPanel.Controls.Add($approvalBadge)
+$summaryPanel.Controls.Add($harnessBadge)
 
 # 가장 오래된 세션 테이블 — 패킷 그리드와 분리된 0~1행 DataGridView.
 $sessionGrid = New-Object System.Windows.Forms.DataGridView
@@ -1316,13 +1431,13 @@ $legendLabel.ForeColor = [System.Drawing.Color]::DimGray
 $radioActive.Add_CheckedChanged({
     if ($radioActive.Checked) {
         $script:showAllFilter = $false
-        Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -SessionGrid $sessionGrid -ToolTip $toolTip
+        Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -HarnessBadge $harnessBadge -SessionGrid $sessionGrid -ToolTip $toolTip
     }
 })
 $radioAll.Add_CheckedChanged({
     if ($radioAll.Checked) {
         $script:showAllFilter = $true
-        Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -SessionGrid $sessionGrid -ToolTip $toolTip -ShowAll
+        Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -HarnessBadge $harnessBadge -SessionGrid $sessionGrid -ToolTip $toolTip -ShowAll
     }
 })
 
@@ -1332,7 +1447,7 @@ $refreshAction = {
     # 버튼을 즉시 비활성화하고 갱신이 끝난 뒤 풀어준다.
     $refreshButton.Enabled = $false
     try {
-        Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -SessionGrid $sessionGrid -ToolTip $toolTip -ShowAll:$script:showAllFilter
+        Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -HarnessBadge $harnessBadge -SessionGrid $sessionGrid -ToolTip $toolTip -ShowAll:$script:showAllFilter
     } finally {
         $refreshButton.Enabled = $true
     }
@@ -1397,11 +1512,11 @@ $form.Controls.Add($statusStrip)
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = $IntervalSeconds * 1000
-$timer.Add_Tick({ Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -SessionGrid $sessionGrid -ToolTip $toolTip -ShowAll:$script:showAllFilter })
+$timer.Add_Tick({ Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -HarnessBadge $harnessBadge -SessionGrid $sessionGrid -ToolTip $toolTip -ShowAll:$script:showAllFilter })
 $clockTimer = New-Object System.Windows.Forms.Timer
 $clockTimer.Interval = 1000
 $clockTimer.Add_Tick({ $clockLabel.Text = '현재: ' + (Get-Date).ToString('HH:mm:ss KST') })
-Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -SessionGrid $sessionGrid -ToolTip $toolTip -ShowAll
+Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -HarnessBadge $harnessBadge -SessionGrid $sessionGrid -ToolTip $toolTip -ShowAll
 $clockLabel.Text = '현재: ' + (Get-Date).ToString('HH:mm:ss KST')
 $timer.Start()
 $clockTimer.Start()

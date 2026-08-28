@@ -37,6 +37,8 @@
                               파생되므로 — 별도의 상한 노브는 두지 않는다 — 이것만 줄이면 짧게 검증할 수 있다.
 .PARAMETER DryRun             실제 실행 없이 생성될 명령/스크립트만 출력(단일 단계 검증용).
 .PARAMETER BypassToolPermissions  사용자 승인 시에만 Antigravity CLI의 도구 권한 요청을 자동 승인한다.
+.PARAMETER ForceFreeModel     impl 폴백 체인에서 유료(opencode-go) 슬롯을 건너뛰고 무료 슬롯으로 바로 시작한다.
+                              사용자가 유료 쿼터 소진을 이미 확인했을 때만 지정 — 자동 판단 없음.
 #>
 
 param(
@@ -53,7 +55,10 @@ param(
     # CFG027: 원장(ledger) 시도 카운트를 구조적 수정 완료 후 감사 가능한 방식으로 초기화한다.
     # 기존에는 CFG025-qa-ledger.json 등을 Write 툴로 직접 덮어써야 했다 — 반복되는 수동 개입.
     [Parameter(Mandatory=$false)][switch]$ResetStageLedger,
-    [Parameter(Mandatory=$false)][string]$ResetReason
+    [Parameter(Mandatory=$false)][string]$ResetReason,
+    # CFG038 핫픽스(2026-08-27): opencode-go 쿼터 소진이 명확할 때 유료 슬롯을 전부 태우며
+    # hang 대기를 반복하지 않도록, 사용자가 이번 실행만 무료 슬롯으로 직행시킬 수 있게 한다.
+    [Parameter(Mandatory=$false)][switch]$ForceFreeModel
 )
 
 $ErrorActionPreference = "Stop"
@@ -100,29 +105,48 @@ $StageConfig = @{
         LogFile = "$TaskLogPrefix-impl.log"
         KillOnHang = $true
         Retry = $false
-        HangSeconds = 600
+        # 단계별 hang 임계(HangSeconds)는 stage-thresholds.json이 정본이다 — 아래에서 로드해 덮어쓴다.
     }
     'qa' = @{
         Command = ''
-        DefaultPrompt = "작업 $TaskId — 개발팀의 1차 구현과 자체 리뷰가 완료되었어. Handoff 확인하고 제로베이스에서 구현 및 코드 품질에 대해 리뷰해. 리뷰 시작 전 패킷의 Done When 항목을 전부 나열하고, 각 항목마다 실제 diff·코드 근거를 들어 충족 여부를 개별 확인해 — 근거 없이 통째로 '완료'로 넘기지 마(CFG024에서 Done When 항목 하나가 이런 식으로 누락됐었다). 발견한 결함은 직접 수정한 뒤 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ④를 갱신해. 마지막으로 QA 판정을 .agents/briefs/logs/$TaskId-qa-verdict.json 파일에 JSON으로 남겨 — doneWhen 배열에 각 항목을 {item, satisfied, evidence} 형태로 개별 기록하고, 하나라도 satisfied가 false면 verdict는 반드시 blocked여야 해. ⑤ 진행 가능하면 verdict를 pass, 차단성 이슈로 ⑤ 진행 불가면 verdict를 blocked(사유는 reason)로 기록해"
+        DefaultPrompt = "작업 $TaskId — 개발팀의 1차 구현과 자체 리뷰가 완료되었어. Handoff 확인하고 제로베이스에서 구현 및 코드 품질에 대해 리뷰해. 리뷰 시작 전 패킷의 Done When 항목을 전부 나열하고, 각 항목마다 실제 diff·코드 근거를 들어 충족 여부를 개별 확인해 — 근거 없이 통째로 '완료'로 넘기지 마(CFG024에서 Done When 항목 하나가 이런 식으로 누락됐었다). 발견한 결함은 직접 수정한 뒤 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ④를 갱신해. 마지막으로 QA 판정을 .agents/briefs/logs/$TaskId-qa-verdict.json 파일에 JSON으로 남겨 — schemaVersion은 2로, findings 배열에는 당신이 발견한 결함을 각각 {id, severity, doneWhenItem, description, fixedInQa, evidence} 형태로 개별 기록해(fixedInQa:true는 당신이 직접 수정했음을 뜻하며, 수정했더라도 findings에서 빠지면 안 된다). doneWhen 배열에 각 항목을 {item, satisfied, evidence} 형태로 개별 기록하고, 하나라도 satisfied가 false면 verdict는 반드시 blocked여야 해. 빈 findings 배열은 '결함을 하나도 발견하지 못했다'는 적극적 진술이며, 결함을 고쳐 놓고 findings를 비워 두는 것은 기록 위반으로 간주된다. ⑤ 진행 가능하면 verdict를 pass, 차단성 이슈로 ⑤ 진행 불가면 verdict를 blocked(사유는 reason)로 기록해"
         LogFile = "$TaskLogPrefix-qa.log"
         ReportFile = "$TaskLogPrefix-qa-last.md"
         VerdictFile = "$TaskLogPrefix-qa-verdict.json"
         KillOnHang = $true
         Retry = $true
-        # QA retries after a false hang, so use the same conservative threshold as impl.
-        HangSeconds = 600
+        # QA는 오탐 hang 후 재시도한다 — 임계는 stage-thresholds.json이 정본이다(impl와 동일하게 보수적).
     }
     'integration' = @{
         Command = ''
-        DefaultPrompt = "작업 $TaskId — 현재 프로세스가 하네스가 시작한 유일한 Integration 본체다. 별도 Integration을 디스패치하거나 PID·락을 감시하거나 프로세스를 종료하지 마. 개발1팀의 구현과 QA팀의 리뷰가 완료되었어. 제로베이스에서 문제없는지 리뷰해. scripts/verify.ps1 게이트 통과 + 실동작 E2E 검증까지 마치고, 문제없으면 Integration을 로컬 완료 처리하고 Pipeline Status ⑤와 history.md를 갱신한 뒤, 관련 변경을 커밋하고 원격에 push까지 자동으로 수행해(추가 승인 대기 없음). 패킷 Amendment에 자동 commit/push를 명시적으로 금지하는 지시가 있으면 그 지시를 따르고 사유를 남겨."
+        DefaultPrompt = "작업 $TaskId — 현재 프로세스가 하네스가 시작한 유일한 Integration 본체다. 별도 Integration을 디스패치하거나 PID·락을 감시하거나 프로세스를 종료하지 마. 개발1팀의 구현과 QA팀의 리뷰가 완료되었어. 제로베이스에서 문제없는지 리뷰해. scripts/verify.ps1 게이트 통과 + 실동작 E2E 검증까지 마치고, 문제없으면 Integration을 로컬 완료 처리하고 Pipeline Status ⑤와 history.md를 갱신한 뒤, 관련 변경을 커밋하고 원격에 push까지 자동으로 수행해(추가 승인 대기 없음). 패킷 Amendment에 자동 commit/push를 명시적으로 금지하는 지시가 있으면 그 지시를 따르고 사유를 남겨. 만약 QA가 pass를 줬지만 이 Integration 단계에서 새 결함(탈출 결함)을 발견하면, .agents/briefs/logs/$TaskId-integration-findings.json 파일에 schemaVersion 2로 {taskId, stage:'integration', findings:[{id, severity, doneWhenItem, description, fixedInQa, evidence}]} 형태로 기록해. 빈 findings 배열은 '탈출 결함을 발견하지 못했다'는 적극적 진술이며, 결함을 고쳐 놓고 findings를 비워 두는 것은 기록 위반으로 간주된다."
         LogFile = "$TaskLogPrefix-integration.log"
+        FindingsFile = "$TaskLogPrefix-integration-findings.json"
         KillOnHang = $false
         Retry = $false
-        HangSeconds = 900
+        # Integration은 git 진행 중 kill을 허용하는 3분법 경로를 쓰므로 임계가 길다 — stage-thresholds.json 정본.
     }
 }
 
+# ── 단계별 임계 정본 로드 (stage-thresholds.json) ────────────────────────────
+# CFG039: HangSeconds 같은 단계별 임계값은 dispatcher와 dashboard가 공유하는 파일에서 읽는다.
+# 어느 쪽도 숫자를 하드코딩하지 않는다. 로드 실패는 비상 기본값(위 $StageConfig에는 없음)보다
+# 안전 정지를 우선하지 않고 경고만 남긴다 — 단, 파일이 존재할 때만 덮어쓴다.
+$StageThresholdsPath = Join-Path $PSScriptRoot 'stage-thresholds.json'
+try {
+    if (Test-Path -LiteralPath $StageThresholdsPath) {
+        $stageThresholds = Get-Content -LiteralPath $StageThresholdsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($st in @('impl', 'qa', 'integration')) {
+            $t = $null
+            try { $t = $stageThresholds.stages.$st } catch { $t = $null }
+            if ($t -and $t.hangSeconds) { $StageConfig[$st].HangSeconds = [int]$t.hangSeconds }
+        }
+    }
+} catch {
+    Write-Log "stage-thresholds.json 로드 실패 — 단계별 임계를 파일 없이 진행합니다: $($_.Exception.Message)" WARN
+}
+
+#region 로깅·경로·사전진단
 # ── 헬퍼 ─────────────────────────────────────────────────────────────────────
 function Write-Log {
     param([string]$Message, [ValidateSet('INFO','WARN','ERROR','SUCCESS')]$Level='INFO')
@@ -394,6 +418,8 @@ function Build-ToolCommand {
         }
     }
 }
+#endregion 로깅·경로·사전진단
+#region hang 탐지·프로세스 트리·작업트리
 
 # UTF-8(BOM 없음) 임시 .sh를 만들어 반환. cd + 도구명령 + </dev/null + 로그 리다이렉트.
 function New-DispatchScript {
@@ -586,6 +612,8 @@ function Get-TreeState {
               FingerprintOk = (-not [string]::IsNullOrEmpty($fingerprint)) }
 }
 
+#endregion hang 탐지·프로세스 트리·작업트리
+#region 락·디스패치 게이트 마커
 # ── 동시 디스패치 락 (§3.9 강제) ─────────────────────────────────────────────
 # §3.9는 "같은 저장소에서 한 팀에 두 패킷을 동시에 디스패치하지 않는다"를 규정하지만
 # 지금까지 문서 규칙일 뿐이었다 — 위반해도 아무 저항이 없고, N≥2에서 무변경 감지·기준점
@@ -787,6 +815,8 @@ function Write-BlockedMarker {
         # 차단 마커를 못 써도 실제 락 판정은 바꾸지 않는다.
     }
 }
+#endregion 락·디스패치 게이트 마커
+#region hang 감시·시간 예산·스테이지 실행
 
 # 강제 종료(hang·하드 상한)가 트리에 무엇을 남겼는지 보고한다.
 # 재시도는 이 더러운 트리 위에서 그대로 다시 시작하므로, 반쪽 편집 위에 편집이 쌓일 수 있다.
@@ -857,6 +887,146 @@ function Get-SwitchableFailureClass {
     return ''
 }
 
+# =====================================================================
+# [hang 탐지 · 프로세스 트리] Invoke-StageProcess 분해 도우미(CFG040) —
+# 감시 한도·기준선·hang/하드 상한 판정을 순수 함수 경계로 분리한다.
+# =====================================================================
+# 스테이지 한도(hang/하드)와 감시 간격을 한 객체로 파생한다.
+# 하드 상한 유연화(2026-08-09 CS-024): 로그가 꾸준히 늘어나는 프로세스를 고정 상한에서 죽이면
+# 멀쩡히 일하던 구현이 통째로 날아간다(실측: 5분당 +3.9KB를 내던 모델이 30분에 강제 종료).
+# 상한에 닿았을 때 진행 중이면 $extendStep 만큼 연장하고, 절대 상한에서는 무조건 끊는다.
+# 노브를 늘리지 않으려고 연장 폭·절대 상한을 기본 상한에서 파생시킨다 —
+# -HardTimeoutMinutes 하나만 줄이면 셋 다 비례해 줄어 짧은 시간에 E2E 검증이 가능하다.
+function Resolve-StageLimits {
+    param([hashtable]$Config)
+
+    $hangLimit = if ($Config.HangSeconds) { $Config.HangSeconds } else { $HangWaitSeconds }
+    $hardLimit = if ($Config.HardTimeoutMinutes) { $Config.HardTimeoutMinutes } else { $HardTimeoutMinutes }
+    $hardMax = $hardLimit * 3
+    $extendStep = [Math]::Max(1, [Math]::Round($hardLimit / 3.0, 2))
+    # 로그 무변화(hang)/하드 상한 감시 간격: 요청한 임계값보다 늦게 감지하지 않도록 제한한다.
+    # 로그 파일이 아직 만들어지지 않은 경우도 무출력 상태이므로 0바이트로 취급한다.
+    $interval = [Math]::Min(10, [Math]::Max(1, $hangLimit))
+    return @{ HangLimit = $hangLimit; HardLimit = $hardLimit; HardMax = $hardMax; ExtendStep = $extendStep; Interval = $interval }
+}
+
+# 감시 루프의 기준선(하드/절대 상한, 무변화 추적, 연장 창, 하트비트, 기준 CPU)을 한 객체로 만든다.
+function New-StageMonitorBaseline {
+    param($Proc, [datetime]$StartedAt, [hashtable]$Limits)
+
+    $deadline = $StartedAt.AddMinutes($Limits.HardLimit)
+    $absoluteDeadline = $StartedAt.AddMinutes($Limits.HardMax)
+    $lastSize = 0; $lastLogChangedAt = $StartedAt; $hangReported = $false
+    # 연장 판정용 롤링 창 — $extendStep 마다 그 구간의 로그 증가량을 확정한다.
+    $windowStartAt = $StartedAt; $windowStartSize = 0; $lastWindowGrowth = 0
+    $idleStartedMetrics = Get-ProcessTreeMetrics -RootProcessId $Proc.Id
+    $lastHeartbeatAt = $StartedAt; $lastHeartbeatSize = 0; $lastHeartbeatCpu = $idleStartedMetrics.Cpu
+    return @{
+        Deadline = $deadline; AbsoluteDeadline = $absoluteDeadline
+        LastSize = $lastSize; LastLogChangedAt = $lastLogChangedAt; HangReported = $hangReported
+        WindowStartAt = $windowStartAt; WindowStartSize = $windowStartSize; LastWindowGrowth = $lastWindowGrowth
+        IdleStartedMetrics = $idleStartedMetrics
+        LastHeartbeatAt = $lastHeartbeatAt; LastHeartbeatSize = $lastHeartbeatSize; LastHeartbeatCpu = $lastHeartbeatCpu
+    }
+}
+
+# 연장 판정용 롤링 창 확정 — 창 길이를 연장 폭과 맞춰 "최근 한 연장분 동안 진행이 있었나"를 본다.
+function Advance-StageWindow {
+    param([hashtable]$Monitor, [long]$LogSize, [double]$ExtendStep)
+
+    if (((Get-Date) - $Monitor.WindowStartAt).TotalMinutes -ge $ExtendStep) {
+        $Monitor.LastWindowGrowth = [math]::Max(0, $LogSize - $Monitor.WindowStartSize)
+        $Monitor.WindowStartAt = Get-Date; $Monitor.WindowStartSize = $LogSize
+    }
+}
+
+# 300초마다 진행 상황을 한 줄로 남긴다. 재시도는 같은 단계 로그를 `>`로 다시 열어 크기가 줄
+# 수 있으므로 하트비트 증가량은 truncate 구간을 0으로 clamp하고, 종료된 자식이 다음 트리
+# 샘플에서 빠질 때의 음수 CPU 증분도 0으로 표시한다.
+function Write-StageHeartbeat {
+    param([string]$Stage, [datetime]$StartedAt, [hashtable]$Monitor, [long]$LogSize, $CpuNow, $metricsNow)
+
+    if (((Get-Date) - $Monitor.LastHeartbeatAt).TotalSeconds -lt 300) { return }
+    $elapsed = [math]::Floor(((Get-Date) - $StartedAt).TotalMinutes)
+    $logDelta = [math]::Max(0, $LogSize - $Monitor.LastHeartbeatSize)
+    $cpuDelta = [math]::Max(0, [math]::Round(($CpuNow - $Monitor.LastHeartbeatCpu).TotalSeconds, 2))
+    Write-Log "진행중 [$Stage] 경과 ${elapsed}분 · 로그 +${logDelta}B · 트리 CPU +${cpuDelta}s · CIM $($metricsNow.QueryMs)ms · CIM 실패 $($metricsNow.CimFailures)회" INFO
+    $Monitor.LastHeartbeatAt = Get-Date; $Monitor.LastHeartbeatSize = $LogSize; $Monitor.LastHeartbeatCpu = $CpuNow
+}
+
+# hang 판정 — CPU '증가 여부'가 아니라 '증가율'로 판정한다(2026-08-09 CS-024).
+# 정지한 프로세스도 폴링·타이머로 초당 수십 ms는 태우므로, 조금이라도 늘면 살려주던 기존 가드
+# (CS-022)는 사실상 hang을 영원히 잡지 못했다 — 실측에서 로그 +0B가 15분 이어지는 동안 코어
+# 1.5%만 태우던 프로세스가 하드 상한까지 20분을 그냥 버렸다. 판정 분기와 로그는 그대로 두고,
+# 강제 종료(Stop-ProcessTree + $policyKilled)만 호출자가 수행한다.
+# 반환 Action: wait=계속 대기 · kill-hang=KillOnHang 즉시 종료 · kill-git=git 부재 확인 즉시 종료.
+function Test-StageHangProgress {
+    param([string]$Stage, [hashtable]$Monitor, $metricsNow, [double]$noChange, [double]$noChangeText, [hashtable]$Config)
+
+    $idleCpuDelta = [math]::Max(0, [math]::Round(($metricsNow.Cpu - $Monitor.IdleStartedMetrics.Cpu).TotalSeconds, 2))
+    $idleIoDelta = [math]::Max(0, $metricsNow.Io - $Monitor.IdleStartedMetrics.Io)
+    $ratePct = [math]::Round(($idleCpuDelta / $noChange) * 100, 1)
+    $ioRate = [math]::Round($idleIoDelta / $noChange, 0)
+    $thresholdPct = [math]::Round($BusyCpuRate * 100, 1)
+    $decision = @{ Action = 'wait' }
+    if (($idleCpuDelta / $noChange) -ge $BusyCpuRate) {
+        # CS-022의 의도(조용히 계산 중인 에이전트를 죽이지 않는다)는 여기서 그대로 유지된다.
+        Write-Log "[$Stage] 로그 무변화 ${noChangeText}초지만 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}%) — 계산 중으로 보고 계속 대기" INFO
+        $Monitor.LastLogChangedAt = Get-Date; $Monitor.IdleStartedMetrics = $metricsNow; $Monitor.HangReported = $false
+    } elseif (($idleIoDelta / $noChange) -ge $BusyIoBytesPerSec) {
+        Write-Log "[$Stage] 로그 무변화 ${noChangeText}초지만 트리 I/O +${idleIoDelta}B(${ioRate}B/s) — I/O 작업 중으로 보고 계속 대기" INFO
+        $Monitor.LastLogChangedAt = Get-Date; $Monitor.IdleStartedMetrics = $metricsNow; $Monitor.HangReported = $false
+    } elseif ($Config.KillOnHang) {
+        Write-Log "⚠️ hang 감지 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 프로세스 트리 종료" WARN
+        $decision = @{ Action = 'kill-hang' }
+    } elseif (-not $Monitor.HangReported) {
+        # CFG031 3분법: KillOnHang=$false 스테이지에서 git 진행 중이면 대기, 아니면 즉시 종료.
+        # 특정 스테이지 이름을 하드코딩하지 않는다 — $Config.KillOnHang=$false인 모든 스테이지에 일반 적용.
+        $gitInFlight = Test-GitOperationInFlight -RepoRoot $RepoRoot -ChildProcessIds $metricsNow.ChildProcessIds
+        $wsMb = [math]::Round($metricsNow.WorkingSet / 1MB, 1)
+        $handles = $metricsNow.HandleCount
+        $childPids = if ($metricsNow.ChildProcessIds -and $metricsNow.ChildProcessIds.Count -gt 0) {
+            $metricsNow.ChildProcessIds -join ', '
+        } else {
+            '없음'
+        }
+        if ($gitInFlight) {
+            Write-Log "⚠️ hang 후보 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 점유 자원: WS ${wsMb}MB, 핸들 ${handles}개, 자식 PID: [$childPids]; git 작업 중이라 하드 상한까지 대기" WARN
+            $Monitor.HangReported = $true
+        } else {
+            Write-Log "⚠️ hang 감지 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 진행 중인 git 커밋/푸시 없음(index.lock 없음, git 자식 프로세스 없음) — 프로세스 트리 종료" WARN
+            $decision = @{ Action = 'kill-git' }
+        }
+    }
+    return $decision
+}
+
+# 하드 상한 판정 — 확정된 직전 창과 진행 중인 창 중 큰 증가량으로 정체를 판정하고,
+# 진행 중이면 연장해 돌아온다. 절대/고정 상한 초과일 때만 'die'를 반환하고
+# 강제 종료(Stop-ProcessTree + $policyKilled)는 호출자가 수행한다.
+function Test-StageDeadlineElapsed {
+    param([string]$Stage, [hashtable]$Monitor, [long]$LogSize, [hashtable]$Limits, [string]$logAbs, [datetime]$StartedAt, $CpuNow)
+
+    if ((Get-Date) -le $Monitor.Deadline) { return @{ Action = 'continue' } }
+    # 창 경계 직후에 상한이 걸려 진행 중인 프로세스가 "이번 창은 아직 0B"라는 이유로 죽는 일을 막는다.
+    $growth = [math]::Max($Monitor.LastWindowGrowth, [math]::Max(0, $LogSize - $Monitor.WindowStartSize))
+    if ($growth -ge $HardTimeoutProgressBytes -and $Monitor.Deadline -lt $Monitor.AbsoluteDeadline) {
+        $repeatedError = Get-RepeatedErrorObservation -LogPath $logAbs
+        if ($repeatedError.Repeated) {
+            Write-Log "⚠️ 반복 오류 관찰 [$Stage] — 최근 $($repeatedError.SampledLines)개 오류 줄 중 같은 문구 $($repeatedError.Count)회: $($repeatedError.Line) (경고 전용; 하드 상한 연장·종료 정책은 유지)" WARN
+        }
+        $Monitor.Deadline = $Monitor.Deadline.AddMinutes($Limits.ExtendStep)
+        if ($Monitor.Deadline -gt $Monitor.AbsoluteDeadline) { $Monitor.Deadline = $Monitor.AbsoluteDeadline }
+        $remain = [math]::Round(($Monitor.AbsoluteDeadline - (Get-Date)).TotalMinutes, 1)
+        Write-Log "⏳ 하드 상한 연장 [$Stage] — 최근 $($Limits.ExtendStep)분 로그 +${growth}B(진행 중), 절대 상한($($Limits.HardMax)분)까지 ${remain}분 남음" WARN
+        return @{ Action = 'continue' }
+    }
+    if ($Monitor.Deadline -ge $Monitor.AbsoluteDeadline) { $why = "절대 상한 $($Limits.HardMax)분 도달" }
+    else { $why = "최근 $($Limits.ExtendStep)분 로그 +${growth}B < ${HardTimeoutProgressBytes}B(정체)" }
+    $spent = [math]::Round(((Get-Date) - $StartedAt).TotalMinutes, 1)
+    return @{ Action = 'die'; Message = "⛔ 하드 상한 초과 [$Stage] — $why; 경과 ${spent}분, 로그 ${LogSize} B, 트리 CPU +$([math]::Round($CpuNow.TotalSeconds, 2))s; 프로세스 트리 종료" }
+}
+
 # 프로세스 1회 실행 + hang/하드타임아웃 감시.
 # 반환: 'ok'(정상 종료) · 'hang'(무변화로 강제 종료) · 'timeout'(하드 상한 초과로 강제 종료)
 # 정상 종료 시 [ref]$ExitCode 에 종료 코드를 담는다($null이면 읽기 실패).
@@ -865,26 +1035,21 @@ function Invoke-StageProcess {
 
     $logRel = $Config.LogFile
     $logAbs = Resolve-RepoPath $logRel
-    $hangLimit = if ($Config.HangSeconds) { $Config.HangSeconds } else { $HangWaitSeconds }
-    $hardLimit = if ($Config.HardTimeoutMinutes) { $Config.HardTimeoutMinutes } else { $HardTimeoutMinutes }
-    # 하드 상한 유연화(2026-08-09 CS-024): 로그가 꾸준히 늘어나는 프로세스를 고정 상한에서 죽이면
-    # 멀쩡히 일하던 구현이 통째로 날아간다(실측: 5분당 +3.9KB를 내던 모델이 30분에 강제 종료).
-    # 상한에 닿았을 때 진행 중이면 $extendStep 만큼 연장하고, 절대 상한에서는 무조건 끊는다.
-    # 노브를 늘리지 않으려고 연장 폭·절대 상한을 기본 상한에서 파생시킨다 —
-    # -HardTimeoutMinutes 하나만 줄이면 셋 다 비례해 줄어 짧은 시간에 E2E 검증이 가능하다.
-    $hardMax = $hardLimit * 3
-    $extendStep = [Math]::Max(1, [Math]::Round($hardLimit / 3.0, 2))
+    $limits = Resolve-StageLimits -Config $Config
+    $hangLimit = $limits.HangLimit
 
+    # 자식 셸 스크립트를 만든 뒤 숨김 창으로 기동한다. -WindowStyle Hidden과 -NoNewWindow는
+    # Windows PowerShell 5.1에서 같은 Start-Process에 함께 줄 수 없으므로, 별도 hidden child로
+    # 시작해야 콘솔도 노출하지 않고 parameter-set 예외도 피한다.
     $shPath = New-DispatchScript -ToolCmd $ToolCmd -LogFile $logRel -Suffix ([guid]::NewGuid().ToString("N"))
     $startedAt = $null
     # hang·하드 상한으로 "정책상" 끊은 경우를 표시한다. taskkill은 종료를 요청만 하므로 직후
     # $proc.HasExited가 아직 $false일 수 있어, 생존 여부로 중단을 판정하면 정상 종료 경로에서
     # 중단 로그가 뜨고 이미 죽은(재활용됐을 수도 있는) PID를 한 번 더 죽이게 된다.
     $policyKilled = $false
+    $proc = $null
     try {
         $startedAt = Get-Date
-        # -WindowStyle Hidden과 -NoNewWindow는 Windows PowerShell 5.1에서 같은 Start-Process에
-        # 함께 줄 수 없다. 별도 hidden child로 시작해야 콘솔도 노출하지 않고 parameter-set 예외도 피한다.
         $proc = Start-Process -FilePath $script:BashExe -WindowStyle Hidden -ArgumentList @($shPath) -PassThru
         $script:ActiveChildProcessId = $proc.Id; $script:ActiveChildStage = $Stage
         Write-StageState -Stage $Stage -Cycle $Cycle -State 'running' -ProcessId $proc.Id -EvidencePaths @($logRel) -Reason 'child process started' -Model $Model
@@ -894,18 +1059,9 @@ function Invoke-StageProcess {
         Write-Log "진행 시작 [$Stage] (PID: $($proc.Id), 명령: $ToolCmd) — 실시간: Get-Content $logRel -Wait" INFO
 
         # 로그 무변화(hang) 감지 + 하드 상한 + 프로세스 종료 대기: 단일 루프로 전 구간 감시.
-        # 요청한 임계값보다 늦게 감지하지 않도록 점검 간격을 제한한다. 로그 파일이 아직
-        # 만들어지지 않은 경우도 무출력 상태이므로 0바이트로 취급한다.
-        $deadline = $startedAt.AddMinutes($hardLimit)
-        $absoluteDeadline = $startedAt.AddMinutes($hardMax)
-        $lastSize = 0; $lastLogChangedAt = $startedAt; $hangReported = $false
-        # 연장 판정용 롤링 창 — $extendStep 마다 그 구간의 로그 증가량을 확정한다.
-        $windowStartAt = $startedAt; $windowStartSize = 0; $lastWindowGrowth = 0
-        $idleStartedMetrics = Get-ProcessTreeMetrics -RootProcessId $proc.Id
-        $lastHeartbeatAt = $startedAt; $lastHeartbeatSize = 0; $lastHeartbeatCpu = $idleStartedMetrics.Cpu
-        $interval = [Math]::Min(10, [Math]::Max(1, $hangLimit))
+        $monitor = New-StageMonitorBaseline -Proc $proc -StartedAt $startedAt -Limits $limits
         while (-not $proc.HasExited) {
-            Start-Sleep -Seconds $interval
+            Start-Sleep -Seconds $limits.Interval
             # 대기 중 정상 종료된 무출력 프로세스를 hang 임계 도달로 오판하지 않는다.
             # 특히 종료 시점이 임계 직전이면 이 재확인 없이 아래 noChange가 임계에 닿아
             # 이미 끝난 정상 프로세스를 'hang'으로 반환할 수 있다.
@@ -913,106 +1069,45 @@ function Invoke-StageProcess {
             if ($proc.HasExited) { break }
             Write-StageState -Stage $Stage -Cycle $Cycle -State 'running' -ProcessId $proc.Id -EvidencePaths @($logRel) -Reason 'watcher heartbeat' -Model $Model
             $sz = if (Test-Path $logAbs) { (Get-Item $logAbs).Length } else { 0 }
-            $logChanged = $sz -ne $lastSize
-            if ($logChanged) { $lastLogChangedAt = Get-Date; $lastSize = $sz; $hangReported = $false }
-            $noChange = [math]::Max(0, ((Get-Date) - $lastLogChangedAt).TotalSeconds)
+            $logChanged = $sz -ne $monitor.LastSize
+            if ($logChanged) { $monitor.LastLogChangedAt = Get-Date; $monitor.LastSize = $sz; $monitor.HangReported = $false }
+            $noChange = [math]::Max(0, ((Get-Date) - $monitor.LastLogChangedAt).TotalSeconds)
             # 아래에서 $noChange를 증가율의 '분모'로 그대로 쓰므로 값 자체를 반올림하지 않는다.
             # 사람이 읽는 로그 문구에만 반올림한 별도 변수를 쓴다.
             $noChangeText = [math]::Round($noChange)
 
             # 자식 에이전트/도구를 포함한 트리 CPU. 무변화 구간의 '증가율'로 hang을 판정하므로,
-            # 기준점($idleStartedCpu)은 로그가 변한 시점에만 리셋한다 — CPU 변화로도 리셋하면
+            # 기준점(IdleStartedMetrics)은 로그가 변한 시점에만 리셋한다 — CPU 변화로도 리셋하면
             # 아래 계산이 늘 직전 한 틱만 보게 되어 판정이 무의미해진다.
             $metricsNow = Get-ProcessTreeMetrics -RootProcessId $proc.Id
-            $cpuNow = $metricsNow.Cpu
-            if ($logChanged) { $idleStartedMetrics = $metricsNow }
+            if ($logChanged) { $monitor.IdleStartedMetrics = $metricsNow }
 
-            # 연장 판정용 창 확정. 창 길이를 연장 폭과 맞춰 "최근 한 연장분 동안 진행이 있었나"를 본다.
-            if (((Get-Date) - $windowStartAt).TotalMinutes -ge $extendStep) {
-                $lastWindowGrowth = [math]::Max(0, $sz - $windowStartSize)
-                $windowStartAt = Get-Date; $windowStartSize = $sz
-            }
-
-            if (((Get-Date) - $lastHeartbeatAt).TotalSeconds -ge 300) {
-                $elapsed = [math]::Floor(((Get-Date) - $startedAt).TotalMinutes)
-                # 재시도는 같은 단계 로그를 `>`로 다시 열어 크기가 줄 수 있다.
-                # 하트비트는 증가량을 표시하므로 truncate 구간은 0으로 clamp한다.
-                $logDelta = [math]::Max(0, $sz - $lastHeartbeatSize)
-                # 종료된 자식은 다음 트리 샘플에서 빠질 수 있으므로 음수 증분은 0으로 표시한다.
-                $cpuDelta = [math]::Max(0, [math]::Round(($cpuNow - $lastHeartbeatCpu).TotalSeconds, 2))
-                Write-Log "진행중 [$Stage] 경과 ${elapsed}분 · 로그 +${logDelta}B · 트리 CPU +${cpuDelta}s · CIM $($metricsNow.QueryMs)ms · CIM 실패 $($metricsNow.CimFailures)회" INFO
-                $lastHeartbeatAt = Get-Date; $lastHeartbeatSize = $sz; $lastHeartbeatCpu = $cpuNow
-            }
+            Advance-StageWindow -Monitor $monitor -LogSize $sz -ExtendStep $limits.ExtendStep
+            Write-StageHeartbeat -Stage $Stage -StartedAt $startedAt -Monitor $monitor -LogSize $sz -CpuNow $metricsNow.Cpu -metricsNow $metricsNow
 
             if ($noChange -ge $hangLimit) {
-                # CPU '증가 여부'가 아니라 '증가율'로 판정한다(2026-08-09 CS-024).
-                # 정지한 프로세스도 폴링·타이머로 초당 수십 ms는 태우므로, 조금이라도 늘면 살려주던
-                # 기존 가드(CS-022)는 사실상 hang을 영원히 잡지 못했다 — 실측에서 로그 +0B가 15분
-                # 이어지는 동안 코어 1.5%만 태우던 프로세스가 하드 상한까지 20분을 그냥 버렸다.
-                $idleCpuDelta = [math]::Max(0, [math]::Round(($cpuNow - $idleStartedMetrics.Cpu).TotalSeconds, 2))
-                $idleIoDelta = [math]::Max(0, $metricsNow.Io - $idleStartedMetrics.Io)
-                $ratePct = [math]::Round(($idleCpuDelta / $noChange) * 100, 1)
-                $ioRate = [math]::Round($idleIoDelta / $noChange, 0)
-                $thresholdPct = [math]::Round($BusyCpuRate * 100, 1)
-                if (($idleCpuDelta / $noChange) -ge $BusyCpuRate) {
-                    # CS-022의 의도(조용히 계산 중인 에이전트를 죽이지 않는다)는 여기서 그대로 유지된다.
-                    Write-Log "[$Stage] 로그 무변화 ${noChangeText}초지만 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}%) — 계산 중으로 보고 계속 대기" INFO
-                    $lastLogChangedAt = Get-Date; $idleStartedMetrics = $metricsNow; $hangReported = $false
-                } elseif (($idleIoDelta / $noChange) -ge $BusyIoBytesPerSec) {
-                    Write-Log "[$Stage] 로그 무변화 ${noChangeText}초지만 트리 I/O +${idleIoDelta}B(${ioRate}B/s) — I/O 작업 중으로 보고 계속 대기" INFO
-                    $lastLogChangedAt = Get-Date; $idleStartedMetrics = $metricsNow; $hangReported = $false
-                } elseif ($Config.KillOnHang) {
-                    Write-Log "⚠️ hang 감지 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 프로세스 트리 종료" WARN
+                $hangDecision = Test-StageHangProgress -Stage $Stage -Monitor $monitor -metricsNow $metricsNow -noChange $noChange -noChangeText $noChangeText -Config $Config
+                if ($hangDecision.Action -eq 'kill-hang') {
                     Stop-ProcessTree $proc.Id
                     $policyKilled = $true
                     Write-Log "강제 종료 [$Stage] (PID: $($proc.Id), 경과 $([math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1))초)" WARN
                     return 'hang'
-                } elseif (-not $hangReported) {
-                    # CFG031 3분법: KillOnHang=$false 스테이지에서 git 진행 중이면 대기, 아니면 즉시 종료.
-                    # 특정 스테이지 이름을 하드코딩하지 않는다 — $Config.KillOnHang=$false인 모든 스테이지에 일반 적용.
-                    $gitInFlight = Test-GitOperationInFlight -RepoRoot $RepoRoot -ChildProcessIds $metricsNow.ChildProcessIds
-                    $wsMb = [math]::Round($metricsNow.WorkingSet / 1MB, 1)
-                    $handles = $metricsNow.HandleCount
-                    $childPids = if ($metricsNow.ChildProcessIds -and $metricsNow.ChildProcessIds.Count -gt 0) {
-                        $metricsNow.ChildProcessIds -join ', '
-                    } else {
-                        '없음'
-                    }
-                    if ($gitInFlight) {
-                        Write-Log "⚠️ hang 후보 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 점유 자원: WS ${wsMb}MB, 핸들 ${handles}개, 자식 PID: [$childPids]; git 작업 중이라 하드 상한까지 대기" WARN
-                        $hangReported = $true
-                    } else {
-                        Write-Log "⚠️ hang 감지 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 진행 중인 git 커밋/푸시 없음(index.lock 없음, git 자식 프로세스 없음) — 프로세스 트리 종료" WARN
-                        Stop-ProcessTree $proc.Id
-                        $policyKilled = $true
-                        Write-Log "강제 종료 [$Stage] (PID: $($proc.Id), 경과 $([math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1))초)" WARN
-                        return 'hang'
-                    }
                 }
-            }
-            if ((Get-Date) -gt $deadline) {
-                # 확정된 직전 창과 진행 중인 창 중 큰 쪽을 본다 — 창 경계 직후에 상한이 걸려
-                # 진행 중인 프로세스가 "이번 창은 아직 0B"라는 이유로 죽는 일을 막는다.
-                $growth = [math]::Max($lastWindowGrowth, [math]::Max(0, $sz - $windowStartSize))
-                if ($growth -ge $HardTimeoutProgressBytes -and $deadline -lt $absoluteDeadline) {
-                    $repeatedError = Get-RepeatedErrorObservation -LogPath $logAbs
-                    if ($repeatedError.Repeated) {
-                        Write-Log "⚠️ 반복 오류 관찰 [$Stage] — 최근 $($repeatedError.SampledLines)개 오류 줄 중 같은 문구 $($repeatedError.Count)회: $($repeatedError.Line) (경고 전용; 하드 상한 연장·종료 정책은 유지)" WARN
-                    }
-                    $deadline = $deadline.AddMinutes($extendStep)
-                    if ($deadline -gt $absoluteDeadline) { $deadline = $absoluteDeadline }
-                    $remain = [math]::Round(($absoluteDeadline - (Get-Date)).TotalMinutes, 1)
-                    Write-Log "⏳ 하드 상한 연장 [$Stage] — 최근 ${extendStep}분 로그 +${growth}B(진행 중), 절대 상한(${hardMax}분)까지 ${remain}분 남음" WARN
-                } else {
-                    if ($deadline -ge $absoluteDeadline) { $why = "절대 상한 ${hardMax}분 도달" }
-                    else { $why = "최근 ${extendStep}분 로그 +${growth}B < ${HardTimeoutProgressBytes}B(정체)" }
-                    $spent = [math]::Round(((Get-Date) - $startedAt).TotalMinutes, 1)
-                    Write-Log "⛔ 하드 상한 초과 [$Stage] — $why; 경과 ${spent}분, 로그 $sz B, 트리 CPU +$([math]::Round($cpuNow.TotalSeconds, 2))s; 프로세스 트리 종료" ERROR
+                if ($hangDecision.Action -eq 'kill-git') {
                     Stop-ProcessTree $proc.Id
                     $policyKilled = $true
-                    Write-Log "강제 종료 [$Stage] (PID: $($proc.Id), 경과 $([math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1))초)" ERROR
-                    return 'timeout'
+                    Write-Log "강제 종료 [$Stage] (PID: $($proc.Id), 경과 $([math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1))초)" WARN
+                    return 'hang'
                 }
+            }
+
+            $deadlineDecision = Test-StageDeadlineElapsed -Stage $Stage -Monitor $monitor -LogSize $sz -Limits $limits -logAbs $logAbs -StartedAt $startedAt -CpuNow $metricsNow.Cpu
+            if ($deadlineDecision.Action -eq 'die') {
+                Write-Log $deadlineDecision.Message ERROR
+                Stop-ProcessTree $proc.Id
+                $policyKilled = $true
+                Write-Log "강제 종료 [$Stage] (PID: $($proc.Id), 경과 $([math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1))초)" ERROR
+                return 'timeout'
             }
         }
 
@@ -1044,6 +1139,8 @@ function Invoke-StageProcess {
     }
 }
 
+#endregion hang 감시·시간 예산·스테이지 실행
+#region 모델 체인·사이클 원장·attempt 로그
 function Resolve-ModelChain {
     param([hashtable]$Config, [string]$Stage)
 
@@ -1237,6 +1334,8 @@ function Update-LatestAttemptLog {
     [System.IO.File]::Copy($attemptAbs, $latestAbs, $true)
 }
 
+#endregion 모델 체인·사이클 원장·attempt 로그
+#region 승인·continuation·시도 판정·스테이지 원장
 # CFG017: 승인 대기 기록 경로 — 실패 마커·차단 마커와 분리된 별도 레코드다. 대시보드는 이 파일을
 # 읽어 APPROVAL REQUIRED를 띄우고, 감사는 이 JSON이 곧 정확 target·증거 링크의 정본이다.
 function Get-ApprovalRecordPath {
@@ -1568,6 +1667,8 @@ function Record-StageAttempt {
     return @{ Blocked = $false; Count = $count; MaxAllowed = $maxAllowed }
 }
 
+#endregion 승인·continuation·시도 판정·스테이지 원장
+#region 원장 게이트·패킷·라우터 파싱·관측
 # CFG037: QA 단계가 완료된 후 qa-verdict.json이 없으면 하네스가 직접 기록한다.
 # QA 모델이 프롬프트 지시를 따르지 않거나 크래시·hang으로 파일 작성 전에 종료되면
 # "verdict=fail"이 영원히 기록되지 않아 대시보드가 실제 QA 실패를 숨기는 결함이 있었다
@@ -1587,13 +1688,17 @@ function Write-SyntheticQaVerdict {
         $reasonText = [string]$Result.FailureReason
     }
     $value = [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         taskId = $TaskId
         stage = 'qa'
         cycle = $CycleNumber
         verdict = $verdictValue
         reason = $reasonText
         doneWhen = @()
+        findings = @()
+        # CFG038: 합성 pass는 findings:[] 로 "무결함"으로 오독될 수 있으므로, 집계기가
+        # "결함 없음"과 "모델이 기록하지 않음"을 구분하도록 측정 불가 플래그를 남긴다.
+        findingsUnmeasured = $true
         synthetic = $true
         syntheticReason = 'model did not write qa-verdict.json; harness recorded outcome'
         observedAt = [datetime]::UtcNow.ToString('o')
@@ -1777,6 +1882,49 @@ function Get-PacketGateTier {
     return 'full'
 }
 
+# CFG041: 신규 패킷의 `Planning Challenge Review` 블록 상태를 파싱한다. 기존 ①~⑤ Pipeline Status에는
+# 편입하지 않고, 미해소(`requested`)·결손·오류 Decision을 파서 수준에서 fail-closed로 판정한다.
+# 레거시(블록 없음) 패킷은 호환성을 위해 항상 Ready=true로 통과시킨다.
+function Get-PlanningChallengeReviewStatus {
+    param([string]$PacketPath)
+    $result = [ordered]@{
+        Present = $false
+        Legacy = $true
+        Decision = $null
+        Ready = $true
+        Reason = $null
+    }
+    if (-not $PacketPath -or -not (Test-Path -LiteralPath $PacketPath)) { return [pscustomobject]$result }
+
+    $text = Get-Content -LiteralPath $PacketPath -Raw -Encoding UTF8
+    $section = [regex]::Match($text, '(?ms)^##\s+Planning Challenge Review\s*$\r?\n(.*?)(?=^##\s+|\z)')
+    if (-not $section.Success) { return [pscustomobject]$result }
+
+    $result.Present = $true
+    $result.Legacy = $false
+    $decision = [regex]::Match($section.Groups[1].Value, '(?im)^-\s*Decision\s*:\s*`?([^`\r\n]+?)`?\s*$')
+    if (-not $decision.Success) {
+        $result.Ready = $false
+        $result.Reason = 'planning_challenge_decision_missing'
+        return [pscustomobject]$result
+    }
+
+    $result.Decision = $decision.Groups[1].Value.Trim().ToLowerInvariant()
+    if ($result.Decision -eq 'not-required' -or $result.Decision -eq 'completed') { return [pscustomobject]$result }
+    $result.Ready = $false
+    $result.Reason = if ($result.Decision -eq 'requested') { 'planning_challenge_pending' } else { 'planning_challenge_decision_invalid' }
+    return [pscustomobject]$result
+}
+
+function Assert-PlanningChallengeReviewReady {
+    param([string]$PacketPath)
+    $status = Get-PlanningChallengeReviewStatus -PacketPath $PacketPath
+    if (-not $status.Ready) {
+        throw "Planning Challenge Review blocks implementation: $($status.Reason) (Decision=$($status.Decision))"
+    }
+    return $status
+}
+
 # 역할 판정은 Pipeline Status 섹션에만 한정한다. 다른 체크박스는 검증·인수인계 목록일 수 있다.
 function Get-PacketPipelineStatus {
     param([string]$PacketPath)
@@ -1932,7 +2080,38 @@ function Test-PipelineStageUpdated {
     # 하네스가 이미 확보한 "단계 성공(verify.ps1 통과)" 근거로 대신 체크한다 — WARN만 남기고 방치하지 않는다.
     $indexes = @($unchecked | ForEach-Object { [int]$_.Index })
     $updated = Set-PacketCheckboxes -PacketPath $PacketPath -Indexes $indexes -Annotation "(자동 갱신 — 하네스가 $Stage 단계 성공 확인 후 대신 체크, 구현 에이전트 누락분)"
+    # CFG038: ④(QA)를 하네스가 대신 체크했으면 'QA 판단 없음'을 verdict에 남긴다 — QA가 아무
+    # 판단도 쓰지 않아도 pass와 구분되도록(실측 CFG028·CFG032·CFG035).
+    if ($Stage -eq 'qa') { Set-QaVerdictStageHarnessFlag -CheckedIndexes $indexes }
     if ($updated) { Write-Log "✅ [$Stage] Pipeline Status 자동 갱신 완료" SUCCESS }
+}
+
+# CFG038: 하네스가 ④(QA) 체크박스를 대신 체크한 경우, verdict에 stageCheckedByHarness=true 를 남긴다.
+# verdict가 있으면 그 안에, 없으면 별도 상태 파일(.agents/briefs/logs/$TaskId-qa-stage-checked.json)에 기록한다.
+function Set-QaVerdictStageHarnessFlag {
+    param([int[]]$CheckedIndexes)
+    if (4 -notin $CheckedIndexes) { return }
+    $verdictRel = $StageConfig['qa'].VerdictFile
+    $verdictAbs = Resolve-RepoPath $verdictRel
+    if (Test-Path -LiteralPath $verdictAbs) {
+        try {
+            $obj = Get-Content -LiteralPath $verdictAbs -Raw -Encoding UTF8 | ConvertFrom-Json
+            $obj | Add-Member -NotePropertyName stageCheckedByHarness -NotePropertyValue $true -Force
+            $temporary = "$verdictAbs.$([guid]::NewGuid().ToString('N')).tmp"
+            [System.IO.File]::WriteAllText($temporary, ($obj | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($true)))
+            Move-Item -LiteralPath $temporary -Destination $verdictAbs -Force
+            Write-Log "⚠️ [qa] verdict에 stageCheckedByHarness=true 기록 — 하네스가 ④를 대신 체크했습니다" WARN
+        } catch {
+            Write-Log "[qa] stageCheckedByHarness 기록 실패($verdictAbs): $($_.Exception.Message)" WARN
+        }
+    } else {
+        $stateAbs = Resolve-RepoPath "$LogDir/$TaskId-qa-stage-checked.json"
+        $state = [ordered]@{ schemaVersion = 1; taskId = $TaskId; stage = 'qa'; stageCheckedByHarness = $true; checkedAt = [datetime]::UtcNow.ToString('o') }
+        $temporary = "$stateAbs.$([guid]::NewGuid().ToString('N')).tmp"
+        [System.IO.File]::WriteAllText($temporary, ($state | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($true)))
+        Move-Item -LiteralPath $temporary -Destination $stateAbs -Force
+        Write-Log "⚠️ [qa] verdict 부재 — 별도 상태 파일에 stageCheckedByHarness=true 기록" WARN
+    }
 }
 
 # CFG026: 착수 컨텍스트 바이트 수 측정. 모델이 실제로 로드하는 문서(전역 CLAUDE.md, 프로젝트
@@ -2006,81 +2185,69 @@ function Measure-ContextBytes {
 
 # 한 단계 디스패치 + hang 감지 + 판정. 성공(종료 코드 정상 + verify 통과) 시 $true.
 # ModelFallback이 있는 단계(impl)는 모델을 바꿔가며 순서대로 시도한다 — 같은 모델을 두 번 부르지 않는다.
-function Dispatch-Stage {
-    param([string]$Stage, [string]$PromptOverride)
-    $config = $StageConfig[$Stage]
-    $logRel = $config.LogFile
+#endregion 원장 게이트·패킷·라우터 파싱·관측
+#region 디스패치 본체 — ②③④⑤ 단계 기동·감시·판정 오케스트레이션 (CFG040 분해)
+# =====================================================================
+# [디스패치 본체] Dispatch-Stage 분해 도우미(CFG040) — 단계 디스패치의
+# 준비·슬롯 해석·종결을 책임 단위로 분리한다. 결정 로직만 도우미에 두고,
+# continue/break 흐름 제어는 의미상 호출자인 Dispatch-Stage가 수행한다.
+# =====================================================================
+# -DryRun: 임시 파일을 남기지 않고 실제로 실행될 .sh 본문을 그대로 보여준다(체인 1번째 모델 기준).
+function Show-StageDryRun {
+    param([string]$Stage, [hashtable]$Config, [string]$LogRel, [string]$PromptOverride, [string]$Model, [bool]$BypassToolPermissions)
 
-    # CFG026: 스테이지 시작 시 착수 컨텍스트 크기를 로그에 한 줄로 남긴다.
-    Measure-ContextBytes -Stage $Stage
-
-    # CFG025: 헤드리스 antigravity는 명령 내용과 무관하게 모든 run_command를 승인 대기로 거부한다
-    # (BOM 수정·verify.ps1 실행·sync-configs.ps1 Push 등에서 반복 관측 — 2026-08-19). QA는 이미
-    # "직접 수정" 권한을 가진 신뢰된 단계이므로, 사용자 승인(2026-08-19)에 따라 QA 단계는 항상
-    # --dangerously-skip-permissions를 부여해 이 실패 클래스 자체를 구조적으로 제거한다.
-    if ($Stage -eq 'qa') { $BypassToolPermissions = $true }
-
-    # CFG024: 디스패치 시작 전 원장/차단 마커 검사 — 이미 상한에 도달한 경우 모델을 띄우기 전에 즉시 거부한다.
-    $allowed = Test-StageDispatchAllowed -Stage $Stage
-    if (-not $allowed.Allowed) {
-        $failureReason = "디스패치 거부: $($allowed.Reason)"
-        Write-Log "❌ [$Stage] $failureReason" ERROR
-        return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $null }
+    $toolCmd = Build-ToolCommand -Config $Config -Stage $Stage -PromptOverride $PromptOverride -Model $Model -BypassToolPermissions:$BypassToolPermissions
+    Write-Log "작업 $TaskId [$Stage] 디스패치" INFO
+    Write-Log "명령: $toolCmd" INFO
+    Write-Log "로그: $LogRel" INFO
+    $shPath = New-DispatchScript -ToolCmd $toolCmd -LogFile $LogRel -Suffix "dryrun-$TaskId-$Stage"
+    try {
+        Write-Log "[DryRun] 실행 생략 — 생성될 bash 스크립트:" WARN
+        Write-Host ([System.IO.File]::ReadAllText($shPath, [System.Text.UTF8Encoding]::new($false)))
+    } finally {
+        Remove-Item $shPath -ErrorAction SilentlyContinue
     }
+    return @{ Success = $true; FailureReason = $null; QaDispatchedAt = $null }
+}
 
-    $models = Resolve-ModelChain -Config $config -Stage $Stage
-    $qaDispatchedAt = $null
-
-    if ($models.Count -eq 0) {
-        $failureReason = '모델 체인이 비어 있음 — 단계 구성 오류'
-        Write-Log "❌ [$Stage] $failureReason" ERROR
-        return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $null }
-    }
-
-    if ($DryRun) {
-        # 임시 파일을 남기지 않고 실제로 실행될 .sh 본문을 그대로 보여준다(체인 1번째 모델 기준).
-        $toolCmd = Build-ToolCommand -Config $config -Stage $Stage -PromptOverride $PromptOverride -Model $models[0] -BypassToolPermissions:$BypassToolPermissions
-        Write-Log "작업 $TaskId [$Stage] 디스패치" INFO
-        Write-Log "명령: $toolCmd" INFO
-        Write-Log "로그: $logRel" INFO
-        $shPath = New-DispatchScript -ToolCmd $toolCmd -LogFile $logRel -Suffix "dryrun-$TaskId-$Stage"
-        try {
-            Write-Log "[DryRun] 실행 생략 — 생성될 bash 스크립트:" WARN
-            Write-Host ([System.IO.File]::ReadAllText($shPath, [System.Text.UTF8Encoding]::new($false)))
-        } finally {
-            Remove-Item $shPath -ErrorAction SilentlyContinue
-        }
-        return @{ Success = $true; FailureReason = $null; QaDispatchedAt = $null }
-    }
+# 디스패치 준비 전반 a: 로그 디렉터리·와처 로그·durable 사이클 할당·starting 상태 원장.
+# CFG017: fresh direct 디스패치마다 durable 사이클을 할당한다. 같은 TaskId/단계의 재디스패치는
+# 단조 증가하는 새 사이클 번호를 받고, 과거 사이클의 attempt 로그는 이름에 cycle이 박혀 불변으로 남는다.
+function Initialize-StageDispatch {
+    param([string]$Stage, [hashtable]$Config, [string]$LogRel)
 
     $logDirAbs = Resolve-RepoPath $LogDir
     if (-not (Test-Path $logDirAbs)) { New-Item -ItemType Directory -Path $logDirAbs -Force | Out-Null }
     Initialize-WatcherLog -Stage $Stage
-
-    # CFG017: fresh direct 디스패치마다 durable 사이클을 할당한다. 같은 TaskId/단계의 재디스패치는
-    # 단조 증가하는 새 사이클 번호를 받고, 과거 사이클의 attempt 로그는 이름에 cycle이 박혀 불변으로 남는다.
     $cycle = New-DispatchCycle -Stage $Stage
-    Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'starting' -ProcessId $PID -EvidencePaths @($logRel) -Reason 'dispatcher accepted stage' -Model $null
+    Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'starting' -ProcessId $PID -EvidencePaths @($LogRel) -Reason 'dispatcher accepted stage' -Model $null
     Write-Log "디스패치 사이클: $($cycle.Token) (id $($cycle.Id))" INFO
+    return $cycle
+}
 
-    # ④ QA: 이전 실행이 남긴 verdict·보고서를 먼저 지운다.
-    # 이번 실행이 verdict를 쓰지 못하고 끝났을 때 직전 실행의 pass를 재사용해 ⑤로 넘어가는 오탐을 막는다.
-    if ($Stage -eq 'qa') {
-        foreach ($rel in @($config.VerdictFile, $config.ReportFile)) {
-            $abs = Resolve-RepoPath $rel
-            if (Test-Path $abs) {
-                Remove-Item $abs -Force
-                Write-Log "이전 실행 산출물 삭제: $rel" INFO
-            }
+# 디스패치 준비 전반 b: ④ QA 이전 실행 verdict·보고서 정리.
+# 이번 실행이 verdict를 쓰지 못하고 끝났을 때 직전 실행의 pass를 재사용해 ⑤로 넘어가는 오탐을 막는다.
+function Clear-QaArtifacts {
+    param([string]$Stage, [hashtable]$Config)
+
+    if ($Stage -ne 'qa') { return $null }
+    foreach ($rel in @($Config.VerdictFile, $Config.ReportFile)) {
+        $abs = Resolve-RepoPath $rel
+        if (Test-Path $abs) {
+            Remove-Item $abs -Force
+            Write-Log "이전 실행 산출물 삭제: $rel" INFO
         }
-        $qaDispatchedAt = Get-Date
     }
+    return (Get-Date)
+}
 
-    Invoke-SessionHealthCheck -Stage $Stage
+# 읽기 전용 preflight 게이트 — PATH·버전·project mapping 진단(외부 설정 무변경).
+# CFG017: Antigravity 어댑터 단계는 실행 전 읽기 전용 preflight로 PATH·버전·project mapping을
+# 진단한다. 이 진단은 외부 설정(설치·매핑·환경 변수)을 절대 변경하지 않는다.
+# CFG028: AdapterChain이 존재하면 슬롯 0 실패 시에도 후속 슬롯(opencode 등) 시도를 위해 즉시 실패시키지 않고 경고 후 계속 진행.
+function Invoke-StagePreflightGate {
+    param([string]$Stage, [hashtable]$config, $Cycle, [string]$LogRel, $qaDispatchedAt)
 
-    # CFG017: Antigravity 어댑터 단계는 실행 전 읽기 전용 preflight로 PATH·버전·project mapping을
-    # 진단한다. 이 진단은 외부 설정(설치·매핑·환경 변수)을 절대 변경하지 않는다.
-    # CFG028: AdapterChain이 존재하면 슬롯 0 실패 시에도 후속 슬롯(opencode 등) 시도를 위해 즉시 실패시키지 않고 경고 후 계속 진행.
     $preflight = Test-AntigravityPreflight -Stage $Stage
     if (-not $preflight.Ready) {
         $reason = "Antigravity preflight 실패: $($preflight.Warnings -join '; ')"
@@ -2088,262 +2255,198 @@ function Dispatch-Stage {
             Write-Log "⚠️ [$Stage] $reason (AdapterChain 설정됨 — 슬롯별 폴백을 위해 모델 루프 계속 진행)" WARN
         } else {
             Write-Log "❌ [$Stage] $reason" ERROR
-            Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $reason -Model $null
-            return @{ Success = $false; FailureReason = $reason; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
+            Write-StageState -Stage $Stage -Cycle $Cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($LogRel) -Reason $reason -Model $null
+            return @{ Abort = $true; Reason = $reason }
         }
     }
     if ($config.Adapter -eq 'antigravity' -and $preflight.Executable) { $config.Executable = $preflight.Executable }
     if ($preflight.Diagnostics.Count -gt 0) { Write-Log "[$Stage] preflight: $($preflight.Diagnostics -join ' | ')" INFO }
+    return @{ Abort = $false }
+}
 
-    # CFG024: 구현(②) 단계 전 스냅숏 확보 (프로토콜 오염 감지용)
-    $packetsBefore = if ($Stage -eq 'impl') { Get-PacketFileSnapshot } else { @() }
-    $routerBefore = if ($Stage -eq 'impl') { Get-RouterTableSnapshot } else { @{} }
+# 슬롯별 어댑터 해석 — qa·integration 폴백 체인은 슬롯마다 어댑터가 달라질 수 있다(예: gemini-qa는
+# antigravity → opencode). AdapterChain이 있으면 이번 슬롯의 어댑터로 $config를 갱신하고,
+# antigravity면 ProjectId·Executable도 그 슬롯 기준으로 다시 확인한다.
+# CFG028: antigravity 매핑 실패 시 unhandled exception 방지 -> WARN + 다음 슬롯 모델로 전환.
+function Resolve-SlotAdapter {
+    param([hashtable]$config, [string]$Stage, [int]$ModelIndex, [string]$Model, [string]$RepoRoot)
 
-    $before = Get-TreeState
-    # CFG018: provider print timeout can be resumed, but only inside one logical run.
-    # The existing hard-timeout absolute maximum remains the total budget across segments.
-    $logicalStartedAt = Get-Date
-    $logicalHardLimit = if ($config.HardTimeoutMinutes) { $config.HardTimeoutMinutes } else { $HardTimeoutMinutes }
-    $logicalAbsoluteDeadline = $logicalStartedAt.AddMinutes($logicalHardLimit * 3)
-    $continuationCount = 0
+    if (-not ($config.AdapterChain -and $ModelIndex -lt $config.AdapterChain.Count)) { return @{ Next = $false; Failure = $null } }
+    $config.Adapter = $config.AdapterChain[$ModelIndex]
+    if ($config.Adapter -ne 'antigravity') { return @{ Next = $false; Failure = $null } }
+    try {
+        $config.ProjectId = Resolve-AntigravityProjectId -RepositoryRoot $RepoRoot
+        $slotPreflight = Test-AntigravityPreflight -Stage $Stage
+        if ($slotPreflight.Executable) { $config.Executable = $slotPreflight.Executable }
+        return @{ Next = $false; Failure = $null }
+    } catch {
+        $slotReason = "슬롯 $($ModelIndex + 1) antigravity 매핑/preflight 실패: $($_.Exception.Message)"
+        Write-Log "⚠️ [$Stage] $slotReason — 다음 슬롯 모델로 전환합니다" WARN
+        return @{ Next = $true; Failure = "model $($ModelIndex + 1) ($Model): $slotReason" }
+    }
+}
 
-    $exit = $null
-    $outcome = $null
-    $attemptFailures = @()
-    $modelIndex = 0
-    $attemptNumber = 0
-    $lastDeterministicSig = $null
-    $consecutiveDeterministicCount = 0
+# 승인 대기 종결 — headless 권한 요청은 재시도 불가능한 종결 상태다. 모델 체인 전환·자동 재시도를
+# 절대 하지 않는다. 정확 target을 추출해 승인 대기 기록을 남기고 즉시 돌아간다(CFG017).
+function Complete-StageApprovalRequired {
+    param([string]$Stage, [hashtable]$config, $Cycle, [int]$AttemptNumber, [string]$Model, [string]$AttemptLog, [string]$LogRel, $qaDispatchedAt, $Evidence)
 
-    while ($modelIndex -lt $models.Count) {
-        $model = $models[$modelIndex]
-        # CFG024: qa·integration 폴백 체인은 슬롯마다 어댑터가 달라질 수 있다(예: gemini-qa는
-        # antigravity → opencode). AdapterChain이 있으면 이번 슬롯의 어댑터로 $config를 갱신하고,
-        # antigravity면 ProjectId·Executable도 그 슬롯 기준으로 다시 확인한다.
-        # CFG028: antigravity 매핑 실패 시 unhandled exception 방지 -> WARN + 다음 슬롯 모델로 전환.
-        if ($config.AdapterChain -and $modelIndex -lt $config.AdapterChain.Count) {
-            $config.Adapter = $config.AdapterChain[$modelIndex]
-            if ($config.Adapter -eq 'antigravity') {
-                try {
-                    $config.ProjectId = Resolve-AntigravityProjectId -RepositoryRoot $RepoRoot
-                    $slotPreflight = Test-AntigravityPreflight -Stage $Stage
-                    if ($slotPreflight.Executable) { $config.Executable = $slotPreflight.Executable }
-                } catch {
-                    $slotReason = "슬롯 $($modelIndex + 1) antigravity 매핑/preflight 실패: $($_.Exception.Message)"
-                    Write-Log "⚠️ [$Stage] $slotReason — 다음 슬롯 모델로 전환합니다" WARN
-                    $attemptFailures += "model $($modelIndex + 1) ($model): $slotReason"
-                    $modelIndex++
-                    continue
-                }
-            }
-        }
-        $toolCmd = Build-ToolCommand -Config $config -Stage $Stage -PromptOverride $PromptOverride -Model $model -BypassToolPermissions:$BypassToolPermissions
-        $modelTag = if ($model) { " (모델 $($modelIndex + 1)/$($models.Count): $model)" } else { "" }
-        Write-Log "작업 $TaskId [$Stage] 디스패치$modelTag" INFO
-        Write-Log "명령: $toolCmd" INFO
-        Write-Log "로그: $logRel" INFO
+    $target = if ($Evidence) { $Evidence.Target } else { $null }
+    $targetLabel = if ($target) { $target } elseif ($Evidence) { "null ($($Evidence.TargetExtractionReason))" } else { 'null (structured terminal evidence missing)' }
+    $approvalPath = Write-ApprovalRecord -Stage $Stage -CycleNumber $Cycle.Id -AttemptNumber $AttemptNumber -Model $Model -AttemptLog $AttemptLog -Evidence $Evidence
+    Write-Log "❌ [$Stage] Antigravity headless 권한 요청 → 승인 대기 (approval_required)" ERROR
+    Write-Log "대상 명령: $targetLabel" WARN
+    Write-Log "승인 기록: $approvalPath" INFO
+    Write-Log "동작: 대상 확인 후 headless 프로세스 밖에서 승인을 마치고, 명시적으로 새 사이클의 fresh 디스패치를 시작하세요." WARN
+    Write-StageState -Stage $Stage -Cycle $Cycle.Id -State 'approval_required' -ProcessId $PID -EvidencePaths @($LogRel) -Reason $targetLabel -Model $Model
+    $null = Record-StageAttempt -Stage $Stage -Signature "deterministic:$($config.Adapter):approval_required" -FailureClass 'deterministic'
+    return @{ Success = $false; Outcome = 'approval_required'; ApprovalPath = $approvalPath; QaDispatchedAt = $qaDispatchedAt; CycleId = $Cycle.Id }
+}
 
-        $attempt = 1
-        while ($true) {
-            $attemptNumber++
-            $attemptLog = Get-AttemptLogPath -LogFile $logRel -CycleNumber $cycle.Id -AttemptNumber $attemptNumber
-            Write-Log "시도 로그: $attemptLog (latest: $logRel)" INFO
-            $attemptResult = Invoke-ModelAttempt -Stage $Stage -Config $config -ToolCmd $toolCmd -AttemptLog $attemptLog -LatestLog $logRel -Cycle $cycle.Id -Model $model
-            $exit = $attemptResult.ExitCode
-            $outcome = Classify-AttemptFailure -Attempt $attemptResult -Before $before -AttemptLog $attemptLog
-            if ($Stage -eq 'impl' -and (Get-Command Update-ProviderHealth -ErrorAction SilentlyContinue)) { Update-ProviderHealth -Model $model -Outcome $outcome -AttemptLog $attemptLog }
+# provider print timeout 재개 결정 — opencode/codex 어댑터에도 continuation 지원(CFG029).
+# stream-json의 정확 대화/세션 ID + 기존 로그 성장 건강도가 맞을 때만 동일 사이클에서 재개한다.
+function Resume-ProviderTimeout {
+    param([string]$Stage, [hashtable]$config, $Cycle, $Attempt, [int]$AttemptNumber, [string]$Model, [string]$AttemptLog, [int]$ContinuationCount, [double]$LogicalHardLimit, [datetime]$LogicalAbsoluteDeadline)
 
-            if ($outcome -eq 'ok') {
-                # CFG024: 정상 종료 직전 프로토콜 오염 감지
-                $pollutionResult = Test-ProtocolPollution -Stage $Stage -PacketsBefore $packetsBefore -RouterBefore $routerBefore
-                if ($pollutionResult.Polluted) {
-                    $outcome = 'pollution'
-                    Write-Log "❌ [$Stage] 프로토콜 오염 감지: $($pollutionResult.Reason) → 실패 처리" ERROR
-                }
-            }
+    $conversationId = $null
+    $sessionId = $null
+    $active = $false
+    $withinBudget = (Get-Date) -lt $LogicalAbsoluteDeadline
+    $activityWindowMinutes = [Math]::Max(1, [Math]::Round($LogicalHardLimit / 3.0, 2))
 
-            if ($outcome -eq 'approval_required') {
-                # CFG017: headless 권한 요청은 재시도 불가능한 종결 상태다 — 모델 체인 전환·자동 재시도를
-                # 절대 하지 않는다. 정확 target을 추출해 승인 대기 기록을 남기고 즉시 돌아간다.
-                $evidence = $attemptResult.ApprovalEvidence
-                $target = if ($evidence) { $evidence.Target } else { $null }
-                $targetLabel = if ($target) { $target } elseif ($evidence) { "null ($($evidence.TargetExtractionReason))" } else { 'null (structured terminal evidence missing)' }
-                $approvalPath = Write-ApprovalRecord -Stage $Stage -CycleNumber $cycle.Id -AttemptNumber $attemptNumber -Model $model -AttemptLog $attemptLog -Evidence $evidence
-                Write-Log "❌ [$Stage] Antigravity headless 권한 요청 → 승인 대기 (approval_required)" ERROR
-                Write-Log "대상 명령: $targetLabel" WARN
-                Write-Log "승인 기록: $approvalPath" INFO
-                Write-Log "동작: 대상 확인 후 headless 프로세스 밖에서 승인을 마치고, 명시적으로 새 사이클의 fresh 디스패치를 시작하세요." WARN
-                Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'approval_required' -ProcessId $PID -EvidencePaths @($logRel) -Reason $targetLabel -Model $model
-                $null = Record-StageAttempt -Stage $Stage -Signature "deterministic:$($config.Adapter):approval_required" -FailureClass 'deterministic'
-                return @{ Success = $false; Outcome = 'approval_required'; ApprovalPath = $approvalPath; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
-            }
-            if ($outcome -eq 'provider_timeout') {
-                # CFG029: opencode/codex 어댑터에도 continuation 지원 확장
-                $conversationId = $null
-                $sessionId = $null
-                $active = $false
-                $withinBudget = (Get-Date) -lt $logicalAbsoluteDeadline
-                $activityWindowMinutes = [Math]::Max(1, [Math]::Round($logicalHardLimit / 3.0, 2))
-
-                if ($config.Adapter -eq 'antigravity') {
-                    $conversationId = Get-AntigravityConversationId -AttemptLog $attemptLog
-                    $active = Test-AntigravityContinuationActivity -AttemptLog $attemptLog -LogStartBytes $attemptResult.LogStartBytes -RecentWindowMinutes $activityWindowMinutes
-                } elseif ($config.Adapter -eq 'opencode') {
-                    $sessionId = Get-OpencodeSessionId -AttemptLog $attemptLog
-                    $active = Test-AntigravityContinuationActivity -AttemptLog $attemptLog -LogStartBytes $attemptResult.LogStartBytes -RecentWindowMinutes $activityWindowMinutes
-                } elseif ($config.Adapter -eq 'codex') {
-                    $sessionId = Get-CodexSessionId -AttemptLog $attemptLog
-                    $active = Test-AntigravityContinuationActivity -AttemptLog $attemptLog -LogStartBytes $attemptResult.LogStartBytes -RecentWindowMinutes $activityWindowMinutes
-                }
-
-                $canContinue = $false
-                $continuationReason = ''
-                if ($config.Adapter -eq 'antigravity') {
-                    $canContinue = $active -and $conversationId -and $continuationCount -lt 2 -and $withinBudget
-                    if (-not $conversationId) { $continuationReason = 'exact conversation ID missing or ambiguous' }
-                    elseif (-not $active) { $continuationReason = 'no healthy stream-json activity' }
-                    elseif (-not $withinBudget) { $continuationReason = 'logical absolute deadline reached' }
-                    elseif ($continuationCount -ge 2) { $continuationReason = 'automatic continuation limit reached' }
-                    else { $continuationReason = 'healthy provider timeout; resume same conversation' }
-                } elseif ($config.Adapter -eq 'opencode') {
-                    $canContinue = $active -and $sessionId -and $continuationCount -lt 2 -and $withinBudget
-                    if (-not $sessionId) { $continuationReason = 'opencode session ID missing or ambiguous' }
-                    elseif (-not $active) { $continuationReason = 'no healthy log activity' }
-                    elseif (-not $withinBudget) { $continuationReason = 'logical absolute deadline reached' }
-                    elseif ($continuationCount -ge 2) { $continuationReason = 'automatic continuation limit reached' }
-                    else { $continuationReason = 'healthy provider timeout; resume same session' }
-                } elseif ($config.Adapter -eq 'codex') {
-                    $canContinue = $active -and $sessionId -and $continuationCount -lt 2 -and $withinBudget
-                    if (-not $sessionId) { $continuationReason = 'codex session ID missing or ambiguous' }
-                    elseif (-not $active) { $continuationReason = 'no healthy log activity' }
-                    elseif (-not $withinBudget) { $continuationReason = 'logical absolute deadline reached' }
-                    elseif ($continuationCount -ge 2) { $continuationReason = 'automatic continuation limit reached' }
-                    else { $continuationReason = 'healthy provider timeout; resume same session' }
-                }
-
-                # CFG029 Integration 수정: PowerShell -or는 불리언 $true/$false를 반환하므로 문자열
-                # 세션 ID가 그대로 전달되지 않고 "True"/"False"로 뭉개진다. 실제 값을 보존하려면 값 자체를 골라야 한다.
-                $recordConversationId = if ($conversationId) { $conversationId } elseif ($sessionId) { $sessionId } else { $null }
-                $continuationPath = Write-ContinuationRecord -Stage $Stage -CycleNumber $cycle.Id -AttemptNumber $attemptNumber -AttemptLog $attemptLog -ConversationId $recordConversationId -Active $active -Resumed $canContinue -Reason $continuationReason
-                if ($canContinue) {
-                    $continuationCount++
-                    if ($config.Adapter -eq 'antigravity') {
-                        $toolCmd = Build-AntigravityContinuationCommand -Config $config -Model $model -ConversationId $conversationId
-                    } elseif ($config.Adapter -eq 'opencode') {
-                        $toolCmd = Build-OpencodeContinuationCommand -Config $config -Model $model -SessionId $sessionId
-                    } elseif ($config.Adapter -eq 'codex') {
-                        $toolCmd = Build-CodexContinuationCommand -Config $config -Model $model -SessionId $sessionId
-                    }
-                    Write-Log "⏳ [$Stage] provider print timeout 뒤 건강한 동일 세션 자동 재개 $continuationCount/2 (cycle $($cycle.Token), 기록: $continuationPath)" WARN
-                    continue
-                }
-                Write-Log "⛔ [$Stage] provider print timeout 재개 불가: $continuationReason (cycle $($cycle.Token), 기록: $continuationPath)" ERROR
-            }
-
-            # CFG024: 실패 부류(deterministic vs transient)에 따라 재시도 게이트
-            $fClass = Get-FailureClass -Outcome $outcome
-            if ($outcome -eq 'hang' -and $config.Retry -and $attempt -eq 1 -and $fClass -ne 'deterministic') {
-                # hang-detect-agent Iron Law: 재시도는 최대 1회. 두 번 멈추면 작업 자체가 깨진 것이다.
-                $attempt = 2
-                Write-KilledLeftover -Before $before -Stage $Stage -Context "1차 시도 강제 종료"
-
-                # CFG029 Integration 수정: opencode/codex는 'provider_timeout'을 절대 만들어내지 못한다
-                # (Classify-AttemptFailure의 그 분기는 antigravity 전용 — L1458 참조). 이 두 어댑터가
-                # 실제로 거치는 유일한 동일-모델 재시도는 이 hang 재시도뿐이므로, continuation 배선은
-                # 여기 걸어야 실제로 실행된다. 강제 종료 직전 로그에 세션 ID가 남아 있고 최근까지 건강한
-                # 활동이 있었다면 처음부터 다시 읽히지 않고 그 세션을 이어받는다. 못 찾으면 기존과 동일하게
-                # 콜드 재시작으로 안전 폴백한다(스테이지를 실패시키지 않는다).
-                $hangSessionId = $null
-                $hangActive = $false
-                if ($config.Adapter -eq 'opencode') {
-                    $hangSessionId = Get-OpencodeSessionId -AttemptLog $attemptLog
-                } elseif ($config.Adapter -eq 'codex') {
-                    $hangSessionId = Get-CodexSessionId -AttemptLog $attemptLog
-                }
-                if ($hangSessionId) {
-                    $hangActivityWindowMinutes = [Math]::Max(1, [Math]::Round($logicalHardLimit / 3.0, 2))
-                    $hangActive = Test-AntigravityContinuationActivity -AttemptLog $attemptLog -LogStartBytes $attemptResult.LogStartBytes -RecentWindowMinutes $hangActivityWindowMinutes
-                }
-                if ($hangSessionId -and $hangActive) {
-                    $continuationPath = Write-ContinuationRecord -Stage $Stage -CycleNumber $cycle.Id -AttemptNumber $attemptNumber -AttemptLog $attemptLog -ConversationId $hangSessionId -Active $hangActive -Resumed $true -Reason 'hang retry; resume same session'
-                    if ($config.Adapter -eq 'opencode') {
-                        $toolCmd = Build-OpencodeContinuationCommand -Config $config -Model $model -SessionId $hangSessionId
-                    } else {
-                        $toolCmd = Build-CodexContinuationCommand -Config $config -Model $model -SessionId $hangSessionId
-                    }
-                    Write-Log "⚠️ HANG [1/2] $Stage — 강제 종료 전 세션($hangSessionId) 이어받아 1회 재디스패치 (기록: $continuationPath)" WARN
-                } else {
-                    Write-Log "⚠️ HANG [1/2] $Stage — 동일 명령으로 1회 재디스패치" WARN
-                }
-                Write-Log "⚠️ 재시도는 위 상태를 정리하지 않고 그대로 이어서 실행합니다." WARN
-                continue
-            }
-            break
-        }
-
-        if ($outcome -eq 'ok') { break }
-
-        if ($outcome -eq 'hang') { $reason = 'hang' }
-        elseif ($outcome -eq 'timeout') { $reason = '하드 상한 초과' }
-        elseif ($outcome -eq 'provider_timeout') { $reason = 'provider print timeout (자동 재개 한도 또는 건강도 미충족)' }
-        elseif ($outcome -eq 'quota') { $reason = '잔액·쿼터 부족' }
-        elseif ($outcome -eq 'billing') { $reason = '잔액·쿼터 부족' }
-        elseif ($outcome -eq 'authentication') { $reason = '인증 실패' }
-        elseif ($outcome -eq 'unavailable') { $reason = '모델·프로바이더 사용 불가' }
-        elseif ($outcome -eq 'noop') { $reason = '무산출 조기 실패' }
-        elseif ($outcome -eq 'pollution') { $reason = '프로토콜 오염 감지' }
-        else { $reason = '알 수 없는 실행 실패' }
-        $attemptFailures += "${model}: $reason"
-
-        $fClass = Get-FailureClass -Outcome $outcome
-        $sig = Get-FailureSignature -FailureClass $fClass -Adapter $config.Adapter -Reason $reason
-        $rec = Record-StageAttempt -Stage $Stage -Signature $sig -FailureClass $fClass
-
-        # CFG024 §6-4: 동일 결정적 실패 서명 연속 2회 발생 시 전역 실패 판정 (체인 중단)
-        if ($fClass -eq 'deterministic') {
-            if ($sig -eq $lastDeterministicSig) {
-                $consecutiveDeterministicCount++
-                if ($consecutiveDeterministicCount -ge 2) {
-                    Write-Log "⚠️ [$Stage] 동일 결정적 실패 서명($sig) 연속 2회 발생 — 전역 실패로 판정하고 체인 즉시 중단" WARN
-                    $modelIndex = $models.Count
-                    continue
-                }
-            } else {
-                $lastDeterministicSig = $sig
-                $consecutiveDeterministicCount = 1
-            }
-        }
-
-        # provider timeout / pollution / unknown 은 모델 폴백 없이 현재 cycle 종료
-        if ($outcome -in @('provider_timeout', 'unknown', 'pollution')) { $modelIndex = $models.Count; continue }
-
-        $modelIndex++
-        if ($modelIndex -lt $models.Count) {
-            # CFG024 §7-1: 슬롯 전진 전 이전 자식 프로세스 트리가 죽었음을 확인
-            if ($script:ActiveChildProcessId) {
-                try {
-                    $orphanProc = Get-Process -Id $script:ActiveChildProcessId -ErrorAction SilentlyContinue
-                    if ($orphanProc -and -not $orphanProc.HasExited) {
-                        Write-Log "⚠️ [$Stage] 이전 슬롯 프로세스(PID $($script:ActiveChildProcessId)) 정리 및 종료 확인" INFO
-                        Stop-ProcessTree -ProcessId $script:ActiveChildProcessId
-                        Start-Sleep -Milliseconds 500
-                        $checkProc = Get-Process -Id $script:ActiveChildProcessId -ErrorAction SilentlyContinue
-                        if ($checkProc -and -not $checkProc.HasExited) {
-                            Write-Log "❌ [$Stage] 프로세스 트리(PID $($script:ActiveChildProcessId)) 종료 확인 실패 — 좀비 방지를 위해 전진하지 않고 중단" ERROR
-                            $modelIndex = $models.Count
-                            continue
-                        }
-                    }
-                } catch { }
-                $script:ActiveChildProcessId = $null
-            }
-            Write-Log "⚠️ [$Stage] $model 에서 $reason — 다음 모델로 전환: $($models[$modelIndex])" WARN
-            Write-KilledLeftover -Before $before -Stage $Stage -Context "$reason — 모델 전환"
-        }
+    if ($config.Adapter -eq 'antigravity') {
+        $conversationId = Get-AntigravityConversationId -AttemptLog $AttemptLog
+        $active = Test-AntigravityContinuationActivity -AttemptLog $AttemptLog -LogStartBytes $Attempt.LogStartBytes -RecentWindowMinutes $activityWindowMinutes
+    } elseif ($config.Adapter -eq 'opencode') {
+        $sessionId = Get-OpencodeSessionId -AttemptLog $AttemptLog
+        $active = Test-AntigravityContinuationActivity -AttemptLog $AttemptLog -LogStartBytes $Attempt.LogStartBytes -RecentWindowMinutes $activityWindowMinutes
+    } elseif ($config.Adapter -eq 'codex') {
+        $sessionId = Get-CodexSessionId -AttemptLog $AttemptLog
+        $active = Test-AntigravityContinuationActivity -AttemptLog $AttemptLog -LogStartBytes $Attempt.LogStartBytes -RecentWindowMinutes $activityWindowMinutes
     }
 
-    $attemptSummary = if ($attemptFailures.Count -gt 0) { " (시도별 사유: $($attemptFailures -join '; '))" } else { '' }
+    $canContinue = $false
+    $continuationReason = ''
+    if ($config.Adapter -eq 'antigravity') {
+        $canContinue = $active -and $conversationId -and $ContinuationCount -lt 2 -and $withinBudget
+        if (-not $conversationId) { $continuationReason = 'exact conversation ID missing or ambiguous' }
+        elseif (-not $active) { $continuationReason = 'no healthy stream-json activity' }
+        elseif (-not $withinBudget) { $continuationReason = 'logical absolute deadline reached' }
+        elseif ($ContinuationCount -ge 2) { $continuationReason = 'automatic continuation limit reached' }
+        else { $continuationReason = 'healthy provider timeout; resume same conversation' }
+    } elseif ($config.Adapter -eq 'opencode') {
+        $canContinue = $active -and $sessionId -and $ContinuationCount -lt 2 -and $withinBudget
+        if (-not $sessionId) { $continuationReason = 'opencode session ID missing or ambiguous' }
+        elseif (-not $active) { $continuationReason = 'no healthy log activity' }
+        elseif (-not $withinBudget) { $continuationReason = 'logical absolute deadline reached' }
+        elseif ($ContinuationCount -ge 2) { $continuationReason = 'automatic continuation limit reached' }
+        else { $continuationReason = 'healthy provider timeout; resume same session' }
+    } elseif ($config.Adapter -eq 'codex') {
+        $canContinue = $active -and $sessionId -and $ContinuationCount -lt 2 -and $withinBudget
+        if (-not $sessionId) { $continuationReason = 'codex session ID missing or ambiguous' }
+        elseif (-not $active) { $continuationReason = 'no healthy log activity' }
+        elseif (-not $withinBudget) { $continuationReason = 'logical absolute deadline reached' }
+        elseif ($ContinuationCount -ge 2) { $continuationReason = 'automatic continuation limit reached' }
+        else { $continuationReason = 'healthy provider timeout; resume same session' }
+    }
 
+    # CFG029 Integration 수정: PowerShell -or는 불리언 $true/$false를 반환하므로 문자열
+    # 세션 ID가 그대로 전달되지 않고 "True"/"False"로 뭉개진다. 실제 값을 보존하려면 값 자체를 골라야 한다.
+    $recordConversationId = if ($conversationId) { $conversationId } elseif ($sessionId) { $sessionId } else { $null }
+    $continuationPath = Write-ContinuationRecord -Stage $Stage -CycleNumber $Cycle.Id -AttemptNumber $AttemptNumber -AttemptLog $AttemptLog -ConversationId $recordConversationId -Active $active -Resumed $canContinue -Reason $continuationReason
+    if (-not $canContinue) {
+        Write-Log "⛔ [$Stage] provider print timeout 재개 불가: $continuationReason (cycle $($Cycle.Token), 기록: $continuationPath)" ERROR
+        return @{ Continue = $false; ContinuationCount = $ContinuationCount; ToolCmd = $null }
+    }
+    $nextCount = $ContinuationCount + 1
+    $toolCmd = if ($config.Adapter -eq 'antigravity') {
+        Build-AntigravityContinuationCommand -Config $config -Model $Model -ConversationId $conversationId
+    } elseif ($config.Adapter -eq 'opencode') {
+        Build-OpencodeContinuationCommand -Config $config -Model $Model -SessionId $sessionId
+    } elseif ($config.Adapter -eq 'codex') {
+        Build-CodexContinuationCommand -Config $config -Model $Model -SessionId $sessionId
+    }
+    Write-Log "⏳ [$Stage] provider print timeout 뒤 건강한 동일 세션 자동 재개 $nextCount/2 (cycle $($Cycle.Token), 기록: $continuationPath)" WARN
+    return @{ Continue = $true; ContinuationCount = $nextCount; ToolCmd = $toolCmd }
+}
+
+# hang 재시도 결정 — 최대 1회(CFG024 hang-detect-agent Iron Law). 강제 종료 직전 로그에 세션 ID가
+# 남아 있고 최근까지 건강한 활동이 있었다면 처음부터 다시 읽히지 않고 그 세션을 이어받는다(CFG029),
+# 못 찾으면 기존과 동일하게 콜드 재시작으로 안전 폴백한다(스테이지를 실패시키지 않는다).
+function Prepare-HangRetry {
+    param([string]$Stage, [hashtable]$config, $Cycle, $Attempt, [int]$AttemptNumber, [string]$Model, [string]$AttemptLog, [double]$LogicalHardLimit, $Before)
+
+    Write-KilledLeftover -Before $Before -Stage $Stage -Context "1차 시도 강제 종료"
+    $hangSessionId = $null
+    $hangActive = $false
+    if ($config.Adapter -eq 'opencode') {
+        $hangSessionId = Get-OpencodeSessionId -AttemptLog $AttemptLog
+    } elseif ($config.Adapter -eq 'codex') {
+        $hangSessionId = Get-CodexSessionId -AttemptLog $AttemptLog
+    }
+    $toolCmd = $null
+    if ($hangSessionId) {
+        $hangActivityWindowMinutes = [Math]::Max(1, [Math]::Round($LogicalHardLimit / 3.0, 2))
+        $hangActive = Test-AntigravityContinuationActivity -AttemptLog $AttemptLog -LogStartBytes $Attempt.LogStartBytes -RecentWindowMinutes $hangActivityWindowMinutes
+    }
+    if ($hangSessionId -and $hangActive) {
+        $continuationPath = Write-ContinuationRecord -Stage $Stage -CycleNumber $Cycle.Id -AttemptNumber $AttemptNumber -AttemptLog $AttemptLog -ConversationId $hangSessionId -Active $hangActive -Resumed $true -Reason 'hang retry; resume same session'
+        if ($config.Adapter -eq 'opencode') {
+            $toolCmd = Build-OpencodeContinuationCommand -Config $config -Model $Model -SessionId $hangSessionId
+        } else {
+            $toolCmd = Build-CodexContinuationCommand -Config $config -Model $Model -SessionId $hangSessionId
+        }
+        Write-Log "⚠️ HANG [1/2] $Stage — 강제 종료 전 세션($hangSessionId) 이어받아 1회 재디스패치 (기록: $continuationPath)" WARN
+    } else {
+        Write-Log "⚠️ HANG [1/2] $Stage — 동일 명령으로 1회 재디스패치" WARN
+    }
+    return @{ ShouldRetry = $true; ToolCmd = $toolCmd }
+}
+
+# outcome → 사람이 읽는 사유 문구 매핑. 모델 체인 전용 사유 문자열 계약은 그대로 유지한다.
+function Resolve-OutcomeReason {
+    param([string]$Outcome)
+
+    if ($Outcome -eq 'hang') { return 'hang' }
+    elseif ($Outcome -eq 'timeout') { return '하드 상한 초과' }
+    elseif ($Outcome -eq 'provider_timeout') { return 'provider print timeout (자동 재개 한도 또는 건강도 미충족)' }
+    elseif ($Outcome -eq 'quota') { return '잔액·쿼터 부족' }
+    elseif ($Outcome -eq 'billing') { return '잔액·쿼터 부족' }
+    elseif ($Outcome -eq 'authentication') { return '인증 실패' }
+    elseif ($Outcome -eq 'unavailable') { return '모델·프로바이더 사용 불가' }
+    elseif ($Outcome -eq 'noop') { return '무산출 조기 실패' }
+    elseif ($Outcome -eq 'pollution') { return '프로토콜 오염 감지' }
+    return '알 수 없는 실행 실패'
+}
+
+# 슬롯 전진 전 이전 자식 프로세스 트리가 죽었음을 확인한다(CFG024 §7-1). 좀비가 남으면 전진을 거부한다.
+function Ensure-PreviousSlotCleared {
+    param([string]$Stage)
+
+    if (-not $script:ActiveChildProcessId) { return $true }
+    try {
+        $orphanProc = Get-Process -Id $script:ActiveChildProcessId -ErrorAction SilentlyContinue
+        if ($orphanProc -and -not $orphanProc.HasExited) {
+            Write-Log "⚠️ [$Stage] 이전 슬롯 프로세스(PID $($script:ActiveChildProcessId)) 정리 및 종료 확인" INFO
+            Stop-ProcessTree -ProcessId $script:ActiveChildProcessId
+            Start-Sleep -Milliseconds 500
+            $checkProc = Get-Process -Id $script:ActiveChildProcessId -ErrorAction SilentlyContinue
+            if ($checkProc -and -not $checkProc.HasExited) {
+                Write-Log "❌ [$Stage] 프로세스 트리(PID $($script:ActiveChildProcessId)) 종료 확인 실패 — 좀비 방지를 위해 전진하지 않고 중단" ERROR
+                return $false
+            }
+        }
+    } catch { }
+    $script:ActiveChildProcessId = $null
+    return $true
+}
+
+# 단계 전체 실패 종결 — 표 형태로 outcome별 사유·정리·로그 꼬리를 매핑해 일관된 종결을 보장한다.
+# CFG007: "모델 체인 전부 소진, 중단" 문구와 시도별 사유 요약은 하네스가 문자열 계약으로 검증한다.
+function Complete-StageFailure {
+    param([string]$Stage, $Cycle, [string]$Outcome, $AttemptFailures, $Before, [string]$Model, [string]$LogRel, $qaDispatchedAt)
+
+    $attemptSummary = if ($AttemptFailures.Count -gt 0) { " (시도별 사유: $($AttemptFailures -join '; '))" } else { '' }
     $failureOutcomes = @{
         hang = @{ Reason = 'hang'; KilledContext = '강제 종료'; ShowLogTail = $false }
         timeout = @{ Reason = '하드 상한 초과'; KilledContext = '하드 상한 초과로 강제 종료'; ShowLogTail = $false }
@@ -2355,65 +2458,222 @@ function Dispatch-Stage {
         noop = @{ Reason = '무산출 조기 실패'; KilledContext = $null; ShowLogTail = $false }
         pollution = @{ Reason = 'impl 폴루션 감지'; KilledContext = $null; ShowLogTail = $true }
     }
-    if ($failureOutcomes.ContainsKey($outcome)) {
-        $failure = $failureOutcomes[$outcome]
-        $failureMessage = "$($failure.Reason) — 모델 체인 전부 소진, 중단"
-        if ($outcome -in @('quota', 'billing')) { $failureMessage += '. 프로바이더 결제 상태를 확인하세요.' }
-        Write-Log "❌ [$Stage] $failureMessage$attemptSummary" ERROR
-        $failureReason = "$($failure.Reason) — 모델 체인 전부 소진$attemptSummary"
-        if ($failure.KilledContext) {
-            Write-KilledLeftover -Before $before -Stage $Stage -Context $failure.KilledContext
-        }
-        if ($failure.ShowLogTail) {
-            $logAbs = Resolve-RepoPath $logRel
-            if (Test-Path $logAbs) { Get-Content $logAbs -Tail 15 | ForEach-Object { Write-Host "    $_" } }
-        }
-        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $failureReason -Model $model
-        return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $qaDispatchedAt }
+    if (-not $failureOutcomes.ContainsKey($Outcome)) { return $null }
+    $failure = $failureOutcomes[$Outcome]
+    $failureMessage = "$($failure.Reason) — 모델 체인 전부 소진, 중단"
+    if ($Outcome -in @('quota', 'billing')) { $failureMessage += '. 프로바이더 결제 상태를 확인하세요.' }
+    Write-Log "❌ [$Stage] $failureMessage$attemptSummary" ERROR
+    $failureReason = "$($failure.Reason) — 모델 체인 전부 소진$attemptSummary"
+    if ($failure.KilledContext) {
+        Write-KilledLeftover -Before $Before -Stage $Stage -Context $failure.KilledContext
+    }
+    if ($failure.ShowLogTail) {
+        $logAbs = Resolve-RepoPath $LogRel
+        if (Test-Path $logAbs) { Get-Content $logAbs -Tail 15 | ForEach-Object { Write-Host "    $_" } }
+    }
+    Write-StageState -Stage $Stage -Cycle $Cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($LogRel) -Reason $failureReason -Model $Model
+    return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $qaDispatchedAt }
+}
+
+# 종료 코드 판정 — exit를 읽지 못했거나 0이 아니면 실패 종결, 0이면 계속(성공 후보).
+function Complete-StageExitFailure {
+    param([string]$Stage, $Cycle, $Exit, [string]$LogRel, [string]$Model, $qaDispatchedAt)
+
+    $exitLabel = if ($null -eq $Exit) { '<unknown>' } else { $Exit }
+    Write-Log "프로세스 종료 (Exit Code: $exitLabel)" INFO
+    if ($null -eq $Exit) {
+        Write-Log "⚠️ [$Stage] 종료 코드를 읽지 못함 — 검증 게이트 결과로 판정" WARN
+        return $null
+    }
+    if ($Exit -eq 0) { return $null }
+    Write-Log "⚠️ [$Stage] 실패 (Exit $Exit) — 로그 끝부분:" WARN
+    $failureReason = "종료 코드 $Exit"
+    $logAbs = Resolve-RepoPath $LogRel
+    if (Test-Path $logAbs) { Get-Content $logAbs -Tail 15 | ForEach-Object { Write-Host "    $_" } }
+    Write-StageState -Stage $Stage -Cycle $Cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($LogRel) -Reason $failureReason -Model $Model
+    return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $qaDispatchedAt }
+}
+
+# 작업트리 변경 유무 경고 — 차단하지 않는다(CFG-BL-014: 지문 실패는 '동일'이 아닌 '판정 불가'다).
+function Warn-UnchangedTree {
+    param([string]$Stage, $Before)
+
+    $after = Get-TreeState
+    if ($null -eq $Before -or $null -eq $after) { return }
+    if (-not $Before.FingerprintOk -or -not $after.FingerprintOk) {
+        Write-Log "[$Stage] 작업트리 변경 여부 판정 불가 (지문 계산 실패) — 무변경 경고를 생략합니다" WARN
+    } elseif ($Before.Head -eq $after.Head -and $Before.Dirty -eq $after.Dirty -and
+              $Before.Fingerprint -eq $after.Fingerprint) {
+        Write-Log "⚠️ [$Stage] 작업트리 변경 없음 (HEAD·미커밋 파일 모두 동일) — 이 단계가 실제로 무엇을 했는지 다음 리뷰 단계에서 확인할 것" WARN
+    }
+}
+
+# 한 단계 디스패치 + hang 감지 + 판정. 성공(종료 코드 정상 + verify 통과) 시 $true.
+# ModelFallback이 있는 단계(impl)는 모델을 바꿔가며 순서대로 시도한다 — 같은 모델을 두 번 부르지 않는다.
+# 한 단계 디스패치 + hang 감지 + 판정. 성공(종료 코드 정상 + verify 통과) 시 $true.
+# ModelFallback이 있는 단계(impl)는 모델을 바꿔가며 순서대로 시도한다 — 같은 모델을 두 번 부르지 않는다.
+# 한 단계 디스패치 + hang 감지 + 판정. 성공(종료 코드 정상 + verify 통과) 시 $true.
+# ModelFallback이 있는 단계(impl)는 모델을 바꿔가며 순서대로 시도한다 — 같은 모델을 두 번 부르지 않는다.
+function Dispatch-Stage {
+    param([string]$Stage, [string]$PromptOverride)
+    $config = $StageConfig[$Stage]
+    $logRel = $config.LogFile
+
+    Measure-ContextBytes -Stage $Stage
+
+    # CFG025: 헤드리스 antigravity는 모든 run_command를 승인 대기로 거부한다. QA는 이미 직접 수정
+    # 권한을 가진 신뢰 단계이므로 사용자 승인(2026-08-19)에 따라 항상 --dangerously-skip-permissions를 부여한다.
+    if ($Stage -eq 'qa') { $BypassToolPermissions = $true }
+    # CFG024: 디스패치 전 원장/차단 마커 검사 — 상한 도달 시 모델을 띄우기 전에 즉시 거부한다.
+    $allowed = Test-StageDispatchAllowed -Stage $Stage
+    if (-not $allowed.Allowed) {
+        $failureReason = "디스패치 거부: $($allowed.Reason)"
+        Write-Log "❌ [$Stage] $failureReason" ERROR
+        return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $null }
     }
 
-    $exitLabel = if ($null -eq $exit) { '<unknown>' } else { $exit }
-    Write-Log "프로세스 종료 (Exit Code: $exitLabel)" INFO
-    if ($null -eq $exit) {
-        Write-Log "⚠️ [$Stage] 종료 코드를 읽지 못함 — 검증 게이트 결과로 판정" WARN
-    } elseif ($exit -ne 0) {
-        Write-Log "⚠️ [$Stage] 실패 (Exit $exit) — 로그 끝부분:" WARN
-        $failureReason = "종료 코드 $exit"
-        $logAbs = Resolve-RepoPath $logRel
-        if (Test-Path $logAbs) { Get-Content $logAbs -Tail 15 | ForEach-Object { Write-Host "    $_" } }
-        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $failureReason -Model $model
-        return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $qaDispatchedAt }
+    $models = Resolve-ModelChain -Config $config -Stage $Stage
+    if ($models.Count -eq 0) {
+        $failureReason = '모델 체인이 비어 있음 — 단계 구성 오류'
+        Write-Log "❌ [$Stage] $failureReason" ERROR
+        return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $null }
     }
+
+    if ($DryRun) {
+        return (Show-StageDryRun -Stage $Stage -Config $config -LogRel $logRel -PromptOverride $PromptOverride -Model $models[0] -BypassToolPermissions $BypassToolPermissions)
+    }
+    $cycle = Initialize-StageDispatch -Stage $Stage -Config $config -LogRel $logRel
+    $qaDispatchedAt = Clear-QaArtifacts -Stage $Stage -Config $config
+    Invoke-SessionHealthCheck -Stage $Stage
+    $preflight = Invoke-StagePreflightGate -Stage $Stage -config $config -Cycle $cycle -LogRel $logRel -qaDispatchedAt $qaDispatchedAt
+    if ($preflight.Abort) {
+        return @{ Success = $false; FailureReason = $preflight.Reason; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
+    }
+
+    # CFG024: 구현(②) 단계 전 스냅숏 확보 (프로토콜 오염 감지용)
+    $packetsBefore = if ($Stage -eq 'impl') { Get-PacketFileSnapshot } else { @() }
+    $routerBefore = if ($Stage -eq 'impl') { Get-RouterTableSnapshot } else { @{} }
+    $before = Get-TreeState
+    $logicalStartedAt = Get-Date
+    $logicalHardLimit = if ($config.HardTimeoutMinutes) { $config.HardTimeoutMinutes } else { $HardTimeoutMinutes }
+    $logicalAbsoluteDeadline = $logicalStartedAt.AddMinutes($logicalHardLimit * 3)
+    $continuationCount = 0
+    $exit = $null; $outcome = $null; $attemptFailures = @()
+    $modelIndex = 0; $attemptNumber = 0; $lastDeterministicSig = $null; $consecutiveDeterministicCount = 0
+
+    while ($modelIndex -lt $models.Count) {
+        $model = $models[$modelIndex]
+        $slot = Resolve-SlotAdapter -config $config -Stage $Stage -ModelIndex $modelIndex -Model $model -RepoRoot $RepoRoot
+        if ($slot.Next) {
+            $attemptFailures += $slot.Failure
+            $modelIndex++
+            continue
+        }
+        $toolCmd = Build-ToolCommand -Config $config -Stage $Stage -PromptOverride $PromptOverride -Model $model -BypassToolPermissions:$BypassToolPermissions
+        $modelTag = if ($model) { " (모델 $($modelIndex + 1)/$($models.Count): $model)" } else { "" }
+        Write-Log "작업 $TaskId [$Stage] 디스패치$modelTag" INFO
+        Write-Log "명령: $toolCmd" INFO
+        Write-Log "로그: $logRel" INFO
+        $attempt = 1
+        while ($true) {
+            $attemptNumber++
+            $attemptLog = Get-AttemptLogPath -LogFile $logRel -CycleNumber $cycle.Id -AttemptNumber $attemptNumber
+            Write-Log "시도 로그: $attemptLog (latest: $logRel)" INFO
+            $attemptResult = Invoke-ModelAttempt -Stage $Stage -Config $config -ToolCmd $toolCmd -AttemptLog $attemptLog -LatestLog $logRel -Cycle $cycle.Id -Model $model
+            $exit = $attemptResult.ExitCode
+            $outcome = Classify-AttemptFailure -Attempt $attemptResult -Before $before -AttemptLog $attemptLog
+            if ($Stage -eq 'impl' -and (Get-Command Update-ProviderHealth -ErrorAction SilentlyContinue)) { Update-ProviderHealth -Model $model -Outcome $outcome -AttemptLog $attemptLog }
+
+            # CFG024: 정상 종료 직전 프로토콜 오염 감지
+            if ($outcome -eq 'ok') {
+                $pollutionResult = Test-ProtocolPollution -Stage $Stage -PacketsBefore $packetsBefore -RouterBefore $routerBefore
+                if ($pollutionResult.Polluted) {
+                    $outcome = 'pollution'
+                    Write-Log "❌ [$Stage] 프로토콜 오염 감지: $($pollutionResult.Reason) → 실패 처리" ERROR
+                }
+            }
+            if ($outcome -eq 'approval_required') {
+                return (Complete-StageApprovalRequired -Stage $Stage -config $config -Cycle $cycle -AttemptNumber $attemptNumber -Model $model -AttemptLog $attemptLog -LogRel $logRel -qaDispatchedAt $qaDispatchedAt -Evidence $attemptResult.ApprovalEvidence)
+            }
+            if ($outcome -eq 'provider_timeout') {
+                $resume = Resume-ProviderTimeout -Stage $Stage -config $config -Cycle $cycle -Attempt $attemptResult -AttemptNumber $attemptNumber -Model $model -AttemptLog $attemptLog -ContinuationCount $continuationCount -LogicalHardLimit $logicalHardLimit -LogicalAbsoluteDeadline $logicalAbsoluteDeadline
+                if ($resume.Continue) { $continuationCount = $resume.ContinuationCount; $toolCmd = $resume.ToolCmd; continue }
+            }
+            $fClass = Get-FailureClass -Outcome $outcome
+            if ($outcome -eq 'hang' -and $config.Retry -and $attempt -eq 1 -and $fClass -ne 'deterministic') {
+                $retry = Prepare-HangRetry -Stage $Stage -config $config -Cycle $cycle -Attempt $attemptResult -AttemptNumber $attemptNumber -Model $model -AttemptLog $attemptLog -LogicalHardLimit $logicalHardLimit -Before $before
+                if ($retry.ShouldRetry) {
+                    $attempt = 2
+                    if ($retry.ToolCmd) { $toolCmd = $retry.ToolCmd }
+                    Write-Log "⚠️ 재시도는 위 상태를 정리하지 않고 그대로 이어서 실행합니다." WARN
+                    continue
+                }
+            }
+            break
+        }
+        if ($outcome -eq 'ok') { break }
+        $reason = Resolve-OutcomeReason -Outcome $outcome
+        $attemptFailures += "${model}: $reason"
+        $fClass = Get-FailureClass -Outcome $outcome
+        $sig = Get-FailureSignature -FailureClass $fClass -Adapter $config.Adapter -Reason $reason
+        $rec = Record-StageAttempt -Stage $Stage -Signature $sig -FailureClass $fClass
+
+        # CFG024 §6-4: 동일 결정적 실패 서명 2회 연속 시 전역 실패 판정(체인 중단). 로컬 상태 3개를
+        # 함께 돌려줘야 해서 인라인 유지(CFG040 결정) — 루프 제어를 도우미로 옮기면 분산 위험이 크다.
+        if ($fClass -eq 'deterministic' -and $sig -eq $lastDeterministicSig) {
+            $consecutiveDeterministicCount++
+            if ($consecutiveDeterministicCount -ge 2) {
+                Write-Log "⚠️ [$Stage] 동일 결정적 실패 서명($sig) 연속 2회 발생 — 전역 실패로 판정하고 체인 즉시 중단" WARN
+                $modelIndex = $models.Count
+                continue
+            }
+        } elseif ($fClass -eq 'deterministic') {
+            $lastDeterministicSig = $sig
+            $consecutiveDeterministicCount = 1
+        }
+
+        # provider timeout / pollution / unknown 은 모델 폴백 없이 현재 cycle 종료
+        if ($outcome -in @('provider_timeout', 'unknown', 'pollution')) { $modelIndex = $models.Count; continue }
+        $modelIndex++
+        if ($modelIndex -lt $models.Count) {
+            if (-not (Ensure-PreviousSlotCleared -Stage $Stage)) { $modelIndex = $models.Count; continue }
+            Write-Log "⚠️ [$Stage] $model 에서 $reason — 다음 모델로 전환: $($models[$modelIndex])" WARN
+            Write-KilledLeftover -Before $before -Stage $Stage -Context "$reason — 모델 전환"
+        }
+    }
+
+    $failure = Complete-StageFailure -Stage $Stage -Cycle $cycle -Outcome $outcome -AttemptFailures $attemptFailures -Before $before -Model $model -LogRel $logRel -qaDispatchedAt $qaDispatchedAt
+    if ($null -ne $failure) { return $failure }
+    $exitFailure = Complete-StageExitFailure -Stage $Stage -Cycle $cycle -Exit $exit -LogRel $logRel -Model $model -qaDispatchedAt $qaDispatchedAt
+    if ($null -ne $exitFailure) { return $exitFailure }
 
     $verifyResult = Invoke-VerifyGate -Stage $Stage
     if (-not $verifyResult.Success) {
+        # CFG042 완료 정리 경계 ①: Integration이 검증 게이트를 통과하지 못하면 파이프라인 완료 정리
+        # (⑤ 체크·router DONE·아카이브 이동·완료 커밋 메시지)를 금지한다. 패킷은 미완료 상태로 남아
+        # 오케스트레이터가 실패를 전제로 재진행해야 한다 — 이 경계 이전에 완료를 주장하는 정리는 없어야 한다.
+        if ($Stage -eq 'integration') {
+            Write-Log '⛔ [integration] 검증 실패 — 완료 정리 금지 (⑤ 체크·router DONE·아카이브·완료 커밋 불가, 패킷 미완료 유지)' ERROR
+        }
         Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $verifyResult.FailureReason -Model $model
         return @{ Success = $false; FailureReason = $verifyResult.FailureReason; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
     }
 
-    # CFG017: 이전에 승인 대기 상태였던 단계가 fresh cycle에서 성공하면 승인 기록을 resolved로 해소한다.
-    # (qa는 이곳이 아니라 fresh verdict 통과를 확인한 뒤 해소한다 — Dispatch-Stage는 verdict를 모른다.)
+    # CFG017: 이전 승인 대기 상태가 fresh cycle 성공 시 resolved로 해소된다 (qa는 verdict 통과 후 별도 해소).
     if ($Stage -ne 'qa') { Resolve-ApprovalRecords -Stage $Stage -ResolvingCycle $cycle.Id }
-
-    # 작업트리 변경 유무 — 경고만 한다(차단하지 않음).
-    # 게이트는 손대지 않은 트리에서도 통과하므로, "성공했지만 아무것도 안 한" 단계를 게이트만으로는 걸러낼 수 없다.
-    # 실제 수행 여부 판단은 다음 리뷰 단계(④ QA · ⑤ 최종리뷰)의 몫이다.
-    # 지문이 없으면 "동일"이 아니라 "판정 불가"다(CFG-BL-014). Dirty 문자열은 이미 수정 상태인 파일을
-    # 더 수정해도 변하지 않으므로, 지문이 죽은 채 비교하면 실제 작업을 무변경으로 단정하게 된다.
-    $after = Get-TreeState
-    if ($null -ne $before -and $null -ne $after) {
-        if (-not $before.FingerprintOk -or -not $after.FingerprintOk) {
-            Write-Log "[$Stage] 작업트리 변경 여부 판정 불가 (지문 계산 실패) — 무변경 경고를 생략합니다" WARN
-        } elseif ($before.Head -eq $after.Head -and $before.Dirty -eq $after.Dirty -and
-                  $before.Fingerprint -eq $after.Fingerprint) {
-            Write-Log "⚠️ [$Stage] 작업트리 변경 없음 (HEAD·미커밋 파일 모두 동일) — 이 단계가 실제로 무엇을 했는지 다음 리뷰 단계에서 확인할 것" WARN
-        }
-    }
+    Warn-UnchangedTree -Stage $Stage -Before $before
 
     Write-Log "✅ [$Stage] 성공 + 검증 통과" SUCCESS
+    # CFG042 완료 정리 경계 ②: Integration이 검증 게이트를 통과한 이 지점에 이르러서야 완료 정리
+    # (⑤ 체크·router DONE·아카이브 이동·완료 커밋·push)가 허용된다. 이 경계 앞에서는 할 수 없다.
+    if ($Stage -eq 'integration') {
+        Write-Log '✅ [integration] 검증 성공 — 완료 정리 허용 (⑤ 체크·router DONE·아카이브·완료 커밋 가능)' INFO
+    }
     Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'completed' -ProcessId $PID -EvidencePaths @($logRel) -Reason 'stage succeeded and verify passed' -Model $model
     return @{ Success = $true; FailureReason = $null; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
 }
+#endregion 디스패치 본체
+#region 관측·집계·감독·정리
 
 function Read-ProviderHealth {
     param([string]$Path)
@@ -2606,6 +2866,7 @@ function Invoke-DispatcherCleanup {
     }
 }
 
+#endregion 관측·집계·감독·정리
 # ── 메인 ─────────────────────────────────────────────────────────────────────
 Validate-TaskId -Id $TaskId
 
@@ -2637,6 +2898,18 @@ if ($packetMatches.Count -eq 0 -and $archiveMatches.Count -eq 0) {
 }
 $checkPipelinePacket = if ($packetMatches.Count -eq 1) { $packetMatches[0].FullName } else { $null }
 
+# CFG041: 패킷 해석 직후·모델 프로필 로드 전에 조건부 기획 챌린지 리뷰 게이트를 검사한다.
+# 이 위치는 -Chain과 -Stage impl 단일 경로를 모두 덮는다. 미해소(requested)·결손·잘못된 Decision은
+# 모델 호출 전에 fail-closed로 차단하고, 레거시·not-required·completed는 그대로 통과시킨다.
+if ($checkPipelinePacket) {
+    try {
+        Assert-PlanningChallengeReviewReady -PacketPath $checkPipelinePacket | Out-Null
+    } catch {
+        Write-Log $_.Exception.Message ERROR
+        exit 1
+    }
+}
+
 . $ProfileModule
 $script:ProfileConfig = Read-ModelProfileConfig -CentralPath $ProfileConfigPath -LocalPath (Join-Path $RepoRoot 'model-profiles.local.json')
 $configuredPlanning = Resolve-RoleProfile -Role planning -Config $script:ProfileConfig
@@ -2655,6 +2928,17 @@ if ($checkPipelinePacket) {
 }
 $script:PipelineRouting = Resolve-PipelineRouting -Config $script:ProfileConfig -PlanningProfile $planningProfile -PlanningAdapter $planningAdapter
 $StageConfig.impl.ModelFallback = @($script:PipelineRouting.ImplementationModels)
+if ($ForceFreeModel) {
+    $freeModels = @($StageConfig.impl.ModelFallback | Where-Object {
+        $script:ProfileConfig.modelCatalog.$_ -and [string]$script:ProfileConfig.modelCatalog.$_.cost -eq 'free'
+    })
+    if ($freeModels.Count -eq 0) {
+        Write-Log '⛔ -ForceFreeModel 지정됐지만 modelCatalog에 cost=free 슬롯이 없음 — 원래 체인 유지' ERROR
+    } else {
+        Write-Log "[impl] -ForceFreeModel: 유료 슬롯 건너뛰고 무료로 직행 ($($freeModels -join ' → '))" INFO
+        $StageConfig.impl.ModelFallback = $freeModels
+    }
+}
 
 # CFG024 §Done When 4: QA·Integration에 실제로 동작하는 폴백 체인을 배선한다.
 # ModelChain/AdapterChain이 Resolve-ModelChain에서 소비되며, Dispatch-Stage 루프가 슬롯마다
@@ -2756,6 +3040,12 @@ if ($Chain) {
             Write-FailureMarker -Stage 'integration' -Reason 'QA verdict 미통과 — ⑤ 진행 중단'
             Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @('QA verdict 미통과 — ⑤ 진행 중단') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
             exit 1
+        }
+        # CFG042 QA pass→Integration 자동 연쇄 경계: 여기까지 도달하면 verdict 게이트(경량 등급 또는
+        # fresh pass)를 통과했다는 뜻이므로 ⑤ Integration을 자동 기동한다. 완료 정리(⑤ 체크·router DONE·
+        # 아카이브 이동·완료 커밋)는 Dispatch-Stage 안에서 Integration 검증 게이트를 통과한 뒤에만 허용된다.
+        if ($stage -eq 'integration' -and -not $DryRun) {
+            Write-Log '📌 [integration] QA verdict pass — 자동 연쇄 진행. 완료 정리는 검증 통과 후에만 허용' INFO
         }
         $result = Invoke-StageWithLock -Stage $stage -PromptOverride '' -CheckPipelineBefore ($stage -eq 'impl') -CheckPipelinePacket $checkPipelinePacket
         $chainStages += [ordered]@{ stage = $stage; success = [bool]$result.Success; failureReason = $result.FailureReason; verifyPassed = [bool]$result.Success; logPath = $StageConfig[$stage].LogFile }

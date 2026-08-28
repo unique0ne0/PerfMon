@@ -20,7 +20,7 @@
     "claude-driver": { "adapter": "claude", "family": "claude", "model": "sonnet", "tier": "balanced", "fallbackProfiles": ["codex-driver"] },
     "codex-driver": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "tier": "balanced", "fallbackProfiles": [] },
     "codex-qa": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "tier": "balanced", "fallbackProfiles": [] },
-    "gemini-qa": { "adapter": "antigravity", "family": "gemini", "model": "gemini-3.7-flash", "tier": "fast", "fallbackProfiles": ["gemini-qa-opencode"] },
+    "gemini-qa": { "adapter": "antigravity", "family": "gemini", "model": "gemini-3.7-flash", "tier": "fast", "fallbackProfiles": ["gemini-qa-opencode", "codex-qa"] },
     "gemini-qa-opencode": { "adapter": "opencode", "family": "gemini", "model": "google/gemini-3.7-flash", "tier": "fast", "fallbackProfiles": [] },
     "claude-integration": { "adapter": "claude", "family": "claude", "model": "sonnet", "tier": "balanced", "fallbackProfiles": [] },
     "codex-integration": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "tier": "quality", "fallbackProfiles": [] },

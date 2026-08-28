@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "stages": {
+    "impl":       { "hangSeconds": 300 },
+    "qa":         { "hangSeconds": 300 },
+    "integration": { "hangSeconds": 900 }
+  }
+}

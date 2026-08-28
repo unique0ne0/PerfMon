@@ -28,7 +28,7 @@ $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrEmpty($RepoRoot)) { $RepoRoot = Split-Path -Parent $PSScriptRoot }
 if ([string]::IsNullOrEmpty($TargetList)) { $TargetList = Join-Path $RepoRoot 'harness-targets.txt' }
 
-$harnessAssets = @('dispatch-with-hang-detect.ps1', 'check-packet-archive.ps1', 'model-profiles.json', 'model-profile.ps1', 'orchestrate-packet.ps1', 'session-health.ps1', 'gy-orchestrator-prompt.md', 'commit-harness-sync.ps1')
+$harnessAssets = @('dispatch-with-hang-detect.ps1', 'check-packet-archive.ps1', 'model-profiles.json', 'model-profile.ps1', 'orchestrate-packet.ps1', 'session-health.ps1', 'gy-orchestrator-prompt.md', 'commit-harness-sync.ps1', 'task-status.ps1', 'sweep-orphan-browsers.ps1', 'stage-thresholds.json')
 
 $logDir = Join-Path $RepoRoot 'global\harness\logs\sync-commit'
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
