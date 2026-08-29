@@ -58,7 +58,14 @@ param(
     [Parameter(Mandatory=$false)][string]$ResetReason,
     # CFG038 핫픽스(2026-08-27): opencode-go 쿼터 소진이 명확할 때 유료 슬롯을 전부 태우며
     # hang 대기를 반복하지 않도록, 사용자가 이번 실행만 무료 슬롯으로 직행시킬 수 있게 한다.
-    [Parameter(Mandatory=$false)][switch]$ForceFreeModel
+    [Parameter(Mandatory=$false)][switch]$ForceFreeModel,
+    # CFG043: 사용자 권한 수동 완료/중단 — 실행(디스패치) 대신 단계 lease를 원자적으로 종결한다.
+    # 실행 프로세스·락·승인 대기를 건드리지 않고, task/stage/cycle/evidence/reason을 보존한
+    # terminal lease('completed' 또는 'failed')를 기록해 대시보드가 '정지 감지'로 오인하지 않게 한다.
+    # 종결된 이전 단계 뒤 첫 미완료 단계부터 안전하게 자동 재개(-Chain)할 수 있게 한다.
+    [Parameter(Mandatory=$false)][switch]$ManualComplete,
+    [Parameter(Mandatory=$false)][switch]$ManualAbort,
+    [Parameter(Mandatory=$false)][string]$Reason
 )
 
 $ErrorActionPreference = "Stop"
@@ -2849,6 +2856,73 @@ function Test-QaVerdict {
     return $false
 }
 
+# ── CFG043: 수동 완료·안전 재개 ─────────────────────────────────────────────
+# 실행 중('running'/'starting') lease가 아직 만료되지 않았거나 살아 있는 락이 있는지 판정한다.
+# 자동 재개(-Chain)가 이들을 "건드리지 않고" 멈추기 위한 가드다. stale(만료) lease나 종결
+# lease는 재개를 막지 않는다 — 그게 재개가 진행해야 할 대상이기 때문이다.
+function Test-LiveStageActivity {
+    param([string]$TargetTaskId = $TaskId)
+    $target = if ([string]::IsNullOrWhiteSpace($TargetTaskId)) { $TaskId } else { $TargetTaskId }
+    $live = @()
+    foreach ($s in @('impl','qa','integration')) {
+        $lock = Read-DispatchLock $s
+        if ($lock -and $lock.Alive) { $live += "[$s] 살아있는 락 PID $($lock.ProcId)" }
+        $leasePath = Resolve-RepoPath "$LogDir/$target-stage-state.json"
+        if (Test-Path -LiteralPath $leasePath) {
+            try {
+                $lease = Get-Content -LiteralPath $leasePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            } catch { $lease = $null }
+            if ($lease -and [string]$lease.stage -eq $s -and [string]$lease.state -match '^(starting|running)$') {
+                try {
+                    $heartbeat = ([datetime]$lease.heartbeatAt).ToUniversalTime()
+                    $fresh = (([datetime]::UtcNow) - $heartbeat).TotalSeconds -lt 600
+                } catch { $fresh = $false }
+                if ($fresh) { $live += "[$s] 살아있는 running lease cycle $($lease.cycle) PID $($lease.pid)" }
+            }
+        }
+    }
+    if ($live.Count -eq 0) { return $null }
+    return ($live -join ', ')
+}
+
+# CFG043: 사용자 권한 수동 완료/중단 — 실행 대신 단계 lease를 terminal 상태로 원자적으로 종결한다.
+# 실행 프로세스·락·승인 대기를 건드리지 않고 task/stage/cycle/evidence/reason을 보존한다.
+# 완료는 'completed', 중단은 'failed'로 기록한다(보존: task/stage/cycle/evidence/reason).
+function Invoke-ManualStageTermination {
+    param([string]$Stage, [switch]$Complete, [string]$ReasonText)
+    if (-not $Stage -or @('impl','qa','integration') -notcontains $Stage) {
+        Write-Log '오류: 수동 완료/중단은 -Stage impl|qa|integration 과 함께 사용하세요.' ERROR
+        return 1
+    }
+    # 살아 있는 실행이 있으면 종결하지 않는다 — 사용자 개입이라도 실제 진행 중 lease를 덮어쓰지 않는다.
+    $live = Test-LiveStageActivity
+    if ($live) {
+        Write-Log "⛔ [수동종결] 살아 있는 실행이 있어 lease를 종결하지 않습니다: $live" ERROR
+        Write-Log '수동 완료/중단은 실행이 종료된 뒤(또는 만료된 lease)에만 사용 가능합니다. 실행이 끝나기를 기다리거나 해당 세션을 정리하세요.' ERROR
+        return 1
+    }
+    $statePath = Resolve-RepoPath "$LogDir/$TaskId-stage-state.json"
+    $cycle = 1
+    $evidence = @()
+    try {
+        if (Test-Path -LiteralPath $statePath) {
+            $prev = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ([string]$prev.stage -eq $Stage) {
+                $c = 0
+                if ([int]::TryParse([string]$prev.cycle, [ref]$c)) { $cycle = $c }
+                foreach ($e in @($prev.evidencePaths)) { if (-not [string]::IsNullOrWhiteSpace([string]$e)) { $evidence += [string]$e } }
+            }
+        }
+    } catch { }
+    $target = if ($Complete) { 'completed' } else { 'failed' }
+    $detail = if ([string]::IsNullOrWhiteSpace($ReasonText)) { '' } else { " — $ReasonText" }
+    $reason = if ($Complete) { "수동 완료 — 사용자 권한으로 단계 실행 종결$detail" } else { "수동 중단 — 사용자 권한으로 실행 중단$detail" }
+    Write-StageState -Stage $Stage -Cycle $cycle -State $target -ProcessId $PID -EvidencePaths $evidence -Reason $reason -Model $null
+    $mark = if ($Complete) { '✅' } else { '❌' }
+    Write-Log "$mark [$Stage] 수동 $(if ($Complete) { '완료' } else { '중단' }) — terminal lease '$target' 기록 (cycle $cycle, reason: $reason)" SUCCESS
+    return 0
+}
+
 function Invoke-DispatcherCleanup {
     if ($script:CleanupStarted) { return }
     $script:CleanupStarted = $true
@@ -2879,6 +2953,13 @@ if ($ResetStageLedger) {
     Reset-StageLedger -Stage $Stage -Reason $ResetReason
     exit 0
 }
+
+# ── CFG043: 수동 완료/중단 (실행 대신 lease 종결) ──
+if ($ManualComplete -and $ManualAbort) {
+    Write-Log '-ManualComplete와 -ManualAbort는 동시에 사용할 수 없습니다.' ERROR; exit 1
+}
+if ($ManualComplete) { exit (Invoke-ManualStageTermination -Stage $Stage -Complete -ReasonText $Reason) }
+if ($ManualAbort) { exit (Invoke-ManualStageTermination -Stage $Stage -Complete:$false -ReasonText $Reason) }
 
 if ($Chain -and $Stage) { Write-Log '-Chain and -Stage are mutually exclusive.' ERROR; exit 1 }
 if ($Chain -and $Prompt) { Write-Log '-Prompt is ignored in -Chain mode; using each stage default prompt.' WARN }
@@ -3016,6 +3097,17 @@ if (-not $DryRun -and -not $script:BashExe) {
 
 if ($Chain) {
     Write-Log "📋 자동 연쇄 모드 시작 (TaskId: $TaskId): 패킷 첫 미완료 단계부터 수렴" INFO
+    # CFG043: 안전 재개 가드 — 살아 있는 lease·락이 있으면 자동 연쇄/재개가 그것을 건드리지 않고
+    # 중단한다(Done When 3). 완료 재개는 종결된 이전 단계 뒤 첫 미완료 단계부터라야 하므로,
+    # 만료(stale) lease는 가드하지 않는다 — 그것이 재개 대상이다.
+    $liveActivity = Test-LiveStageActivity
+    if ($liveActivity) {
+        Write-Log "⛔ 자동 연쇄/재개 중단 — 살아 있는 단계 실행이 있어 재개하지 않습니다: $liveActivity" ERROR
+        Write-Log '살아 있는 lease·락·승인 대기를 보존한 채 종료합니다. 실행이 끝난 뒤 다시 재개하세요.' ERROR
+        $holdingPipeline = Get-PacketPipelineStatus -PacketPath $checkPipelinePacket
+        Write-ChainSummary -State 'blocked' -Stages @() -Warnings @("살아 있는 실행으로 인한 재개 보류 — $liveActivity") -StartedAt (Get-Date) -PipelineBefore $holdingPipeline -PipelineAfter $holdingPipeline -TreeBefore (Get-TreeState) -TreeAfter (Get-TreeState) -QaVerdict @{ verdict = $null; fresh = $false } | Out-Null
+        exit 1
+    }
     $chainStartedAt = Get-Date
     $chainPipelineBefore = Get-PacketPipelineStatus -PacketPath $checkPipelinePacket
     Set-CompletedStageApprovalsSuperseded -PipelineStatus $chainPipelineBefore -Evidence $checkPipelinePacket | Out-Null

@@ -402,6 +402,35 @@ function Get-StageStateLease {
     return [pscustomobject]@{ Lease = $lease; Fresh = (([datetime]::UtcNow - $heartbeat).TotalSeconds -lt $limit); Heartbeat = $heartbeat; StartedAt = $parsedStartedAt }
 }
 
+# CFG043: 만료된 'running'/'starting' lease가 가리키는 단계가 패킷 Pipeline Status에서 이미 완료됐는지
+# 판정한다. 수동 완료/대체로 파이프라인이 그 단계를 실제로 마쳤다면 stale lease는 "정지"가 아니라
+# "재개 필요"의 신호다(Done When 2 — 패킷 ②③이 완료된 경우 '정지 감지' 대신 '재개 필요'를 표시).
+function Test-LeaseStageCompleteInPacket {
+    param([string]$ProjectPath, [string]$TaskId, $Lease)
+    $stage = [string]$Lease.Lease.stage
+    if ($stage -eq 'unknown' -or @('impl','qa','integration') -notcontains $stage) { return $false }
+    $indexes = switch ($stage) {
+        'impl' { @(2, 3) }
+        'qa' { @(4) }
+        'integration' { @(5) }
+        default { @() }
+    }
+    foreach ($dir in @((Join-Path $ProjectPath '.agents\briefs\packets'), (Join-Path $ProjectPath '.agents\briefs\archive'))) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        $pk = @(Get-ChildItem -Path $dir -Filter "$TaskId-*.md" -File -ErrorAction SilentlyContinue)
+        if ($pk.Count -ne 1) { continue }
+        $ps = Get-PacketPipelineStatus -PacketPath $pk[0].FullName
+        if (-not $ps.HasPipelineStatus -or $ps.Items.Count -eq 0) { continue }
+        $allChecked = $true
+        foreach ($i in $indexes) {
+            $item = @($ps.Items | Where-Object { $_.Index -eq $i })
+            if ($item.Count -eq 0 -or -not $item[0].Checked) { $allChecked = $false; break }
+        }
+        if ($allChecked) { return $true }
+    }
+    return $false
+}
+
 # Stage/Owner are presentation contracts, not a copy of stale router prose.  Normal
 # pipeline work always keeps its circled step; exceptional states deliberately replace
 # it with an unnumbered explanation so the grid does not imply that a stage is healthy.
@@ -410,6 +439,7 @@ function Format-DashboardStage {
     $exception = @{
         HANG = '무응답 의심'; APPROVAL_REQUIRED = '승인 대기'; FAILED = '실패 중단'
         STALE = '죽은 락 잔존'; STANDBY = '체인 전환'; BLOCKED = '락 대기'
+        RESUME = '재개 필요'
     }
     if ($exception.ContainsKey($Status)) { return $exception[$Status] }
     if ($Status -eq '장기보류' -or $Stage -match '장기\s*보류') { return '-' }
@@ -793,11 +823,23 @@ function Get-TaskStatuses {
                     $lastActivity = $lease.Heartbeat.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' · state lease 상태 판정 불가'
                     $lastActivityFull = $lastActivity
                 } else {
-                    $status = 'STALLED'
-                    $stage = $leaseStage
-                    $processId = $leasePid
-                    $lastActivity = $lease.Heartbeat.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' · state lease 만료'
-                    $lastActivityFull = $lastActivity
+                    # 기본은 '정지 감지'. 그러나 만료된 running/starting lease가 가리키는 단계가 패킷에서
+                    # 이미 완료됐다면(수동 완료/대체) 웅크린 정지가 아니라 '재개 필요'로 표시한다(CFG043 DW2).
+                    $resume = ([string]$lease.Lease.state -match '^(starting|running)$') -and
+                              (Test-LeaseStageCompleteInPacket -ProjectPath $projectPath -TaskId $task.TaskId -Lease $lease)
+                    if ($resume) {
+                        $status = 'RESUME'
+                        $stage = $leaseStage
+                        $processId = $leasePid
+                        $lastActivity = $lease.Heartbeat.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' · 종결됨 — 첫 미완료 단계부터 재개 필요'
+                        $lastActivityFull = $lastActivity
+                    } else {
+                        $status = 'STALLED'
+                        $stage = $leaseStage
+                        $processId = $leasePid
+                        $lastActivity = $lease.Heartbeat.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' · state lease 만료'
+                        $lastActivityFull = $lastActivity
+                    }
                 }
             } elseif ($lock -and $lock.Alive) {
                 $stage = $lock.Stage.ToUpperInvariant()
@@ -1024,6 +1066,7 @@ $statusStyles = [ordered]@{
     'STANDBY'  = @{ Text = '⏸ 체인대기';  Fore = 'SteelBlue';   Back = 'AliceBlue' }
     'READY'    = @{ Text = '○ 기동대기';  Fore = 'DimGray';     Back = 'White' }
     'STALLED'  = @{ Text = '⚠ 정지 감지'; Fore = 'DarkOrange';  Back = 'OldLace' }
+    'RESUME'   = @{ Text = '▶ 재개 필요'; Fore = 'MediumBlue';  Back = 'LightCyan' }
     'BLOCKED'  = @{ Text = '⏳ 락 대기로 불발'; Fore = 'DarkGoldenrod'; Back = 'LemonChiffon' }
     'WAITING'  = @{ Text = '◇ 대기중';    Fore = 'RoyalBlue';   Back = 'Lavender' }
     '장기보류'  = @{ Text = '◆ 장기보류';  Fore = 'Gray';        Back = 'WhiteSmoke' }
