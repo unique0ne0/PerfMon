@@ -77,13 +77,33 @@ function Test-HarnessOverrideState {
     return (Test-Path -LiteralPath $copy) -and ((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne $Master)
 }
 
+# ── CFG044: 배포 대상 자산의 유일한 목록은 매니페스트(harness-assets.txt)다 ────────────
+# sync-configs.ps1 / scripts/verify.ps1 / task-status.ps1 이 같은 파서 계약으로 읽는다.
+# 매니페스트에 없는 중앙 전용 문서(orchestration-runbook.md, promotion-notes.md)는 프로젝트
+# 드리프트로 세지 않는다. 배포된 task-status.ps1 은 자기 옆(scripts\)의 매니페스트를 먼저 읽고,
+# 없으면 중앙 정본 경로로 폴백한다. 순수 함수라 WinForms 없이 AST 임포트로 자동 검증할 수 있다.
+function Read-HarnessAssets {
+    param([string]$ManifestPath)
+    $assets = @()
+    if (-not (Test-Path -LiteralPath $ManifestPath)) { return $assets }
+    foreach ($line in @(Get-Content -LiteralPath $ManifestPath -Encoding UTF8)) {
+        $name = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith('#')) { continue }
+        if ($name -match '[/\\]' -or $name -eq '.' -or $name -eq '..' -or $name -like '..*') { continue }
+        if ($assets -notcontains $name) { $assets += $name }
+    }
+    return $assets
+}
+
 # ── CFG042: 하네스 배포 동기화 요약 — 오버라이드(추적 가능한 로컬 예외)와 드리프트 분리 ──
-# 정본 자산 목록은 이 저장소(실행 지점)의 global/harness 파일 목록에서 읽는다. 각 대상 사본이
-# 정본과 다르면 상태 파일의 엄격 조건을 위반하는지 확인해, 유효 오버라이드는 예외로, 나머지는
-# 드리프트로 집계한다. 순수 함수라 WinForms 없이 AST 임포트로 자동 검증할 수 있다.
 function Get-HarnessSyncSummary {
     $masterDir = Join-Path $root 'global\harness'
-    $assets = @(Get-ChildItem -LiteralPath $masterDir -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    # 배포된 사본은 자기 옆(scripts\) 매니페스트를 먼저 읽는다. AST 임포트 테스트처럼 $PSScriptRoot가
+    # 없는 문맥이면 그대로 중앙 정본 경로로 폴백한다 — 딱 하나의 목록을 두 소비자가 공유하게 한다.
+    $manifestPath = $null
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $manifestPath = Join-Path $PSScriptRoot 'harness-assets.txt' }
+    if ([string]::IsNullOrWhiteSpace($manifestPath) -or -not (Test-Path -LiteralPath $manifestPath)) { $manifestPath = Join-Path $masterDir 'harness-assets.txt' }
+    $assets = @(Read-HarnessAssets -ManifestPath $manifestPath)
     $harnessProjects = @(Get-HarnessProjects)
 
     $overrideLookup = @{}

@@ -28,7 +28,21 @@ $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrEmpty($RepoRoot)) { $RepoRoot = Split-Path -Parent $PSScriptRoot }
 if ([string]::IsNullOrEmpty($TargetList)) { $TargetList = Join-Path $RepoRoot 'harness-targets.txt' }
 
-$harnessAssets = @('dispatch-with-hang-detect.ps1', 'check-packet-archive.ps1', 'model-profiles.json', 'model-profile.ps1', 'orchestrate-packet.ps1', 'session-health.ps1', 'gy-orchestrator-prompt.md', 'commit-harness-sync.ps1', 'task-status.ps1', 'sweep-orphan-browsers.ps1', 'stage-thresholds.json')
+# CFG044: 커밋 대상 자산도 sync-configs.ps1과 같은 매니페스트(global/harness/harness-assets.txt)를
+# 읽는다. 매니페스트 자체(harness-assets.txt 항목)도 함께 배포·커밋되므로 이 목록을 유일 원천으로 쓴다.
+function Read-HarnessAssets {
+    param([string]$ManifestPath)
+    $assets = @()
+    if (-not (Test-Path -LiteralPath $ManifestPath)) { return $assets }
+    foreach ($line in @(Get-Content -LiteralPath $ManifestPath -Encoding UTF8)) {
+        $name = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith('#')) { continue }
+        if ($name -match '[/\\]' -or $name -eq '.' -or $name -eq '..' -or $name -like '..*') { continue }
+        if ($assets -notcontains $name) { $assets += $name }
+    }
+    return $assets
+}
+$harnessAssets = @(Read-HarnessAssets -ManifestPath (Join-Path $RepoRoot 'global\harness\harness-assets.txt'))
 
 $logDir = Join-Path $RepoRoot 'global\harness\logs\sync-commit'
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }

@@ -6,4 +6,9 @@ scripts/model-profile.ps1 linguist-generated=true
 scripts/orchestrate-packet.ps1 linguist-generated=true
 scripts/session-health.ps1 linguist-generated=true
 scripts/gy-orchestrator-prompt.md linguist-generated=true
+scripts/commit-harness-sync.ps1 linguist-generated=true
+scripts/task-status.ps1 linguist-generated=true
+scripts/sweep-orphan-browsers.ps1 linguist-generated=true
+scripts/stage-thresholds.json linguist-generated=true
+scripts/harness-assets.txt linguist-generated=true
 # END harness-generated
