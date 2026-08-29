@@ -33,11 +33,11 @@ if ([string]::IsNullOrEmpty($TargetList)) { $TargetList = Join-Path $RepoRoot 'h
 function Read-HarnessAssets {
     param([string]$ManifestPath)
     $assets = @()
-    if (-not (Test-Path -LiteralPath $ManifestPath)) { return $assets }
+    if (-not (Test-Path -LiteralPath $ManifestPath)) { throw "Harness asset manifest is missing: $ManifestPath" }
     foreach ($line in @(Get-Content -LiteralPath $ManifestPath -Encoding UTF8)) {
         $name = $line.Trim()
         if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith('#')) { continue }
-        if ($name -match '[/\\]' -or $name -eq '.' -or $name -eq '..' -or $name -like '..*') { continue }
+        if ($name -match '[/\\]' -or $name -eq '.' -or $name -eq '..' -or $name -like '..*') { throw "Invalid harness asset manifest entry '$name' in $ManifestPath" }
         if ($assets -notcontains $name) { $assets += $name }
     }
     return $assets

@@ -85,11 +85,11 @@ function Test-HarnessOverrideState {
 function Read-HarnessAssets {
     param([string]$ManifestPath)
     $assets = @()
-    if (-not (Test-Path -LiteralPath $ManifestPath)) { return $assets }
+    if (-not (Test-Path -LiteralPath $ManifestPath)) { throw "Harness asset manifest is missing: $ManifestPath" }
     foreach ($line in @(Get-Content -LiteralPath $ManifestPath -Encoding UTF8)) {
         $name = $line.Trim()
         if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith('#')) { continue }
-        if ($name -match '[/\\]' -or $name -eq '.' -or $name -eq '..' -or $name -like '..*') { continue }
+        if ($name -match '[/\\]' -or $name -eq '.' -or $name -eq '..' -or $name -like '..*') { throw "Invalid harness asset manifest entry '$name' in $ManifestPath" }
         if ($assets -notcontains $name) { $assets += $name }
     }
     return $assets
@@ -103,7 +103,8 @@ function Get-HarnessSyncSummary {
     $manifestPath = $null
     if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $manifestPath = Join-Path $PSScriptRoot 'harness-assets.txt' }
     if ([string]::IsNullOrWhiteSpace($manifestPath) -or -not (Test-Path -LiteralPath $manifestPath)) { $manifestPath = Join-Path $masterDir 'harness-assets.txt' }
-    $assets = @(Read-HarnessAssets -ManifestPath $manifestPath)
+    try { $assets = @(Read-HarnessAssets -ManifestPath $manifestPath) }
+    catch { return [pscustomobject]@{ MasterChecks = 0; Overrides = @(); Drifts = @("manifest ($($_.Exception.Message))"); Projects = @() } }
     $harnessProjects = @(Get-HarnessProjects)
 
     $overrideLookup = @{}
