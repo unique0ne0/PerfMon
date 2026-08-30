@@ -18,12 +18,17 @@
     "gemini-planning": { "adapter": "antigravity", "family": "gemini", "model": "gemini-3.1-pro-high", "tier": "quality", "fallbackProfiles": [] },
     "gemini-driver": { "adapter": "antigravity", "family": "gemini", "model": "gemini-3.7-flash", "tier": "fast", "fallbackProfiles": ["claude-driver", "codex-driver"] },
     "claude-driver": { "adapter": "claude", "family": "claude", "model": "sonnet", "tier": "balanced", "fallbackProfiles": ["codex-driver"] },
+    "claude-qa": { "adapter": "claude", "family": "claude", "model": "sonnet", "tier": "balanced", "fallbackProfiles": [] },
     "codex-driver": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "tier": "balanced", "fallbackProfiles": [] },
     "codex-qa": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "tier": "balanced", "fallbackProfiles": [] },
     "gemini-qa": { "adapter": "antigravity", "family": "gemini", "model": "gemini-3.7-flash", "tier": "fast", "fallbackProfiles": ["gemini-qa-opencode", "codex-qa"] },
     "gemini-qa-opencode": { "adapter": "opencode", "family": "gemini", "model": "google/gemini-3.7-flash", "tier": "fast", "fallbackProfiles": [] },
     "claude-integration": { "adapter": "claude", "family": "claude", "model": "sonnet", "tier": "balanced", "fallbackProfiles": [] },
     "codex-integration": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "tier": "quality", "fallbackProfiles": [] },
+    "opencode-planning": { "adapter": "opencode", "family": "opencode", "model": "opencode/deepseek-v4-flash-free", "tier": "fast", "fallbackProfiles": [] },
+    "opencode-driver": { "adapter": "opencode", "family": "opencode", "model": "opencode/deepseek-v4-flash-free", "tier": "fast", "fallbackProfiles": ["codex-driver"] },
+    "opencode-qa": { "adapter": "opencode", "family": "opencode", "model": "opencode/deepseek-v4-flash-free", "tier": "fast", "fallbackProfiles": [] },
+    "opencode-integration": { "adapter": "opencode", "family": "opencode", "model": "opencode/deepseek-v4-flash-free", "tier": "fast", "fallbackProfiles": [] },
     "gemini-integration": { "adapter": "antigravity", "family": "gemini", "model": "gemini-3.7-flash", "tier": "fast", "fallbackProfiles": [] }
   },
   "routes": {
@@ -34,6 +39,7 @@
     "claude": { "implementationRoute": "claude-planned", "qaProfile": "codex-qa", "integrationProfile": "claude-integration" },
     "codex": { "implementationRoute": "independent-planned", "qaProfile": "gemini-qa", "integrationProfile": "codex-integration" },
     "antigravity": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "gemini-integration" },
+    "opencode": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "claude-integration" },
     "gemini": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "gemini-integration" }
   },
   "fallbackOn": ["provider_unavailable", "authentication", "quota"],

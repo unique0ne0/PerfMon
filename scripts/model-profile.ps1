@@ -50,8 +50,17 @@ function Test-ProfileGraph {
     }
     # 검사 대상 어댑터를 하드코딩하지 않고 plannerRouting 자체에서 읽는다. 다만 실제로 기획을 맡을 수
     # 있는 어댑터는 항목이 빠지면 안 되므로 존재만 강제한다(gemini는 agy로 대체되어 선택 항목이다).
-    foreach ($requiredAdapter in @('claude', 'codex', 'antigravity')) {
+    foreach ($requiredAdapter in @('claude', 'codex', 'antigravity', 'opencode')) {
         if ($null -eq $Config.plannerRouting.$requiredAdapter) { throw "Missing planner routing for $requiredAdapter" }
+    }
+    # CFG046 Done When 1: every supported team must be executable in every pipeline role.
+    foreach ($adapter in @('claude', 'codex', 'antigravity', 'opencode')) {
+        foreach ($roleSuffix in @('planning', 'driver', 'qa', 'integration')) {
+            $matches = @($Config.profiles.psobject.Properties | Where-Object {
+                [string]$_.Value.adapter -eq $adapter -and $_.Name -match ("-{0}$" -f $roleSuffix)
+            })
+            if ($matches.Count -eq 0) { throw "Missing $roleSuffix profile for $adapter" }
+        }
     }
     foreach ($routingProperty in @($Config.plannerRouting.psobject.Properties)) {
         $adapter = [string]$routingProperty.Name
