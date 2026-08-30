@@ -3054,7 +3054,12 @@ if ($integrationSlots.Count -eq 0) {
     $StageConfig.integration.Model = $integrationSlots[0].Model
 }
 $StageConfig.integration.ReportFile = "$TaskLogPrefix-integration-last.md"
-$stateRoot = if ($env:USERPROFILE) { Join-Path $env:USERPROFILE '.agents\harness\state' } else { Join-Path ([IO.Path]::GetTempPath()) 'agents-harness-state' }
+# 상태 저장소는 반드시 `~/.agents/harness` **밖**에 둔다. 그 폴더는 sync-configs.ps1이
+# robocopy /MIR로 미러링하는 배포 대상이라, 저장소에 없는 하위 폴더는 Push 한 번에 purge된다.
+# 종전 경로(`.agents\harness\state`)는 그 안에 있었고, 다음 Push에서 provider health cooldown이
+# 통째로 삭제될 상태였다(2026-08-30 발견 · 이관). 여기를 다시 harness 아래로 옮기지 말 것 —
+# scripts/verify.ps1의 회귀 검사가 막는다.
+$stateRoot = if ($env:USERPROFILE) { Join-Path $env:USERPROFILE '.agents\harness-state' } else { Join-Path ([IO.Path]::GetTempPath()) 'agents-harness-state' }
 $script:ProviderHealthPath = Join-Path $stateRoot 'provider-health.json'
 Write-Log "planner=$planningProfile/$planningAdapter impl-route=$($script:PipelineRouting.ImplementationRoute) qa=$($StageConfig.qa.Adapter)/$($StageConfig.qa.Model) project=$($StageConfig.qa.ProjectId) integration=$($StageConfig.integration.Adapter)/$($StageConfig.integration.Model)" INFO
 
