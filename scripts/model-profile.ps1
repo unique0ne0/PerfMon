@@ -108,8 +108,17 @@ function Read-ModelProfileConfig {
     $graphWarnings.Clear()
     $local = Read-JsonFile -Path $LocalPath
     if ($null -ne $local) {
-        $unexpectedTopLevel = @($local.psobject.Properties.Name | Where-Object { $_ -notin @('roles', 'plannerRouting') })
-        if ($unexpectedTopLevel.Count -gt 0) { throw "Local model profile config only permits 'roles' and 'plannerRouting'." }
+        $unexpectedTopLevel = @($local.psobject.Properties.Name | Where-Object { $_ -notin @('roles', 'plannerRouting', 'preferCost') })
+        if ($unexpectedTopLevel.Count -gt 0) { throw "Local model profile config only permits 'roles', 'plannerRouting', and 'preferCost'." }
+        $forbiddenFields = @('command', 'apiKey', 'token', 'secret', 'password')
+        foreach ($prop in @($local.psobject.Properties)) {
+            if ($prop.Name -in $forbiddenFields) { throw "Local model profile config contains forbidden field: $($prop.Name)" }
+        }
+        if ($null -ne $local.preferCost) {
+            $costVal = [string]$local.preferCost
+            if ($costVal -ne 'free') { throw "Unsupported preferCost value '$costVal'. Only 'free' is supported." }
+            $config | Add-Member -NotePropertyName preferCost -NotePropertyValue $costVal -Force
+        }
         if ($null -ne $local.roles) {
             $unexpectedRoles = @($local.roles.psobject.Properties.Name | Where-Object { $_ -notin @('planning', 'orchestration') })
             if ($unexpectedRoles.Count -gt 0) { throw 'Local model profile config contains an unsupported role.' }
@@ -122,7 +131,6 @@ function Read-ModelProfileConfig {
                 if ($null -eq $centralRoute) { $config.plannerRouting | Add-Member -NotePropertyName $adapter.Name -NotePropertyValue $adapter.Value }
                 else { foreach ($prop in @($adapter.Value.psobject.Properties)) { $centralRoute | Add-Member -NotePropertyName $prop.Name -NotePropertyValue $prop.Value -Force } }
             }
-            $forbiddenFields = @('command', 'apiKey', 'token', 'secret', 'password')
             foreach ($adapter in @($local.plannerRouting.psobject.Properties)) {
                 if ($null -ne $adapter.Value) {
                     foreach ($prop in @($adapter.Value.psobject.Properties)) {
