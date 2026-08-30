@@ -37,7 +37,7 @@ function Read-HarnessAssets {
     foreach ($line in @(Get-Content -LiteralPath $ManifestPath -Encoding UTF8)) {
         $name = $line.Trim()
         if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith('#')) { continue }
-        if ($name -match '[/\\]' -or $name -eq '.' -or $name -eq '..' -or $name -like '..*') { throw "Invalid harness asset manifest entry '$name' in $ManifestPath" }
+        if ($name -match '[<>:"/\\|?*\x00-\x1F]' -or $name -eq '.' -or $name -eq '..' -or $name -like '..*') { throw "Invalid harness asset manifest entry '$name' in $ManifestPath" }
         if ($assets -notcontains $name) { $assets += $name }
     }
     return $assets
