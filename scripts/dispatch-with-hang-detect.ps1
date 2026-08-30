@@ -2044,6 +2044,26 @@ function Get-RuntimeRoleBinding {
     return [pscustomobject]$result
 }
 
+function Resolve-ForceFreeModelChain {
+    param(
+        [string[]]$ModelFallback,
+        [object]$ProfileConfig,
+        [bool]$ForceFreeModel
+    )
+    $shouldForceFree = $ForceFreeModel -or ($ProfileConfig.preferCost -and [string]$ProfileConfig.preferCost -eq 'free')
+    if (-not $shouldForceFree) { return @($ModelFallback) }
+    $freeModels = @($ModelFallback | Where-Object {
+        $ProfileConfig.modelCatalog.$_ -and [string]$ProfileConfig.modelCatalog.$_.cost -eq 'free'
+    })
+    $sourceLabel = if ($ForceFreeModel) { '-ForceFreeModel' } else { 'preferCost: free' }
+    if ($freeModels.Count -eq 0) {
+        Write-Log ("⛔ {0} 지정됐지만 modelCatalog에 cost=free 슬롯이 없음 — 원래 체인 유지" -f $sourceLabel) ERROR
+        return @($ModelFallback)
+    }
+    Write-Log ("[impl] {0}: 유료 슬롯 건너뛰고 무료로 직행 ({1})" -f $sourceLabel, ($freeModels -join ' → ')) INFO
+    return @($freeModels)
+}
+
 function Set-CompletedStageApprovalsSuperseded {
     param([object]$PipelineStatus, [string]$Evidence)
     if ($null -eq $PipelineStatus -or -not $PipelineStatus.HasPipelineStatus) { return @() }
@@ -2827,6 +2847,7 @@ function Write-ChainSummary {
         pipelineStatus = @{ before = $PipelineBefore; after = $PipelineAfter }
         tree = @{ before = $TreeBefore; after = $TreeAfter; changedFileCount = if ($TreeAfter -and $TreeAfter.Dirty) { @(($TreeAfter.Dirty -split "`r?`n") | Where-Object { $_ }).Count } else { 0 }; fingerprintComparable = [bool]($TreeBefore -and $TreeAfter -and $TreeBefore.FingerprintOk -and $TreeAfter.FingerprintOk) }
         warnings = @($Warnings)
+        runtimeRoleBinding = $script:RuntimeRoleBinding
         logDirectory = $LogDir
     }
     $tempPath = "$summaryPath.$([guid]::NewGuid().ToString('N')).tmp"
@@ -3035,30 +3056,38 @@ $script:ProfileConfig = Read-ModelProfileConfig -CentralPath $ProfileConfigPath 
 $configuredPlanning = Resolve-RoleProfile -Role planning -Config $script:ProfileConfig
 $planningProfile = $configuredPlanning.Name
 $planningAdapter = $configuredPlanning.Adapter
+$script:RuntimeRoleBinding = [pscustomobject]@{
+    source = 'config'
+    legacy = $false
+    planningProfile = $planningProfile
+    planningAdapter = $planningAdapter
+}
 if ($checkPipelinePacket) {
     $runtimeBinding = Get-RuntimeRoleBinding -PacketPath $checkPipelinePacket
     if ($runtimeBinding.Valid) {
         $planningProfile = $runtimeBinding.PlanningProfile
         $planningAdapter = $runtimeBinding.PlanningAdapter
+        $script:RuntimeRoleBinding = [pscustomobject]@{
+            source = 'packet'
+            legacy = $false
+            planningProfile = $planningProfile
+            planningAdapter = $planningAdapter
+        }
     } elseif ($runtimeBinding.Error) {
         throw $runtimeBinding.Error
     } else {
+        $script:RuntimeRoleBinding = [pscustomobject]@{
+            source = 'config'
+            legacy = $true
+            planningProfile = $planningProfile
+            planningAdapter = $planningAdapter
+        }
         Write-Log 'Runtime Role Binding missing; using configured planning profile for legacy packet.' WARN
     }
 }
 $script:PipelineRouting = Resolve-PipelineRouting -Config $script:ProfileConfig -PlanningProfile $planningProfile -PlanningAdapter $planningAdapter
 $StageConfig.impl.ModelFallback = @($script:PipelineRouting.ImplementationModels)
-if ($ForceFreeModel) {
-    $freeModels = @($StageConfig.impl.ModelFallback | Where-Object {
-        $script:ProfileConfig.modelCatalog.$_ -and [string]$script:ProfileConfig.modelCatalog.$_.cost -eq 'free'
-    })
-    if ($freeModels.Count -eq 0) {
-        Write-Log '⛔ -ForceFreeModel 지정됐지만 modelCatalog에 cost=free 슬롯이 없음 — 원래 체인 유지' ERROR
-    } else {
-        Write-Log "[impl] -ForceFreeModel: 유료 슬롯 건너뛰고 무료로 직행 ($($freeModels -join ' → '))" INFO
-        $StageConfig.impl.ModelFallback = $freeModels
-    }
-}
+$StageConfig.impl.ModelFallback = @(Resolve-ForceFreeModelChain -ModelFallback $StageConfig.impl.ModelFallback -ProfileConfig $script:ProfileConfig -ForceFreeModel $ForceFreeModel)
 
 # 구현(②③) 슬롯의 어댑터를 modelCatalog에서 해석한다. 개발1팀 역할이 opencode에 고정되어 있으면
 # 다른 팀이 구현을 대체 수행할 수 없어(지시 6·11) 프로바이더 장애가 곧 파이프라인 정지가 된다.
