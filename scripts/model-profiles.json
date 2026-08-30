@@ -15,7 +15,7 @@
   "profiles": {
     "claude-planning": { "adapter": "claude", "family": "claude", "model": "sonnet", "tier": "balanced", "fallbackProfiles": [] },
     "codex-planning": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "tier": "quality", "fallbackProfiles": [] },
-    "gemini-planning": { "adapter": "antigravity", "family": "gemini", "model": "gemini-3.7-flash", "tier": "fast", "fallbackProfiles": [] },
+    "gemini-planning": { "adapter": "antigravity", "family": "gemini", "model": "gemini-3.1-pro-high", "tier": "quality", "fallbackProfiles": [] },
     "gemini-driver": { "adapter": "antigravity", "family": "gemini", "model": "gemini-3.7-flash", "tier": "fast", "fallbackProfiles": ["claude-driver", "codex-driver"] },
     "claude-driver": { "adapter": "claude", "family": "claude", "model": "sonnet", "tier": "balanced", "fallbackProfiles": ["codex-driver"] },
     "codex-driver": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "tier": "balanced", "fallbackProfiles": [] },
