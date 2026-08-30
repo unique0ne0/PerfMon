@@ -2167,8 +2167,18 @@ function Measure-ContextBytes {
         $packetText = Get-Content -LiteralPath $packetPath -Raw -Encoding UTF8
         $rrMatch = [regex]::Match($packetText, '(?s)##\s*Required Reading\s*\n(.+?)(?=\n##\s|\z)')
         if ($rrMatch.Success) {
+            # Required Reading의 백틱 안에는 파일 경로만 있는 것이 아니다 — `agy models`, `model:<name>`,
+            # `@('claude','codex')` 처럼 설명용 토큰이 섞인다. 이런 문자열을 경로 API에 그대로 넘기면
+            # IsPathRooted가 "Illegal characters in path"로 throw하고, 측정 코드가 디스패치 전체를
+            # 죽인다(2026-08-31 CFG046 impl 실측). 경로가 아닌 토큰은 조용히 건너뛴다.
+            $invalidPathChars = [System.IO.Path]::GetInvalidPathChars()
             foreach ($m in [regex]::Matches($rrMatch.Groups[1].Value, '`([^`]+)`')) {
                 $relPath = $m.Groups[1].Value.Trim().TrimEnd('.')
+                if ([string]::IsNullOrWhiteSpace($relPath)) { continue }
+                if ($relPath.IndexOfAny($invalidPathChars) -ge 0) { continue }
+                # 드라이브 문자를 뺀 콜론은 경로가 아니다(`model:<name>`, `principal:opencode-go`).
+                $colonIndex = $relPath.IndexOf(':')
+                if ($colonIndex -ge 0 -and $colonIndex -ne 1) { continue }
                 $absPath = if ($relPath.StartsWith('~')) {
                     if ($env:USERPROFILE) {
                         Join-Path $env:USERPROFILE ($relPath.Substring(1).TrimStart('/\') -replace '/','\')
@@ -2530,7 +2540,8 @@ function Dispatch-Stage {
     $config = $StageConfig[$Stage]
     $logRel = $config.LogFile
 
-    Measure-ContextBytes -Stage $Stage
+    # 컨텍스트 측정은 순수 관측이다 — 여기서 난 예외로 파이프라인이 멈춰서는 안 된다.
+    try { Measure-ContextBytes -Stage $Stage } catch { Write-Log "[context-size] 측정 실패(무시하고 진행): $($_.Exception.Message)" WARN }
 
     # CFG025: 헤드리스 antigravity는 모든 run_command를 승인 대기로 거부한다. QA는 이미 직접 수정
     # 권한을 가진 신뢰 단계이므로 사용자 승인(2026-08-19)에 따라 항상 --dangerously-skip-permissions를 부여한다.
