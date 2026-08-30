@@ -5,6 +5,7 @@ using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
+using Microsoft.Win32;
 using WColor = System.Windows.Media.Color;
 using HAlign = System.Windows.HorizontalAlignment;
 
@@ -80,6 +81,50 @@ public partial class MainWindow : Window
             AssertTopmost();
     }
 
+    // ── 화면 안 복귀 (모니터 전환·DPI 변경·장시간 오프스크린 표류 대비) ──
+    // 창이 가상화면 밖(어느 방향이든 완전히 벗어남)이면 안쪽으로 되돌린다.
+    private void EnsureOnScreen()
+    {
+        if (!IsLoaded) return;
+        double vx = SystemParameters.VirtualScreenLeft;
+        double vy = SystemParameters.VirtualScreenTop;
+        double vw = SystemParameters.VirtualScreenWidth;
+        double vh = SystemParameters.VirtualScreenHeight;
+
+        double x = Left, y = Top;
+        double w = Width, h = Height;
+
+        // 오버레이는 항상 화면 안에 완전히 보여야 하므로,
+        // 창 일부(어느 방향이든)가 가상화면 밖이면 화면 안으로 완전히 되돌린다.
+        bool outLeft  = x < vx;
+        bool outRight = x + w > vx + vw;
+        bool outTop   = y < vy;
+        bool outBottom = y + h > vy + vh;
+        if (!(outLeft || outRight || outTop || outBottom)) return;
+
+        // 화면보다 창이 크면 좌상단에 붙이고, 아니면 4px 여백을 둔 채 화면 안으로 클램프
+        double nx = w >= vw ? vx : Math.Clamp(x, vx + 4, vx + vw - w - 4);
+        double ny = h >= vh ? vy : Math.Clamp(y, vy + 4, vy + vh - h - 4);
+
+        if (Math.Abs(nx - x) < 0.01 && Math.Abs(ny - y) < 0.01) return;
+
+        Left = nx;
+        Top  = ny;
+    }
+
+    // 오프스크린 표류 방지 자동복구: 매 초 및 모니터/세션 변경 시 호출
+    private void AutoClampNow()
+    {
+        if (!IsVisible) return;
+        var prevX = Left; var prevY = Top;
+        EnsureOnScreen();
+        if (Math.Abs(Left - prevX) > 0.01 || Math.Abs(Top - prevY) > 0.01)
+        {
+            _saveDebounce.Stop();
+            _saveDebounce.Start();   // 보정된 위치를 곧 저장
+        }
+    }
+
     private void AssertTopmost()
     {
         var hwnd = new WindowInteropHelper(this).Handle;
@@ -119,6 +164,15 @@ public partial class MainWindow : Window
         ContextMenuOpening += (_, _) => MenuRenderer.FillWpf(ContextMenu, BuildMenuModel());
 
         Loaded += (_, _) => { LoadSettings(); _loaded = true; };
+
+        // 모니터/해상도 구성 변경 시 창이 화면 밖에 남아있지 않도록 즉시 복구
+        SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
+    }
+
+    private void OnDisplaySettingsChanged(object? sender, EventArgs e)
+    {
+        // SystemEvents 콜백은 UI 스레드가 아님 → Dispatcher로 전달
+        Dispatcher.BeginInvoke(DispatcherPriority.Background, () => AutoClampNow());
     }
 
     // 섹션 인덱스 0=CPU 1=MEM 2=DISK 3=NET 로 매핑되는 UI 요소
@@ -859,6 +913,9 @@ public partial class MainWindow : Window
         // 포그라운드 이벤트를 놓친 경우(작업표시줄 자동 상승 등) 대비 주기적 재주장
         if (_cfg.AlwaysOnTop && IsVisible) AssertTopmost();
 
+        // 장시간 가동 중 오프스크린으로 밀려난 경우(모니터 구성 변경 등) 화면 안으로 복구
+        if (IsVisible) AutoClampNow();
+
         var d = _monitor.Collect();
 
         vCpu.Text   = $"{d.Cpu:F0}%";
@@ -1085,6 +1142,7 @@ public partial class MainWindow : Window
     {
         if (_cfg.SavedX.HasValue) Left = _cfg.SavedX.Value;
         if (_cfg.SavedY.HasValue) Top  = _cfg.SavedY.Value;
+        AutoClampNow();              // 지정 위치가 화면 밖이면 화면 안으로 복귀
     }
 
     protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
@@ -1095,6 +1153,7 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
         if (_fgHook != IntPtr.Zero) { UnhookWinEvent(_fgHook); _fgHook = IntPtr.Zero; }
         SaveWindowStateNow();
         _timer.Stop();
