@@ -111,6 +111,8 @@ $StageConfig = @{
         ModelFallback = @('opencode-go/mimo-v2.5-pro', 'opencode-go/deepseek-v4-flash', 'opencode-go/mimo-v2.5', 'opencode/deepseek-v4-flash-free', 'opencode/big-pickle')
         DefaultPrompt = "작업 $TaskId — [②구현] handoff 확인하고 패킷의 Done When과 Amendments를 충실히 따라 다음 단계 구현을 진행해. 구현 완료 후 [③자체리뷰] 제로베이스에서 개발 의도·계획 반영 여부와 로직·코드 품질을 점검하고 필요시 수정해. 이어서 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ②③을 갱신해"
         LogFile = "$TaskLogPrefix-impl.log"
+        # codex 어댑터가 구현 슬롯에 배정될 때 `codex exec -o`가 쓸 보고서 경로다(다른 어댑터는 무시).
+        ReportFile = "$TaskLogPrefix-impl-last.md"
         KillOnHang = $true
         Retry = $false
         # 단계별 hang 임계(HangSeconds)는 stage-thresholds.json이 정본이다 — 아래에서 로드해 덮어쓴다.
@@ -398,8 +400,19 @@ function Test-AntigravityPreflight {
     return $result
 }
 
+# 라우트 슬롯 식별자(`provider/model`)를 그 어댑터가 실제로 받는 모델 문자열로 바꾼다.
+# opencode 슬롯은 식별자 자체가 모델명이라 매핑이 없고, antigravity 처럼 provider 접두어를
+# 쓰지 않는 어댑터만 modelCatalog의 invokeModel로 치환된다.
+function Resolve-InvocationModel {
+    param([hashtable]$Config, [string]$Model)
+    if ([string]::IsNullOrWhiteSpace($Model)) { return $Model }
+    if ($Config.ModelMap -and $Config.ModelMap.ContainsKey($Model)) { return [string]$Config.ModelMap[$Model] }
+    return $Model
+}
+
 function Build-ToolCommand {
     param([hashtable]$Config, [string]$Stage, [string]$PromptOverride, [string]$Model, [switch]$BypassToolPermissions)
+    $Model = Resolve-InvocationModel -Config $Config -Model $Model
     $p = if ([string]::IsNullOrWhiteSpace($PromptOverride)) { $Config.DefaultPrompt } else { $PromptOverride }
     $q = ConvertTo-BashSingleQuoted $p
     $cmd = if ($Model) { $Config.Command -replace '\{MODEL\}', $Model } else { $Config.Command }
@@ -407,6 +420,12 @@ function Build-ToolCommand {
     # (CFG046 R11 — Build-AdapterCommand 와 중복을 허용하지 않는다). ProjectId 누락 시 즉시 실패한다.
     switch ($Stage) {
                 'impl'        {
+            # 개발1팀도 어댑터가 고정이 아니다(모든 팀이 모든 역할 수행). 라우트 슬롯의 어댑터를
+            # 따르고, 어댑터가 없거나 opencode일 때만 기존 Command 템플릿을 쓴다.
+            if ($Config.Adapter -eq 'antigravity') { return Build-AntigravityCommand -Model $Model -Prompt $p -ProjectId $Config.ProjectId -Executable $Config.Executable }
+            if ($Config.Adapter -eq 'claude') { return "claude -p $q --model $Model --dangerously-skip-permissions --output-format stream-json --verbose" }
+            if ($Config.Adapter -eq 'codex') { return "codex exec $q -m $Model -s danger-full-access -o $(ConvertTo-BashSingleQuoted $Config.ReportFile)" }
+            if ($Config.Adapter -eq 'gemini') { return "gemini --approval-mode yolo -m $Model $q" }
             if ($Model -and $Model -match '(?i)(big-pickle|free|flash)' -and $cmd -match ' --variant \S+') {
                 $cmd = $cmd -replace ' --variant \S+', ''
             }
@@ -2270,7 +2289,7 @@ function Invoke-StagePreflightGate {
     $preflight = Test-AntigravityPreflight -Stage $Stage
     if (-not $preflight.Ready) {
         $reason = "Antigravity preflight 실패: $($preflight.Warnings -join '; ')"
-        if ($config.AdapterChain -and $config.AdapterChain.Count -gt 0) {
+        if (($config.AdapterChain -and $config.AdapterChain.Count -gt 0) -or ($config.AdapterMap -and $config.AdapterMap.Count -gt 1)) {
             Write-Log "⚠️ [$Stage] $reason (AdapterChain 설정됨 — 슬롯별 폴백을 위해 모델 루프 계속 진행)" WARN
         } else {
             Write-Log "❌ [$Stage] $reason" ERROR
@@ -2290,8 +2309,15 @@ function Invoke-StagePreflightGate {
 function Resolve-SlotAdapter {
     param([hashtable]$config, [string]$Stage, [int]$ModelIndex, [string]$Model, [string]$RepoRoot)
 
-    if (-not ($config.AdapterChain -and $ModelIndex -lt $config.AdapterChain.Count)) { return @{ Next = $false; Failure = $null } }
-    $config.Adapter = $config.AdapterChain[$ModelIndex]
+    # impl 체인은 preflight cooldown 필터로 슬롯이 걸러지므로 인덱스 기반 AdapterChain은 필터 후
+    # 어긋난다. AdapterMap(모델 식별자 → 어댑터)이 있으면 그쪽을 우선한다.
+    if ($config.AdapterMap -and $Model -and $config.AdapterMap.ContainsKey($Model)) {
+        $config.Adapter = [string]$config.AdapterMap[$Model]
+    } elseif ($config.AdapterChain -and $ModelIndex -lt $config.AdapterChain.Count) {
+        $config.Adapter = $config.AdapterChain[$ModelIndex]
+    } else {
+        return @{ Next = $false; Failure = $null }
+    }
     if ($config.Adapter -ne 'antigravity') { return @{ Next = $false; Failure = $null } }
     try {
         $config.ProjectId = Resolve-AntigravityProjectId -RepositoryRoot $RepoRoot
@@ -3034,6 +3060,23 @@ if ($ForceFreeModel) {
     }
 }
 
+# 구현(②③) 슬롯의 어댑터를 modelCatalog에서 해석한다. 개발1팀 역할이 opencode에 고정되어 있으면
+# 다른 팀이 구현을 대체 수행할 수 없어(지시 6·11) 프로바이더 장애가 곧 파이프라인 정지가 된다.
+# adapter/invokeModel이 없는 기존 슬롯은 종전과 동일하게 opencode + 식별자 그대로 동작한다.
+$implAdapterMap = @{}
+$implModelMap = @{}
+foreach ($implSlot in @($StageConfig.impl.ModelFallback)) {
+    $implMeta = $null
+    if ($script:ProfileConfig.modelCatalog) { $implMeta = $script:ProfileConfig.modelCatalog.$implSlot }
+    $implAdapterMap[$implSlot] = if ($implMeta -and $implMeta.adapter) { [string]$implMeta.adapter } else { 'opencode' }
+    if ($implMeta -and $implMeta.invokeModel) { $implModelMap[$implSlot] = [string]$implMeta.invokeModel }
+}
+$StageConfig.impl.AdapterMap = $implAdapterMap
+$StageConfig.impl.ModelMap = $implModelMap
+$implFirstSlot = @($StageConfig.impl.ModelFallback)[0]
+if ($implFirstSlot -and $implAdapterMap.ContainsKey($implFirstSlot)) { $StageConfig.impl.Adapter = $implAdapterMap[$implFirstSlot] }
+if ($StageConfig.impl.Adapter -eq 'antigravity') { $StageConfig.impl.ProjectId = Resolve-AntigravityProjectId -RepositoryRoot $RepoRoot }
+
 # CFG024 §Done When 4: QA·Integration에 실제로 동작하는 폴백 체인을 배선한다.
 # ModelChain/AdapterChain이 Resolve-ModelChain에서 소비되며, Dispatch-Stage 루프가 슬롯마다
 # AdapterChain을 따라 $config.Adapter를 갱신한다(위 Dispatch-Stage 본문 참조).
@@ -3074,7 +3117,7 @@ $StageConfig.integration.ReportFile = "$TaskLogPrefix-integration-last.md"
 # scripts/verify.ps1의 회귀 검사가 막는다.
 $stateRoot = if ($env:USERPROFILE) { Join-Path $env:USERPROFILE '.agents\harness-state' } else { Join-Path ([IO.Path]::GetTempPath()) 'agents-harness-state' }
 $script:ProviderHealthPath = Join-Path $stateRoot 'provider-health.json'
-Write-Log "planner=$planningProfile/$planningAdapter impl-route=$($script:PipelineRouting.ImplementationRoute) qa=$($StageConfig.qa.Adapter)/$($StageConfig.qa.Model) project=$($StageConfig.qa.ProjectId) integration=$($StageConfig.integration.Adapter)/$($StageConfig.integration.Model)" INFO
+Write-Log "planner=$planningProfile/$planningAdapter impl-route=$($script:PipelineRouting.ImplementationRoute) impl=$implFirstSlot(adapter=$($StageConfig.impl.Adapter)) qa=$($StageConfig.qa.Adapter)/$($StageConfig.qa.Model) project=$($StageConfig.qa.ProjectId) integration=$($StageConfig.integration.Adapter)/$($StageConfig.integration.Model)" INFO
 
 trap {
     Invoke-DispatcherCleanup

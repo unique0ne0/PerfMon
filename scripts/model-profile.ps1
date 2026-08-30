@@ -34,6 +34,11 @@ function Test-ProfileGraph {
         $meta = $catalogEntry.Value
         if ([string]$meta.family -notmatch '^[a-z][a-z0-9-]*$') { throw "Invalid family in modelCatalog: $($catalogEntry.Name)" }
         if ([string]::IsNullOrWhiteSpace([string]$meta.principal)) { throw "Missing principal in modelCatalog: $($catalogEntry.Name)" }
+        # adapter/invokeModel은 선택 항목이다 — 없으면 opencode 어댑터에 식별자 그대로가 모델명이다.
+        # 개발1팀(구현) 슬롯도 어댑터가 고정이 아니어야 하므로(모든 팀이 모든 역할 수행) 여기서 검증만 하고
+        # 기본값은 디스패처가 채운다.
+        if ($meta.adapter -and ([string]$meta.adapter -notin @('claude', 'codex', 'opencode', 'gemini', 'antigravity'))) { throw "Unsupported adapter in modelCatalog: $($catalogEntry.Name)" }
+        if ($meta.invokeModel -and ([string]$meta.invokeModel -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$')) { throw "Invalid invokeModel in modelCatalog: $($catalogEntry.Name)" }
     }
     foreach ($route in @($Config.routes.psobject.Properties)) {
         $models = @($route.Value)
