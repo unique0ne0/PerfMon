@@ -403,10 +403,8 @@ function Build-ToolCommand {
     $p = if ([string]::IsNullOrWhiteSpace($PromptOverride)) { $Config.DefaultPrompt } else { $PromptOverride }
     $q = ConvertTo-BashSingleQuoted $p
     $cmd = if ($Model) { $Config.Command -replace '\{MODEL\}', $Model } else { $Config.Command }
-    $agyCommand = if ($Config.Executable) { ConvertTo-BashSingleQuoted ([string]$Config.Executable).Replace('\','/') } else { 'agy' }
-    # agy(Antigravity)는 권한 프롬프트로 단계가 멈추는 일이 잦아, 사용자 지시(2026-08-31)에 따라
-    # -BypassToolPermissions 스위치와 무관하게 항상 사용자 권한으로 실행한다.
-    $agyPermissionFlag = ' --dangerously-skip-permissions'
+    # agy(Antigravity) 커맨드는 model-profile.ps1 의 Build-AntigravityCommand 단일 구현으로 만든다
+    # (CFG046 R11 — Build-AdapterCommand 와 중복을 허용하지 않는다). ProjectId 누락 시 즉시 실패한다.
     switch ($Stage) {
                 'impl'        {
             if ($Model -and $Model -match '(?i)(big-pickle|free|flash)' -and $cmd -match ' --variant \S+') {
@@ -416,14 +414,14 @@ function Build-ToolCommand {
         }
         'qa' {
             if ($Config.Adapter -eq 'gemini') { return "gemini --approval-mode yolo -m $Model $q" }
-            if ($Config.Adapter -eq 'antigravity') { if (-not $Config.ProjectId) { throw 'Antigravity ProjectId is required.' }; $effortFlag = if ($Model -eq 'gemini-3.7-flash') { ' --effort medium' } else { '' }; return "$agyCommand --project $($Config.ProjectId) --model $Model$effortFlag --mode accept-edits$agyPermissionFlag --output-format stream-json --print-timeout 25m --print $q" }
+            if ($Config.Adapter -eq 'antigravity') { return Build-AntigravityCommand -Model $Model -Prompt $p -ProjectId $Config.ProjectId -Executable $Config.Executable }
             if ($Config.Adapter -eq 'opencode') { return "opencode run --pure --auto -m $Model $q" }
             return "codex exec $q -m $Model -s danger-full-access -o $(ConvertTo-BashSingleQuoted $Config.ReportFile)"
         }
         'integration' {
             if ($Config.Adapter -eq 'codex') { return "codex exec $q -m $Model -s danger-full-access -o $(ConvertTo-BashSingleQuoted $Config.ReportFile)" }
             if ($Config.Adapter -eq 'gemini') { return "gemini --approval-mode yolo -m $Model $q" }
-            if ($Config.Adapter -eq 'antigravity') { if (-not $Config.ProjectId) { throw 'Antigravity ProjectId is required.' }; $effortFlag = if ($Model -eq 'gemini-3.7-flash') { ' --effort medium' } else { '' }; return "$agyCommand --project $($Config.ProjectId) --model $Model$effortFlag --mode accept-edits$agyPermissionFlag --output-format stream-json --print-timeout 25m --print $q" }
+            if ($Config.Adapter -eq 'antigravity') { return Build-AntigravityCommand -Model $Model -Prompt $p -ProjectId $Config.ProjectId -Executable $Config.Executable }
             if ($Config.Adapter -eq 'opencode') { return "opencode run --pure --auto -m $Model $q" }
             return "claude -p $q --model $Model --dangerously-skip-permissions --output-format stream-json --verbose"
         }

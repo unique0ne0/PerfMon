@@ -175,14 +175,39 @@ function Resolve-PipelineRouting {
 
 function ConvertTo-DriverQuoted { param([string]$Text) return '"' + ($Text -replace '"', '\"') + '"' }
 
+# bash 작은따옴표 리터럴로 감싼다 — 프롬프트·실행 파일 경로 안의 $·백틱·"가 bash에서 확장되지
+# 않도록. dispatch-with-hang-detect.ps1 의 ConvertTo-BashSingleQuoted 와 같은 구현이며,
+# model-profile.ps1 이 단독으로 dot-source 되는 컨텍스트(테스트)에서도 antigravity 커맨드 빌더가
+# 자립하도록 여기에도 정의해 둔다.
+function ConvertTo-BashSingleQuoted {
+    param([string]$Text)
+    return "'" + ($Text -replace "'", "'\''") + "'"
+}
+
+# CFG046 R11: Antigravity(agy) 커맨드는 여기 한 곳에서만 만든다. 이 함수가
+#  - dispatch-with-hang-detect.ps1 의 Build-ToolCommand (qa·integration antigravity 분기)
+#  - model-profile.ps1 의 Build-AdapterCommand (antigravity 분기)
+# 양쪽이 공유하는 단일 구현이다. 프로젝트 매핑(ProjectId)이 없으면 agy 는 헤드리스 디스패치에서
+# 실행 불가하므로 즉시 실패한다 — 조용히 매달리지 않는다(본문 Done When 3).
+# 프롬프트의 인용(작은따옴표)은 dispatch 의 bash 래퍼 규약(CFG-BL-031)을 따른다.
+function Build-AntigravityCommand {
+    param([string]$Model, [string]$Prompt, [string]$ProjectId, [string]$Executable, [string]$PrintTimeout = '25m')
+    if ([string]::IsNullOrWhiteSpace($ProjectId)) { throw 'Antigravity ProjectId is required.' }
+    $agyBase = if ([string]::IsNullOrWhiteSpace($Executable)) { 'agy' } else { ConvertTo-BashSingleQuoted ([string]$Executable).Replace('\','/') }
+    # agy 는 권한 프롬프트로 단계가 멈추는 일이 잦아, 사용자 지시(2026-08-31)에 따라 항상 사용자 권한으로 실행한다.
+    $effortFlag = if ($Model -eq 'gemini-3.7-flash') { ' --effort medium' } else { '' }
+    $quotedPrompt = ConvertTo-BashSingleQuoted $Prompt
+    return "$agyBase --project $ProjectId --model $Model$effortFlag --mode accept-edits --dangerously-skip-permissions --output-format stream-json --print-timeout $PrintTimeout --print $quotedPrompt"
+}
+
 function Build-AdapterCommand {
-    param([ValidateSet('claude','codex','opencode','gemini','antigravity')][string]$Adapter, [string]$Model, [string]$Prompt, [string]$ReportFile)
+    param([ValidateSet('claude','codex','opencode','gemini','antigravity')][string]$Adapter, [string]$Model, [string]$Prompt, [string]$ReportFile, [string]$ProjectId)
     $quotedPrompt = ConvertTo-DriverQuoted $Prompt
     switch ($Adapter) {
         'claude' { return "claude -p $quotedPrompt --model $Model --output-format stream-json --verbose --dangerously-skip-permissions" }
         'codex' { return "codex exec $quotedPrompt -m $Model -s danger-full-access -o $(ConvertTo-DriverQuoted $ReportFile)" }
         'opencode' { return "opencode run --pure --auto -m $Model $quotedPrompt" }
         'gemini' { return "gemini --approval-mode yolo -m $Model $quotedPrompt" }
-        'antigravity' { return "agy --model $Model --mode accept-edits --print $quotedPrompt" }
+        'antigravity' { return Build-AntigravityCommand -Model $Model -Prompt $Prompt -ProjectId $ProjectId }
     }
 }
