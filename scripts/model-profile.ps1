@@ -48,20 +48,32 @@ function Test-ProfileGraph {
         $unique = @($models | Sort-Object -Unique)
         if ($unique.Count -ne $models.Count) { throw "Route $($route.Name) contains duplicate models." }
     }
-    foreach ($adapter in @('claude', 'codex', 'gemini')) {
-        $route = $Config.plannerRouting.$adapter
+    # 검사 대상 어댑터를 하드코딩하지 않고 plannerRouting 자체에서 읽는다. 다만 실제로 기획을 맡을 수
+    # 있는 어댑터는 항목이 빠지면 안 되므로 존재만 강제한다(gemini는 agy로 대체되어 선택 항목이다).
+    foreach ($requiredAdapter in @('claude', 'codex', 'antigravity')) {
+        if ($null -eq $Config.plannerRouting.$requiredAdapter) { throw "Missing planner routing for $requiredAdapter" }
+    }
+    foreach ($routingProperty in @($Config.plannerRouting.psobject.Properties)) {
+        $adapter = [string]$routingProperty.Name
+        $route = $routingProperty.Value
         $routeName = if ($route) { [string]$route.implementationRoute } else { '' }
         $qaName = if ($route) { [string]$route.qaProfile } else { '' }
         $integrationName = if ($route) { [string]$route.integrationProfile } else { '' }
         if ($null -eq $route -or $null -eq $Config.routes.$routeName -or $null -eq $Config.profiles.$qaName -or $null -eq $Config.profiles.$integrationName) { throw "Invalid planner routing for $adapter" }
         $qa = $Config.profiles.$qaName
-        if ($qa.family -eq $adapter) {
-            $msg = "Planner $adapter uses same-family QA profile $($route.qaProfile) (prefer violation)"
-            if ($null -ne $Warnings) { $null = $Warnings.Add($msg) } else { throw $msg }
-        }
-        if ($Config.profiles.$integrationName.family -ne $adapter) {
-            $msg = "Planner $adapter does not use its own family for Integration (prefer violation)"
-            if ($null -ne $Warnings) { $null = $Warnings.Add($msg) } else { throw $msg }
+        # 어댑터 이름과 family 이름은 같지 않다 — antigravity 어댑터의 family는 gemini다. 교차 원칙은
+        # 이름이 아니라 그 어댑터를 쓰는 프로필들의 family로 판정한다. 프로필이 하나도 없는 어댑터는
+        # (호환을 위해 남겨둔 gemini처럼) 기획을 맡을 수 없으므로 선호 검사를 건너뛴다.
+        $adapterFamilies = @($Config.profiles.psobject.Properties | Where-Object { [string]$_.Value.adapter -eq $adapter } | ForEach-Object { [string]$_.Value.family } | Sort-Object -Unique)
+        if ($adapterFamilies.Count -gt 0) {
+            if ([string]$qa.family -in $adapterFamilies) {
+                $msg = "Planner $adapter uses same-family QA profile $($route.qaProfile) (prefer violation)"
+                if ($null -ne $Warnings) { $null = $Warnings.Add($msg) } else { throw $msg }
+            }
+            if ([string]$Config.profiles.$integrationName.family -notin $adapterFamilies) {
+                $msg = "Planner $adapter does not use its own family for Integration (prefer violation)"
+                if ($null -ne $Warnings) { $null = $Warnings.Add($msg) } else { throw $msg }
+            }
         }
         $implModels = @($Config.routes.$routeName)
         foreach ($m in $implModels) {

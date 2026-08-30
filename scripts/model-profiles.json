@@ -15,8 +15,8 @@
   "profiles": {
     "claude-planning": { "adapter": "claude", "family": "claude", "model": "sonnet", "tier": "balanced", "fallbackProfiles": [] },
     "codex-planning": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "tier": "quality", "fallbackProfiles": [] },
-    "gemini-planning": { "adapter": "gemini", "family": "gemini", "model": "gemini-2.5-pro", "tier": "quality", "fallbackProfiles": [] },
-    "gemini-driver": { "adapter": "gemini", "family": "gemini", "model": "gemini-3.7-flash", "tier": "fast", "fallbackProfiles": ["claude-driver", "codex-driver"] },
+    "gemini-planning": { "adapter": "antigravity", "family": "gemini", "model": "gemini-3.7-flash", "tier": "fast", "fallbackProfiles": [] },
+    "gemini-driver": { "adapter": "antigravity", "family": "gemini", "model": "gemini-3.7-flash", "tier": "fast", "fallbackProfiles": ["claude-driver", "codex-driver"] },
     "claude-driver": { "adapter": "claude", "family": "claude", "model": "sonnet", "tier": "balanced", "fallbackProfiles": ["codex-driver"] },
     "codex-driver": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "tier": "balanced", "fallbackProfiles": [] },
     "codex-qa": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "tier": "balanced", "fallbackProfiles": [] },
@@ -24,7 +24,7 @@
     "gemini-qa-opencode": { "adapter": "opencode", "family": "gemini", "model": "google/gemini-3.7-flash", "tier": "fast", "fallbackProfiles": [] },
     "claude-integration": { "adapter": "claude", "family": "claude", "model": "sonnet", "tier": "balanced", "fallbackProfiles": [] },
     "codex-integration": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "tier": "quality", "fallbackProfiles": [] },
-    "gemini-integration": { "adapter": "gemini", "family": "gemini", "model": "gemini-2.5-pro", "tier": "quality", "fallbackProfiles": [] }
+    "gemini-integration": { "adapter": "antigravity", "family": "gemini", "model": "gemini-3.7-flash", "tier": "fast", "fallbackProfiles": [] }
   },
   "routes": {
     "claude-planned":      ["opencode-go/qwen3.7-plus", "opencode-go/mimo-v2.5-pro", "opencode-go/deepseek-v4-flash", "opencode-go/mimo-v2.5", "opencode/deepseek-v4-flash-free", "opencode/big-pickle"],
@@ -33,6 +33,7 @@
   "plannerRouting": {
     "claude": { "implementationRoute": "claude-planned", "qaProfile": "codex-qa", "integrationProfile": "claude-integration" },
     "codex": { "implementationRoute": "independent-planned", "qaProfile": "gemini-qa", "integrationProfile": "codex-integration" },
+    "antigravity": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "gemini-integration" },
     "gemini": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "gemini-integration" }
   },
   "fallbackOn": ["provider_unavailable", "authentication", "quota"],

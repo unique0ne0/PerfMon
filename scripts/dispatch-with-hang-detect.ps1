@@ -36,7 +36,8 @@
                               멈춰 있으면 종료시킨다. 연장 폭(상한÷3)과 절대 상한(상한×3)이 전부 이 값에서
                               파생되므로 — 별도의 상한 노브는 두지 않는다 — 이것만 줄이면 짧게 검증할 수 있다.
 .PARAMETER DryRun             실제 실행 없이 생성될 명령/스크립트만 출력(단일 단계 검증용).
-.PARAMETER BypassToolPermissions  사용자 승인 시에만 Antigravity CLI의 도구 권한 요청을 자동 승인한다.
+.PARAMETER BypassToolPermissions  claude 등 다른 어댑터의 도구 권한 요청을 자동 승인한다. Antigravity(agy)는
+    권한 프롬프트로 단계가 멈추는 일이 잦아 사용자 지시(2026-08-31)에 따라 이 스위치와 무관하게 항상 승인된다.
 .PARAMETER ForceFreeModel     impl 폴백 체인에서 유료(opencode-go) 슬롯을 건너뛰고 무료 슬롯으로 바로 시작한다.
                               사용자가 유료 쿼터 소진을 이미 확인했을 때만 지정 — 자동 판단 없음.
 #>
@@ -403,6 +404,9 @@ function Build-ToolCommand {
     $q = ConvertTo-BashSingleQuoted $p
     $cmd = if ($Model) { $Config.Command -replace '\{MODEL\}', $Model } else { $Config.Command }
     $agyCommand = if ($Config.Executable) { ConvertTo-BashSingleQuoted ([string]$Config.Executable).Replace('\','/') } else { 'agy' }
+    # agy(Antigravity)는 권한 프롬프트로 단계가 멈추는 일이 잦아, 사용자 지시(2026-08-31)에 따라
+    # -BypassToolPermissions 스위치와 무관하게 항상 사용자 권한으로 실행한다.
+    $agyPermissionFlag = ' --dangerously-skip-permissions'
     switch ($Stage) {
                 'impl'        {
             if ($Model -and $Model -match '(?i)(big-pickle|free|flash)' -and $cmd -match ' --variant \S+') {
@@ -412,14 +416,14 @@ function Build-ToolCommand {
         }
         'qa' {
             if ($Config.Adapter -eq 'gemini') { return "gemini --approval-mode yolo -m $Model $q" }
-            if ($Config.Adapter -eq 'antigravity') { if (-not $Config.ProjectId) { throw 'Antigravity ProjectId is required.' }; $permissionFlag = if ($BypassToolPermissions) { ' --dangerously-skip-permissions' } else { '' }; $effortFlag = if ($Model -eq 'gemini-3.7-flash') { ' --effort medium' } else { '' }; return "$agyCommand --project $($Config.ProjectId) --model $Model$effortFlag --mode accept-edits$permissionFlag --output-format stream-json --print-timeout 25m --print $q" }
+            if ($Config.Adapter -eq 'antigravity') { if (-not $Config.ProjectId) { throw 'Antigravity ProjectId is required.' }; $effortFlag = if ($Model -eq 'gemini-3.7-flash') { ' --effort medium' } else { '' }; return "$agyCommand --project $($Config.ProjectId) --model $Model$effortFlag --mode accept-edits$agyPermissionFlag --output-format stream-json --print-timeout 25m --print $q" }
             if ($Config.Adapter -eq 'opencode') { return "opencode run --pure --auto -m $Model $q" }
             return "codex exec $q -m $Model -s danger-full-access -o $(ConvertTo-BashSingleQuoted $Config.ReportFile)"
         }
         'integration' {
             if ($Config.Adapter -eq 'codex') { return "codex exec $q -m $Model -s danger-full-access -o $(ConvertTo-BashSingleQuoted $Config.ReportFile)" }
             if ($Config.Adapter -eq 'gemini') { return "gemini --approval-mode yolo -m $Model $q" }
-            if ($Config.Adapter -eq 'antigravity') { if (-not $Config.ProjectId) { throw 'Antigravity ProjectId is required.' }; $permissionFlag = if ($BypassToolPermissions) { ' --dangerously-skip-permissions' } else { '' }; return "$agyCommand --project $($Config.ProjectId) --model $Model --mode accept-edits$permissionFlag --output-format stream-json --print-timeout 25m --print $q" }
+            if ($Config.Adapter -eq 'antigravity') { if (-not $Config.ProjectId) { throw 'Antigravity ProjectId is required.' }; $effortFlag = if ($Model -eq 'gemini-3.7-flash') { ' --effort medium' } else { '' }; return "$agyCommand --project $($Config.ProjectId) --model $Model$effortFlag --mode accept-edits$agyPermissionFlag --output-format stream-json --print-timeout 25m --print $q" }
             if ($Config.Adapter -eq 'opencode') { return "opencode run --pure --auto -m $Model $q" }
             return "claude -p $q --model $Model --dangerously-skip-permissions --output-format stream-json --verbose"
         }
