@@ -82,6 +82,11 @@ if (-not (Test-Path -LiteralPath $ContractsModule)) {
     throw "Required harness contracts module not found: $ContractsModule"
 }
 . $ContractsModule
+$HarnessIoModule = Join-Path $PSScriptRoot 'harness-io.ps1'
+if (-not (Test-Path -LiteralPath $HarnessIoModule)) {
+    throw "Required harness I/O module not found: $HarnessIoModule"
+}
+. $HarnessIoModule
 
 # 동시 디스패치 락. 로그 디렉터리 **안**에 둔다 — Get-TreeState가 이 경로를 이미 걸러내므로
 # 락 파일 자체가 작업트리를 더럽혀 무변경 감지를 무력화하는 자충수를 피한다.
@@ -218,9 +223,7 @@ function Write-StageState {
     $wasRunning = $previous -and ([string]$previous.state -match '^(starting|running)$')
     $startedAt = if ($sameCycle -and $wasRunning -and $previous.startedAt) { [string]$previous.startedAt } else { $now }
     $value = [ordered]@{ schemaVersion = 1; taskId = $TaskId; stage = $Stage; cycle = $Cycle; sequence = $sequence; state = $State; owner = 'dispatcher'; pid = $ProcessId; model = $Model; startedAt = $startedAt; heartbeatAt = $now; eventAt = $now; evidencePaths = @($EvidencePaths); reason = $Reason }
-    $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
-    [System.IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($true)))
-    Move-Item -LiteralPath $temporary -Destination $path -Force
+    Write-AtomicJson -Path $path -Value $value -Depth 6
 }
 
 function Get-SessionHealthRole {
@@ -663,25 +666,17 @@ function Get-LockPath {
 function Read-DispatchLock {
     param([string]$Stage)
     $p = Get-LockPath $Stage
-    if (-not (Test-Path $p)) { return $null }
-    $raw = (Get-Content $p -Raw -ErrorAction SilentlyContinue)
-    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
-    $parts = $raw.Trim() -split '\|'
-    if ($parts.Count -lt 3) { return $null }
-    $procId = 0
-    if (-not [int]::TryParse($parts[0], [ref]$procId)) { return $null }
-    $process = Get-Process -Id $procId -ErrorAction SilentlyContinue
-    $alive = $null -ne $process
-    $processStartedAt = $null
-    if ($alive -and $parts.Count -ge 5) {
-        try {
-            $processStartedAt = $process.StartTime
-            [datetime]$recordedStart = [datetime]::MinValue
-            if (-not [datetime]::TryParse($parts[4], [ref]$recordedStart) -or
-                [math]::Abs(($processStartedAt - $recordedStart).TotalSeconds) -gt 2) { $alive = $false }
-        } catch { $alive = $false }
+    $lock = Read-HarnessLockFile -Path $p
+    if (-not $lock -or [string]::IsNullOrWhiteSpace($lock.Raw)) { return $null }
+    return @{
+        Path = $lock.Path
+        Raw = $lock.Raw
+        ProcId = $lock.ProcessId
+        TaskId = $lock.TaskId
+        StartedAt = [string]$lock.StartedAt
+        ProcessStartedAt = $lock.ProcessStartedAt
+        Alive = $lock.Alive
     }
-    return @{ Path = $p; Raw = $raw.Trim(); ProcId = $procId; TaskId = $parts[1]; StartedAt = $parts[2]; ProcessStartedAt = $processStartedAt; Alive = $alive }
 }
 
 function Remove-StaleDispatchLock {
@@ -1363,9 +1358,7 @@ function New-DispatchCycle {
         stage = $Stage
         cycles = @($existing) + @([ordered]@{ id = $nextId; token = ('cycle{0:D4}' -f $nextId); allocatedAt = [datetime]::UtcNow.ToString('o') })
     }
-    $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
-    [System.IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($true)))
-    Move-Item -LiteralPath $temporary -Destination $path -Force
+    Write-AtomicJson -Path $path -Value $value -Depth 6
     return @{ Id = $nextId; Token = ('cycle{0:D4}' -f $nextId) }
 }
 
@@ -1459,9 +1452,7 @@ function Write-ApprovalRecord {
         decisionNeeded = 'Inspect the exact target, arrange approval outside the headless process, then start one explicit fresh stage dispatch (new cycle).'
         status = 'pending'
     }
-    $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
-    [System.IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($true)))
-    Move-Item -LiteralPath $temporary -Destination $path -Force
+    Write-AtomicJson -Path $path -Value $value -Depth 6
     return $path
 }
 
@@ -1479,9 +1470,7 @@ function Resolve-ApprovalRecords {
         $record.status = 'resolved'
         $record | Add-Member -NotePropertyName resolvedCycle -NotePropertyValue $ResolvingCycle -Force
         $record | Add-Member -NotePropertyName resolvedAt -NotePropertyValue ([datetime]::UtcNow.ToString('o')) -Force
-        $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
-        [System.IO.File]::WriteAllText($temporary, ($record | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($true)))
-        Move-Item -LiteralPath $temporary -Destination $path -Force
+        Write-AtomicJson -Path $path -Value $record -Depth 6
         Write-Log "✅ [$TaskId/$Stage] 승인 대기(cycle $($record.cycle))를 fresh cycle $ResolvingCycle 성공으로 해소 — 감사 기록 보존" SUCCESS
       } catch {
         Write-Log "승인 기록 해소 중 실패(감사에 영향 없음): $($_.Exception.Message)" WARN
@@ -1585,9 +1574,7 @@ function Write-ContinuationRecord {
     }
     $segment = [ordered]@{ attempt = $AttemptNumber; timestamp = [datetime]::UtcNow.ToString('o'); attemptLog = $AttemptLog; conversationId = $ConversationId; active = $Active; resumed = $Resumed; reason = $Reason }
     $record.segments = @($record.segments) + @($segment)
-    $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
-    [System.IO.File]::WriteAllText($temporary, ($record | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($true)))
-    Move-Item -LiteralPath $temporary -Destination $path -Force
+    Write-AtomicJson -Path $path -Value $record -Depth 8
     return $path
 }
 
@@ -1699,10 +1686,7 @@ function Read-StageLedger {
 function Write-StageLedger {
     param([string]$Stage, [object]$Ledger)
     $path = Get-StageLedgerPath $Stage
-    $parent = Split-Path -Parent $path
-    if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-    $body = $Ledger | ConvertTo-Json -Depth 6
-    [System.IO.File]::WriteAllText($path, $body, (New-Object System.Text.UTF8Encoding($false)))
+    Write-AtomicJson -Path $path -Value $Ledger -Depth 6
 }
 
 function Record-StageAttempt {
@@ -1758,11 +1742,7 @@ function Write-SyntheticQaVerdict {
         syntheticReason = 'model did not write qa-verdict.json; harness recorded outcome'
         observedAt = [datetime]::UtcNow.ToString('o')
     }
-    $parent = Split-Path -Parent $verdictAbs
-    if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-    $temporary = "$verdictAbs.$([guid]::NewGuid().ToString('N')).tmp"
-    [System.IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($true)))
-    Move-Item -LiteralPath $temporary -Destination $verdictAbs -Force
+    Write-AtomicJson -Path $verdictAbs -Value $value -Depth 6
     Write-Log "⚠️ [qa] 합성 qa-verdict 기록: verdict=$verdictValue ($reasonText)" WARN
 }
 
@@ -2069,9 +2049,7 @@ function Set-CompletedStageApprovalsSuperseded {
             $record | Add-Member -NotePropertyName supersededAt -NotePropertyValue ([datetime]::UtcNow.ToString('o')) -Force
             $record | Add-Member -NotePropertyName supersededReason -NotePropertyValue 'packet stage completed; durable pipeline state outranks the pending runtime artifact' -Force
             $record | Add-Member -NotePropertyName supersededByEvidence -NotePropertyValue $Evidence -Force
-            $temporary = "$($recordFile.FullName).$([guid]::NewGuid().ToString('N')).tmp"
-            [System.IO.File]::WriteAllText($temporary, ($record | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($true)))
-            Move-Item -LiteralPath $temporary -Destination $recordFile.FullName -Force
+            Write-AtomicJson -Path $recordFile.FullName -Value $record -Depth 8
             $updated += $recordFile.FullName
             Write-Log "✅ [$TaskId/$($record.stage)] 완료된 패킷 단계의 pending 승인 기록을 superseded 처리: $($recordFile.Name)" SUCCESS
         } catch {
@@ -2129,9 +2107,7 @@ function Set-QaVerdictStageHarnessFlag {
         try {
             $obj = Get-Content -LiteralPath $verdictAbs -Raw -Encoding UTF8 | ConvertFrom-Json
             $obj | Add-Member -NotePropertyName stageCheckedByHarness -NotePropertyValue $true -Force
-            $temporary = "$verdictAbs.$([guid]::NewGuid().ToString('N')).tmp"
-            [System.IO.File]::WriteAllText($temporary, ($obj | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($true)))
-            Move-Item -LiteralPath $temporary -Destination $verdictAbs -Force
+            Write-AtomicJson -Path $verdictAbs -Value $obj -Depth 8
             Write-Log "⚠️ [qa] verdict에 stageCheckedByHarness=true 기록 — 하네스가 ④를 대신 체크했습니다" WARN
         } catch {
             Write-Log "[qa] stageCheckedByHarness 기록 실패($verdictAbs): $($_.Exception.Message)" WARN
@@ -2139,9 +2115,7 @@ function Set-QaVerdictStageHarnessFlag {
     } else {
         $stateAbs = Resolve-RepoPath "$LogDir/$TaskId-qa-stage-checked.json"
         $state = [ordered]@{ schemaVersion = 1; taskId = $TaskId; stage = 'qa'; stageCheckedByHarness = $true; checkedAt = [datetime]::UtcNow.ToString('o') }
-        $temporary = "$stateAbs.$([guid]::NewGuid().ToString('N')).tmp"
-        [System.IO.File]::WriteAllText($temporary, ($state | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($true)))
-        Move-Item -LiteralPath $temporary -Destination $stateAbs -Force
+        Write-AtomicJson -Path $stateAbs -Value $state -Depth 4
         Write-Log "⚠️ [qa] verdict 부재 — 별도 상태 파일에 stageCheckedByHarness=true 기록" WARN
     }
 }
@@ -2744,11 +2718,7 @@ function Read-ProviderHealth {
 
 function Write-ProviderHealth {
     param([string]$Path, [object]$Value)
-    $parent = Split-Path -Parent $Path
-    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-    $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
-    [System.IO.File]::WriteAllText($temporary, ($Value | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($true)))
-    Move-Item -LiteralPath $temporary -Destination $Path -Force
+    Write-AtomicJson -Path $Path -Value $Value -Depth 5
 }
 
 function Invoke-WithProviderHealthLock {
@@ -2896,9 +2866,7 @@ function Write-ChainSummary {
         runtimeRoleBinding = $script:RuntimeRoleBinding
         logDirectory = $LogDir
     }
-    $tempPath = "$summaryPath.$([guid]::NewGuid().ToString('N')).tmp"
-    [System.IO.File]::WriteAllText($tempPath, ($value | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($true)))
-    Move-Item -LiteralPath $tempPath -Destination $summaryPath -Force
+    Write-AtomicJson -Path $summaryPath -Value $value -Depth 8
     return $summaryPath
 }
 

@@ -30,20 +30,10 @@ $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrEmpty($RepoRoot)) { $RepoRoot = Split-Path -Parent $PSScriptRoot }
 if ([string]::IsNullOrEmpty($TargetList)) { $TargetList = Join-Path $RepoRoot 'harness-targets.txt' }
 
-# CFG044: 커밋 대상 자산도 sync-configs.ps1과 같은 매니페스트(global/harness/harness-assets.txt)를
-# 읽는다. 매니페스트 자체(harness-assets.txt 항목)도 함께 배포·커밋되므로 이 목록을 유일 원천으로 쓴다.
-function Read-HarnessAssets {
-    param([string]$ManifestPath)
-    $assets = @()
-    if (-not (Test-Path -LiteralPath $ManifestPath)) { throw "Harness asset manifest is missing: $ManifestPath" }
-    foreach ($line in @(Get-Content -LiteralPath $ManifestPath -Encoding UTF8)) {
-        $name = $line.Trim()
-        if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith('#')) { continue }
-        if ($name -match '[<>:"/\\|?*\x00-\x1F]' -or $name -eq '.' -or $name -eq '..' -or $name -like '..*') { throw "Invalid harness asset manifest entry '$name' in $ManifestPath" }
-        if ($assets -notcontains $name) { $assets += $name }
-    }
-    return $assets
-}
+$harnessIoModule = Join-Path $PSScriptRoot 'harness-io.ps1'
+if (-not (Test-Path -LiteralPath $harnessIoModule)) { $harnessIoModule = Join-Path $RepoRoot 'global\harness\harness-io.ps1' }
+if (-not (Test-Path -LiteralPath $harnessIoModule)) { throw "Required harness I/O module not found: $harnessIoModule" }
+. $harnessIoModule
 $harnessAssets = @(Read-HarnessAssets -ManifestPath (Join-Path $RepoRoot 'global\harness\harness-assets.txt'))
 
 $logDir = Join-Path $RepoRoot 'global\harness\logs\sync-commit'
@@ -81,9 +71,7 @@ function Invoke-GitQuiet {
     }
 }
 
-# ── 락 마커 감지 (Read-DispatchLock 과 동일한 이중 검증) ─────────────────────────
-# dispatch-with-hang-detect.ps1 의 Read-DispatchLock 을 dot-source 하지 않고,
-# 같은 판정 로직(PID 존재 + StartTime 일치)을 독립 구현한다.
+# ── CFG053: Read-HarnessLockFile 공용 함수에 위임 ─────────────────────────
 function Test-ActiveLock {
     param([string]$ProjRoot)
 
@@ -94,25 +82,10 @@ function Test-ActiveLock {
 
     foreach ($stage in @('impl', 'qa', 'integration')) {
         $lockPath = Join-Path $lockDir "$lockPrefix-$stage"
-        if (-not (Test-Path $lockPath)) { continue }
-        $raw = $null
-        try { $raw = (Get-Content $lockPath -Raw -ErrorAction SilentlyContinue) } catch { continue }
-        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
-        $parts = $raw.Trim() -split '\|'
-        if ($parts.Count -lt 3) { continue }
-        $procId = 0
-        if (-not [int]::TryParse($parts[0], [ref]$procId)) { continue }
-        $process = Get-Process -Id $procId -ErrorAction SilentlyContinue
-        if ($null -eq $process) { continue }
-        # StartTime 이중 검증
-        if ($parts.Count -ge 5) {
-            try {
-                [datetime]$recordedStart = [datetime]::MinValue
-                if (-not [datetime]::TryParse($parts[4], [ref]$recordedStart)) { continue }
-                if ([math]::Abs(($process.StartTime - $recordedStart).TotalSeconds) -gt 2) { continue }
-            } catch { continue }
+        $lock = Read-HarnessLockFile -Path $lockPath
+        if ($lock -and $lock.Alive) {
+            return @{ Stage = $stage; TaskId = $lock.TaskId; ProcId = $lock.ProcessId; StartedAt = $lock.StartedAt }
         }
-        return @{ Stage = $stage; TaskId = $parts[1]; ProcId = $procId; StartedAt = $parts[2] }
     }
     return $null
 }

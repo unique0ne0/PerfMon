@@ -81,23 +81,13 @@ function Test-HarnessOverrideState {
     return (Test-Path -LiteralPath $copy) -and ((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne $Master)
 }
 
-# ── CFG044: 배포 대상 자산의 유일한 목록은 매니페스트(harness-assets.txt)다 ────────────
-# sync-configs.ps1 / scripts/verify.ps1 / task-status.ps1 이 같은 파서 계약으로 읽는다.
-# 매니페스트에 없는 중앙 전용 문서(orchestration-runbook.md, promotion-notes.md)는 프로젝트
-# 드리프트로 세지 않는다. 배포된 task-status.ps1 은 자기 옆(scripts\)의 매니페스트를 먼저 읽고,
-# 없으면 중앙 정본 경로로 폴백한다. 순수 함수라 WinForms 없이 AST 임포트로 자동 검증할 수 있다.
-function Read-HarnessAssets {
-    param([string]$ManifestPath)
-    $assets = @()
-    if (-not (Test-Path -LiteralPath $ManifestPath)) { throw "Harness asset manifest is missing: $ManifestPath" }
-    foreach ($line in @(Get-Content -LiteralPath $ManifestPath -Encoding UTF8)) {
-        $name = $line.Trim()
-        if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith('#')) { continue }
-        if ($name -match '[<>:"/\\|?*\x00-\x1F]' -or $name -eq '.' -or $name -eq '..' -or $name -like '..*') { throw "Invalid harness asset manifest entry '$name' in $ManifestPath" }
-        if ($assets -notcontains $name) { $assets += $name }
-    }
-    return $assets
+$harnessIoModule = $null
+if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $harnessIoModule = Join-Path $PSScriptRoot 'harness-io.ps1' }
+if ([string]::IsNullOrWhiteSpace($harnessIoModule) -or -not (Test-Path -LiteralPath $harnessIoModule)) {
+    $harnessIoModule = Join-Path (Join-Path $root 'global\harness') 'harness-io.ps1'
 }
+if (-not (Test-Path -LiteralPath $harnessIoModule)) { throw "Required harness I/O module not found: $harnessIoModule" }
+. $harnessIoModule
 
 # ── CFG042: 하네스 배포 동기화 요약 — 오버라이드(추적 가능한 로컬 예외)와 드리프트 분리 ──
 function Get-HarnessSyncSummary {
@@ -234,34 +224,15 @@ function Get-DispatchLock {
     param([string]$ProjectPath, [string]$Stage)
 
     $lockPath = Join-Path $ProjectPath ('.agents\briefs\logs\.dispatch-lock-' + $Stage)
-    if (-not (Test-Path $lockPath)) { return $null }
+    $lock = Read-HarnessLockFile -Path $lockPath
+    if (-not $lock -or [string]::IsNullOrWhiteSpace($lock.Raw)) { return $null }
 
-    $parts = @((Get-Content $lockPath -Raw -ErrorAction SilentlyContinue).Trim() -split '\|')
-    if ($parts.Count -lt 3) { return $null }
-
-    $processId = 0
-    if (-not [int]::TryParse($parts[0], [ref]$processId)) { return $null }
-    [datetime]$parsedStartedAt = [datetime]::MinValue
-    $startedAt = $null
-    if ([datetime]::TryParse($parts[2], [ref]$parsedStartedAt)) {
-        $startedAt = $parsedStartedAt
-    }
-
-    $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
-    $alive = $null -ne $process
-    if ($alive -and $parts.Count -ge 5) {
-        try {
-            [datetime]$recordedStart = [datetime]::MinValue
-            if (-not [datetime]::TryParse($parts[4], [ref]$recordedStart) -or
-                [math]::Abs(($process.StartTime - $recordedStart).TotalSeconds) -gt 2) { $alive = $false }
-        } catch { $alive = $false }
-    }
     return [pscustomobject]@{
         Stage = $Stage
-        TaskId = $parts[1]
-        ProcessId = $processId
-        StartedAt = $startedAt
-        Alive = $alive
+        TaskId = $lock.TaskId
+        ProcessId = $lock.ProcessId
+        StartedAt = $lock.StartedAt
+        Alive = $lock.Alive
     }
 }
 

@@ -1,4 +1,4 @@
-# harness-assets.txt — ai-agents-config 저장소가 각 프로젝트에 배포하는 하네스 운영 자산의 유일한 목록(SSOT).
+﻿# harness-assets.txt — ai-agents-config 저장소가 각 프로젝트에 배포하는 하네스 운영 자산의 유일한 목록(SSOT).
 #
 # sync-configs.ps1 -Action Push 는 이 목록의 자산만 각 프로젝트 scripts\ 로 복사한다.
 # scripts/verify.ps1 과 task-status.ps1 는 같은 목록을 읽어 드리프트를 판정한다.
@@ -22,4 +22,5 @@ task-status.ps1
 sweep-orphan-browsers.ps1
 stage-thresholds.json
 harness-contracts.ps1
+harness-io.ps1
 harness-assets.txt
