@@ -45,11 +45,15 @@ foreach ($st in $stages) {
 # 서로 다른 문자열로 쪼개 대시보드가 같은 작업을 다른 것으로 오인한다(예: CS-030 락과
 # CS-030 라우터 행이 분리되어 "라우터에 행 없음" 오펀으로 중복 표시).
 # 비교 전에 알파벳/숫자만 남긴 정규 형태로 맞춘다 — 표시값은 원본 그대로 유지.
-function Get-NormalizedTaskId {
-    param([string]$TaskId)
-    if ($null -eq $TaskId) { return '' }
-    return ($TaskId -replace '[^A-Za-z0-9]', '').ToUpperInvariant()
+# Dot-source shared harness contracts module (CFG052)
+$ContractsModule = Join-Path $PSScriptRoot 'harness-contracts.ps1'
+if (-not (Test-Path -LiteralPath $ContractsModule)) {
+    $ContractsModule = Join-Path $root 'harness-contracts.ps1'
 }
+if (-not (Test-Path -LiteralPath $ContractsModule)) {
+    throw "Required harness contracts module not found: $ContractsModule"
+}
+. $ContractsModule
 
 function Get-HarnessProjects {
     $targetList = Join-Path $root 'harness-targets.txt'
@@ -225,24 +229,6 @@ function Get-RouterTasks {
 }
 
 # 패킷의 Pipeline Status 섹션만 파싱해 단계별 체크 상태와 첫 미체크 단계를 돌려준다.
-function Get-PacketPipelineStatus {
-    param([string]$PacketPath)
-    $result = @{ Items = @(); FirstUnchecked = $null; HasPipelineStatus = $false }
-    if (-not $PacketPath -or -not (Test-Path -LiteralPath $PacketPath)) { return $result }
-    $inSection = $false
-    foreach ($line in Get-Content -LiteralPath $PacketPath -Encoding UTF8) {
-        if ($line -match '^##\s+Pipeline Status\s*$') { $inSection = $true; $result.HasPipelineStatus = $true; continue }
-        if ($inSection -and $line -match '^##\s+') { break }
-        if (-not $inSection -or $line -notmatch '^\s*-\s*\[([ xX])\]') { continue }
-        $stageMatch = [regex]::Match($line, '[①②③④⑤]')
-        if (-not $stageMatch.Success) { continue }
-        $checked = $Matches[1] -match '[xX]'
-        $item = @{ Index = '①②③④⑤'.IndexOf($stageMatch.Value) + 1; Label = $line.Trim(); Checked = $checked }
-        $result.Items += $item
-        if ($null -eq $result.FirstUnchecked -and -not $item.Checked) { $result.FirstUnchecked = $item }
-    }
-    return $result
-}
 
 function Get-DispatchLock {
     param([string]$ProjectPath, [string]$Stage)
