@@ -1225,6 +1225,15 @@ function Resolve-ModelChain {
                         continue
                     }
                 }
+                $rateCap = $null
+                if ($script:ProfileConfig.rateLimit -and $script:ProfileConfig.rateLimit.$principal) { $rateCap = $script:ProfileConfig.rateLimit.$principal.maxCallsPerHour }
+                if ($rateCap) {
+                    $rateCount = Get-CallRateCount -State $health -Principal $principal -WindowMinutes 60
+                    if ($rateCount -ge [int]$rateCap) {
+                        Write-Log "[$Stage] preflight skip: $m (principal $principal rate limit: $rateCount/$rateCap calls in last 60m)" INFO
+                        continue
+                    }
+                }
             }
             $filtered += $m
         }
@@ -1236,6 +1245,16 @@ function Resolve-ModelChain {
                     [datetime]$pProbe = [datetime]::MinValue
                     if ([datetime]::TryParse([string]$pEntry.nextProbeAt, [ref]$pProbe) -and $pProbe.ToUniversalTime() -gt [datetime]::UtcNow) {
                         $blockedPrincipals += "$($prop.Name -replace 'principal:','') (until $($pProbe.ToUniversalTime().ToString('o')))"
+                    }
+                }
+            }
+            if ($script:ProfileConfig.rateLimit) {
+                foreach ($prop in @($script:ProfileConfig.rateLimit.psobject.Properties)) {
+                    $rateCap = $prop.Value.maxCallsPerHour
+                    if (-not $rateCap) { continue }
+                    $rateCount = Get-CallRateCount -State $health -Principal $prop.Name -WindowMinutes 60
+                    if ($rateCount -ge [int]$rateCap) {
+                        $blockedPrincipals += "$($prop.Name) (rate limit: $rateCount/$rateCap calls in last 60m)"
                     }
                 }
             }
@@ -1602,6 +1621,9 @@ function Invoke-ModelAttempt {
     # CFG-004의 무산출 안전망이 살아있다. 현재는 매 시도 새 파일이라 항상 0이지만, 계약을 이곳에서 확정한다.
     $attemptLogAbs = Resolve-RepoPath $AttemptLog
     $logStartBytes = if (Test-Path $attemptLogAbs) { (Get-Item $attemptLogAbs).Length } else { 0 }
+    if (-not (Update-CallRate -Model $Model)) {
+        return @{ Outcome = 'rate_limited'; ExitCode = $null; ElapsedSeconds = 0; LogStartBytes = $logStartBytes; Adapter = $Config.Adapter }
+    }
     $exit = $null; $elapsedSeconds = 0
     $outcome = Invoke-StageProcess -Stage $Stage -Config $attemptConfig -ToolCmd $ToolCmd -Cycle $Cycle -ExitCode ([ref]$exit) -ElapsedSeconds ([ref]$elapsedSeconds) -Model $Model
     Update-LatestAttemptLog -AttemptLog $AttemptLog -LatestLog $LatestLog
@@ -1632,7 +1654,7 @@ function Classify-AttemptFailure {
 
 function Get-FailureClass {
     param([string]$Outcome)
-    if ($Outcome -in @('quota', 'billing', 'authentication', 'pollution', 'approval_required', 'config')) {
+    if ($Outcome -in @('quota', 'billing', 'authentication', 'pollution', 'approval_required', 'config', 'rate_limited')) {
         return 'deterministic'
     }
     return 'transient'
@@ -2553,6 +2575,7 @@ function Resolve-OutcomeReason {
     elseif ($Outcome -eq 'provider_timeout') { return 'provider print timeout (자동 재개 한도 또는 건강도 미충족)' }
     elseif ($Outcome -eq 'quota') { return '잔액·쿼터 부족' }
     elseif ($Outcome -eq 'billing') { return '잔액·쿼터 부족' }
+    elseif ($Outcome -eq 'rate_limited') { return '사전 시간당 호출 상한 도달' }
     elseif ($Outcome -eq 'authentication') { return '인증 실패' }
     elseif ($Outcome -eq 'unavailable') { return '모델·프로바이더 사용 불가' }
     elseif ($Outcome -eq 'noop') { return '무산출 조기 실패' }
@@ -2819,14 +2842,17 @@ function Dispatch-Stage {
 
 function Read-ProviderHealth {
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return [pscustomobject]@{ schemaVersion = 1; providers = [pscustomobject]@{} } }
+    if (-not (Test-Path -LiteralPath $Path)) { return [pscustomobject]@{ schemaVersion = 1; providers = [pscustomobject]@{}; callRate = [pscustomobject]@{} } }
     try {
         $state = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($state.schemaVersion -ne 1 -or $null -eq $state.providers) { throw 'invalid schema' }
+        # callRate는 구 상태 파일(rate-limit 도입 이전)에는 없을 수 있다 — 없으면 빈 객체로 채워
+        # 하위호환을 유지한다(opencode 시간당 호출 상한).
+        if ($null -eq $state.callRate) { $state | Add-Member -NotePropertyName callRate -NotePropertyValue ([pscustomobject]@{}) -Force }
         return $state
     } catch {
         Write-Log "provider health state corrupt; ignoring it until the next classified result: $($_.Exception.Message)" WARN
-        return [pscustomobject]@{ schemaVersion = 1; providers = [pscustomobject]@{} }
+        return [pscustomobject]@{ schemaVersion = 1; providers = [pscustomobject]@{}; callRate = [pscustomobject]@{} }
     }
 }
 
@@ -2839,60 +2865,118 @@ function Write-ProviderHealth {
     Move-Item -LiteralPath $temporary -Destination $Path -Force
 }
 
+function Invoke-WithProviderHealthLock {
+    param([scriptblock]$Action)
+    $mutex = $null
+    $locked = $false
+    try {
+        $mutex = New-Object System.Threading.Mutex($false, 'ai-agents-harness-provider-health-v1')
+        $locked = $mutex.WaitOne(10000)
+        if (-not $locked) { throw 'provider health state lock timeout' }
+        return (& $Action)
+    } finally {
+        if ($locked) { $mutex.ReleaseMutex() }
+        if ($mutex) { $mutex.Dispose() }
+    }
+}
+
 function Update-ProviderHealth {
     param([string]$Model, [string]$Outcome, [string]$AttemptLog)
     if (-not $script:ProviderHealthPath -or $Model -notmatch '^([^/]+)/') { return }
-    $provider = $Matches[1]
-    $state = Read-ProviderHealth -Path $script:ProviderHealthPath
-    if ($null -eq $state.providers) { $state | Add-Member -NotePropertyName providers -NotePropertyValue ([pscustomobject]@{}) -Force }
-    if ($Outcome -eq 'ok') {
+    Invoke-WithProviderHealthLock -Action {
+        $provider = $Matches[1]
+        $state = Read-ProviderHealth -Path $script:ProviderHealthPath
+        if ($null -eq $state.providers) { $state | Add-Member -NotePropertyName providers -NotePropertyValue ([pscustomobject]@{}) -Force }
+        if ($Outcome -eq 'ok') {
+            $modelKey = "model:$Model"
+            $state.providers.psobject.Properties.Remove($modelKey)
+            $principal = if ($script:ProfileConfig.modelCatalog -and $script:ProfileConfig.modelCatalog.$Model) { [string]$script:ProfileConfig.modelCatalog.$Model.principal } else { '' }
+            if ($principal) {
+                $principalKey = "principal:$principal"
+                $principalModels = @($state.providers.psobject.Properties | Where-Object { $_.Name -like "model:*" -and [string]$_.Value.principal -eq $principal })
+                if ($principalModels.Count -eq 0) { $state.providers.psobject.Properties.Remove($principalKey) }
+            }
+            Write-ProviderHealth -Path $script:ProviderHealthPath -Value $state
+            return
+        }
+        if ($Outcome -notin @('quota', 'billing', 'unavailable')) { return }
         $modelKey = "model:$Model"
-        $state.providers.psobject.Properties.Remove($modelKey)
+        $prior = $state.providers.$modelKey
+        $count = if ($prior) { [int]$prior.consecutiveFailures + 1 } else { 1 }
+        $hours = if ($count -gt 1) { [int]$script:ProfileConfig.providerCooldown.repeatedQuotaHours } elseif ($Outcome -eq 'unavailable') { 1 } else { [int]$script:ProfileConfig.providerCooldown.quotaDefaultHours }
+        $nextProbe = [datetime]::UtcNow.AddHours($hours)
+        if ($AttemptLog) {
+            $logPath = Resolve-RepoPath $AttemptLog
+            if (Test-Path -LiteralPath $logPath) {
+                $retry = [regex]::Match((Get-Content -LiteralPath $logPath -Raw -ErrorAction SilentlyContinue), '(?im)retry-after\s*[:=]\s*(\d+)')
+                if ($retry.Success) { $nextProbe = [datetime]::UtcNow.AddSeconds([int]$retry.Groups[1].Value) }
+            }
+        }
+        $entry = [pscustomobject]@{ reason = $Outcome; consecutiveFailures = $count; observedAt = [datetime]::UtcNow.ToString('o'); nextProbeAt = $nextProbe.ToString('o') }
+        $state.providers | Add-Member -NotePropertyName $modelKey -NotePropertyValue $entry -Force
         $principal = if ($script:ProfileConfig.modelCatalog -and $script:ProfileConfig.modelCatalog.$Model) { [string]$script:ProfileConfig.modelCatalog.$Model.principal } else { '' }
         if ($principal) {
             $principalKey = "principal:$principal"
-            $principalModels = @($state.providers.psobject.Properties | Where-Object { $_.Name -like "model:*" -and [string]$_.Value.principal -eq $principal })
-            if ($principalModels.Count -eq 0) { $state.providers.psobject.Properties.Remove($principalKey) }
+            $principalModels = @($state.providers.psobject.Properties | Where-Object { $_.Name -like "model:*" -and [string]($state.providers.($_.Name)).reason -in @('quota', 'billing', 'unavailable') })
+            if ($principalModels.Count -ge 2) {
+                $longestHours = $hours
+                foreach ($pm in $principalModels) {
+                    $pmEntry = $state.providers.($pm.Name)
+                    if ($pmEntry.nextProbeAt) {
+                        try {
+                            $pmProbe = ([datetime]$pmEntry.nextProbeAt).ToUniversalTime()
+                            $diff = ($pmProbe - [datetime]::UtcNow).TotalHours
+                            if ($diff -gt $longestHours) { $longestHours = [math]::Ceiling($diff) }
+                        } catch { }
+                    }
+                }
+                $principalEntry = [pscustomobject]@{ reason = $Outcome; consecutiveFailures = $count; observedAt = [datetime]::UtcNow.ToString('o'); nextProbeAt = [datetime]::UtcNow.AddHours($longestHours).ToString('o') }
+                $state.providers | Add-Member -NotePropertyName $principalKey -NotePropertyValue $principalEntry -Force
+            }
         }
         Write-ProviderHealth -Path $script:ProviderHealthPath -Value $state
-        return
     }
-    if ($Outcome -notin @('quota', 'billing', 'unavailable')) { return }
-    $modelKey = "model:$Model"
-    $prior = $state.providers.$modelKey
-    $count = if ($prior) { [int]$prior.consecutiveFailures + 1 } else { 1 }
-    $hours = if ($count -gt 1) { [int]$script:ProfileConfig.providerCooldown.repeatedQuotaHours } elseif ($Outcome -eq 'unavailable') { 1 } else { [int]$script:ProfileConfig.providerCooldown.quotaDefaultHours }
-    $nextProbe = [datetime]::UtcNow.AddHours($hours)
-    if ($AttemptLog) {
-        $logPath = Resolve-RepoPath $AttemptLog
-        if (Test-Path -LiteralPath $logPath) {
-            $retry = [regex]::Match((Get-Content -LiteralPath $logPath -Raw -ErrorAction SilentlyContinue), '(?im)retry-after\s*[:=]\s*(\d+)')
-            if ($retry.Success) { $nextProbe = [datetime]::UtcNow.AddSeconds([int]$retry.Groups[1].Value) }
-        }
+}
+
+function Get-CallRateCount {
+    param([object]$State, [string]$Principal, [int]$WindowMinutes = 60)
+    if ($null -eq $State.callRate) { return 0 }
+    $entry = $State.callRate."principal:$Principal"
+    if (-not $entry) { return 0 }
+    $cutoff = [datetime]::UtcNow.AddMinutes(-$WindowMinutes)
+    $count = 0
+    foreach ($ts in @($entry)) {
+        [datetime]$parsed = [datetime]::MinValue
+        if ([datetime]::TryParse([string]$ts, [ref]$parsed) -and $parsed.ToUniversalTime() -gt $cutoff) { $count++ }
     }
-    $entry = [pscustomobject]@{ reason = $Outcome; consecutiveFailures = $count; observedAt = [datetime]::UtcNow.ToString('o'); nextProbeAt = $nextProbe.ToString('o') }
-    $state.providers | Add-Member -NotePropertyName $modelKey -NotePropertyValue $entry -Force
+    return $count
+}
+
+function Update-CallRate {
+    param([string]$Model)
+    if (-not $script:ProviderHealthPath -or $Model -notmatch '^([^/]+)/') { return $true }
     $principal = if ($script:ProfileConfig.modelCatalog -and $script:ProfileConfig.modelCatalog.$Model) { [string]$script:ProfileConfig.modelCatalog.$Model.principal } else { '' }
-    if ($principal) {
-        $principalKey = "principal:$principal"
-        $principalModels = @($state.providers.psobject.Properties | Where-Object { $_.Name -like "model:*" -and [string]($state.providers.($_.Name)).reason -in @('quota', 'billing', 'unavailable') })
-        if ($principalModels.Count -ge 2) {
-            $longestHours = $hours
-            foreach ($pm in $principalModels) {
-                $pmEntry = $state.providers.($pm.Name)
-                if ($pmEntry.nextProbeAt) {
-                    try {
-                        $pmProbe = ([datetime]$pmEntry.nextProbeAt).ToUniversalTime()
-                        $diff = ($pmProbe - [datetime]::UtcNow).TotalHours
-                        if ($diff -gt $longestHours) { $longestHours = [math]::Ceiling($diff) }
-                    } catch { }
-                }
-            }
-            $principalEntry = [pscustomobject]@{ reason = $Outcome; consecutiveFailures = $count; observedAt = [datetime]::UtcNow.ToString('o'); nextProbeAt = [datetime]::UtcNow.AddHours($longestHours).ToString('o') }
-            $state.providers | Add-Member -NotePropertyName $principalKey -NotePropertyValue $principalEntry -Force
+    # rateLimit 설정이 없는 principal은 기록하지 않는다 — 상한 검사에 쓰이지 않을 타임스탬프로
+    # 공유 상태 파일(provider-health.json)이 모든 어댑터 호출마다 무한정 커지는 것을 막기 위함이다.
+    if (-not $principal -or -not ($script:ProfileConfig.rateLimit -and $script:ProfileConfig.rateLimit.$principal)) { return $true }
+    return (Invoke-WithProviderHealthLock -Action {
+        $state = Read-ProviderHealth -Path $script:ProviderHealthPath
+        $key = "principal:$principal"
+        $cutoff = [datetime]::UtcNow.AddMinutes(-60)
+        $existing = @($state.callRate.$key) | Where-Object {
+            [datetime]$parsed = [datetime]::MinValue
+            [datetime]::TryParse([string]$_, [ref]$parsed) -and $parsed.ToUniversalTime() -gt $cutoff
         }
-    }
-    Write-ProviderHealth -Path $script:ProviderHealthPath -Value $state
+        $rateCap = [int]$script:ProfileConfig.rateLimit.$principal.maxCallsPerHour
+        if ($existing.Count -ge $rateCap) {
+            Write-Log "[impl] execution skip: $Model (principal $principal rate limit: $($existing.Count)/$rateCap calls in last 60m)" INFO
+            return $false
+        }
+        $updated = @($existing) + @([datetime]::UtcNow.ToString('o'))
+        $state.callRate | Add-Member -NotePropertyName $key -NotePropertyValue $updated -Force
+        Write-ProviderHealth -Path $script:ProviderHealthPath -Value $state
+        return $true
+    })
 }
 
 function Write-ChainSummary {
