@@ -147,6 +147,8 @@ foreach ($proj in $targets) {
     # 활성 락 검사
     $activeLock = Test-ActiveLock -ProjRoot $proj
     if ($null -ne $activeLock) {
+        # 잠긴 저장소는 안전하게 건너뛴다. 다만 마지막 exit 판정에서 이 상태를
+        # 실패로 집계해 호출자가 배포-커밋이 닫히지 않았음을 알 수 있게 한다.
         $entry.Status = 'skipped-locked'
         $entry.Detail = "활성 락: [$($activeLock.Stage)] 작업 $($activeLock.TaskId), PID $($activeLock.ProcId)"
         $results += $entry
@@ -263,6 +265,6 @@ $report | ConvertTo-Json -Depth 6 | Out-File -FilePath $reportPath -Encoding UTF
 Write-Host ""
 Write-Host "리포트: $reportPath" -ForegroundColor Cyan
 
-$hasErrors = @($results | Where-Object { $_.Status -eq 'error' }).Count -gt 0
+$hasErrors = @($results | Where-Object { $_.Status -in @('error', 'skipped-locked') }).Count -gt 0
 if ($hasErrors) { exit 1 }
 exit 0
