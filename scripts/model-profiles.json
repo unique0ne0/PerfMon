@@ -44,5 +44,6 @@
     "gemini": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "gemini-integration" }
   },
   "fallbackOn": ["provider_unavailable", "authentication", "quota"],
-  "providerCooldown": { "quotaDefaultHours": 5, "repeatedQuotaHours": 24 }
+  "providerCooldown": { "quotaDefaultHours": 5, "repeatedQuotaHours": 24 },
+  "rateLimit": { "opencode-free": { "maxCallsPerHour": 80 } }
 }

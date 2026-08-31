@@ -3,11 +3,11 @@ commit-harness-sync.ps1 — sync-configs.ps1 -Push 로 배포된 하네스 사�
 
 동작: harness-targets.txt 의 각 다운스트림 저장소를 순회하며, 하네스 자산 파일만
       pathspec-scoped 로 커밋한다. 무관한 staged/modified 변경이 있어도 절대 함께 커밋하지 않는다.
-      자동 push는 하지 않는다 — 커밋까지만 수행하고 push는 사용자/오케스트레이터의 별도 확인을 거친다.
+      -PushTargets 지정 시에만 원격에 push를 수행한다.
 
 스킵 사유:
-  - no-git-repo: 대상 저장소에 .git 이 없음
-  - active-pipeline-lock: 살아있는 디스패치 락이 감지됨
+  - skipped-no-repo: 대상 저장소에 .git 이 없거나 디렉터리가 존재하지 않음
+  - skipped-locked: 살아있는 디스패치 락이 감지됨
   - nothing-to-commit: 하네스 자산에 변경 없음
   - skipped-unrelated-only: 무관한 파일만 변경됨
 
@@ -19,7 +19,9 @@ Windows PowerShell 5.1 호환, UTF-8 + BOM 저장.
 param(
     [string]$RepoRoot,
     [string]$TargetList,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$PushTargets,
+    [string]$CommitMessage
 )
 
 $ErrorActionPreference = 'Stop'
@@ -207,13 +209,24 @@ foreach ($proj in $targets) {
         Invoke-GitQuiet -ProjRoot $proj -GitArgs $addArgs | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "git add 실패 (exit $LASTEXITCODE)" }
 
-        $commitMsg = "chore(harness): sync harness assets from ai-agents-config`n`nAssets: $($changedAssets -join ', ')"
+        $commitMsg = if (-not [string]::IsNullOrWhiteSpace($CommitMessage)) {
+            $CommitMessage
+        } else {
+            "chore(harness): sync harness assets from ai-agents-config`n`nAssets: $($changedAssets -join ', ')"
+        }
         $commitArgs = @('commit', '-m', $commitMsg, '--') + $commitPaths
         Invoke-GitQuiet -ProjRoot $proj -GitArgs $commitArgs | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "git commit 실패 (exit $LASTEXITCODE)" }
 
-        $entry.Status = 'committed'
-        $entry.Detail = "커밋 완료: $($changedAssets -join ', ')"
+        if ($PushTargets) {
+            Invoke-GitQuiet -ProjRoot $proj -GitArgs @('push') | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "git push 실패 (exit $LASTEXITCODE)" }
+            $entry.Status = 'committed'
+            $entry.Detail = "커밋 및 푸시 완료: $($changedAssets -join ', ')"
+        } else {
+            $entry.Status = 'committed'
+            $entry.Detail = "커밋 완료: $($changedAssets -join ', ')"
+        }
     } catch {
         $entry.Status = 'error'
         $entry.Detail = $_.Exception.Message

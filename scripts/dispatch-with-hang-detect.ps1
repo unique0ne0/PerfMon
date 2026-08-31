@@ -129,7 +129,7 @@ $StageConfig = @{
     }
     'integration' = @{
         Command = ''
-        DefaultPrompt = "작업 $TaskId — 현재 프로세스가 하네스가 시작한 유일한 Integration 본체다. 별도 Integration을 디스패치하거나 PID·락을 감시하거나 프로세스를 종료하지 마. 개발1팀의 구현과 QA팀의 리뷰가 완료되었어. 제로베이스에서 문제없는지 리뷰해. scripts/verify.ps1 게이트 통과 + 실동작 E2E 검증까지 마치고, 문제없으면 Integration을 로컬 완료 처리하고 Pipeline Status ⑤와 history.md를 갱신한 뒤, 관련 변경을 커밋하고 원격에 push까지 자동으로 수행해(추가 승인 대기 없음). 패킷 Amendment에 자동 commit/push를 명시적으로 금지하는 지시가 있으면 그 지시를 따르고 사유를 남겨. 만약 QA가 pass를 줬지만 이 Integration 단계에서 새 결함(탈출 결함)을 발견하면, .agents/briefs/logs/$TaskId-integration-findings.json 파일에 schemaVersion 2로 {taskId, stage:'integration', findings:[{id, severity, doneWhenItem, description, fixedInQa, evidence}]} 형태로 기록해. 빈 findings 배열은 '탈출 결함을 발견하지 못했다'는 적극적 진술이며, 결함을 고쳐 놓고 findings를 비워 두는 것은 기록 위반으로 간주된다."
+        DefaultPrompt = "작업 $TaskId — 현재 프로세스가 하네스가 시작한 유일한 Integration 본체다. 별도 Integration을 디스패치하거나 PID·락을 감시하거나 프로세스를 종료하지 마. 개발1팀의 구현과 QA팀의 리뷰가 완료되었어. 제로베이스에서 문제없는지 리뷰해. scripts/verify.ps1 게이트 통과 + 실동작 E2E 검증까지 마치고, 문제없으면 Integration을 로컬 완료 처리하고 Pipeline Status ⑤와 history.md를 갱신한 뒤, 관련 변경을 커밋하고 원격에 push까지 자동으로 수행해(추가 승인 대기 없음; 정본 하네스를 수정했으면 sync-configs.ps1 -Action Push -CommitTargets -PushTargets 까지 수행해야 배포와 하류 사본 커밋이 완료된다). 패킷 Amendment에 자동 commit/push를 명시적으로 금지하는 지시가 있으면 그 지시를 따르고 사유를 남겨. 만약 QA가 pass를 줬지만 이 Integration 단계에서 새 결함(탈출 결함)을 발견하면, .agents/briefs/logs/$TaskId-integration-findings.json 파일에 schemaVersion 2로 {taskId, stage:'integration', findings:[{id, severity, doneWhenItem, description, fixedInQa, evidence}]} 형태로 기록해. 빈 findings 배열은 '탈출 결함을 발견하지 못했다'는 적극적 진술이며, 결함을 고쳐 놓고 findings를 비워 두는 것은 기록 위반으로 간주된다."
         LogFile = "$TaskLogPrefix-integration.log"
         FindingsFile = "$TaskLogPrefix-integration-findings.json"
         KillOnHang = $false
@@ -1225,6 +1225,15 @@ function Resolve-ModelChain {
                         continue
                     }
                 }
+                $rateCap = $null
+                if ($script:ProfileConfig.rateLimit -and $script:ProfileConfig.rateLimit.$principal) { $rateCap = $script:ProfileConfig.rateLimit.$principal.maxCallsPerHour }
+                if ($rateCap) {
+                    $rateCount = Get-CallRateCount -State $health -Principal $principal -WindowMinutes 60
+                    if ($rateCount -ge [int]$rateCap) {
+                        Write-Log "[$Stage] preflight skip: $m (principal $principal rate limit: $rateCount/$rateCap calls in last 60m)" INFO
+                        continue
+                    }
+                }
             }
             $filtered += $m
         }
@@ -1236,6 +1245,16 @@ function Resolve-ModelChain {
                     [datetime]$pProbe = [datetime]::MinValue
                     if ([datetime]::TryParse([string]$pEntry.nextProbeAt, [ref]$pProbe) -and $pProbe.ToUniversalTime() -gt [datetime]::UtcNow) {
                         $blockedPrincipals += "$($prop.Name -replace 'principal:','') (until $($pProbe.ToUniversalTime().ToString('o')))"
+                    }
+                }
+            }
+            if ($script:ProfileConfig.rateLimit) {
+                foreach ($prop in @($script:ProfileConfig.rateLimit.psobject.Properties)) {
+                    $rateCap = $prop.Value.maxCallsPerHour
+                    if (-not $rateCap) { continue }
+                    $rateCount = Get-CallRateCount -State $health -Principal $prop.Name -WindowMinutes 60
+                    if ($rateCount -ge [int]$rateCap) {
+                        $blockedPrincipals += "$($prop.Name) (rate limit: $rateCount/$rateCap calls in last 60m)"
                     }
                 }
             }
@@ -1602,6 +1621,7 @@ function Invoke-ModelAttempt {
     # CFG-004의 무산출 안전망이 살아있다. 현재는 매 시도 새 파일이라 항상 0이지만, 계약을 이곳에서 확정한다.
     $attemptLogAbs = Resolve-RepoPath $AttemptLog
     $logStartBytes = if (Test-Path $attemptLogAbs) { (Get-Item $attemptLogAbs).Length } else { 0 }
+    Update-CallRate -Model $Model
     $exit = $null; $elapsedSeconds = 0
     $outcome = Invoke-StageProcess -Stage $Stage -Config $attemptConfig -ToolCmd $ToolCmd -Cycle $Cycle -ExitCode ([ref]$exit) -ElapsedSeconds ([ref]$elapsedSeconds) -Model $Model
     Update-LatestAttemptLog -AttemptLog $AttemptLog -LatestLog $LatestLog
@@ -2819,14 +2839,17 @@ function Dispatch-Stage {
 
 function Read-ProviderHealth {
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return [pscustomobject]@{ schemaVersion = 1; providers = [pscustomobject]@{} } }
+    if (-not (Test-Path -LiteralPath $Path)) { return [pscustomobject]@{ schemaVersion = 1; providers = [pscustomobject]@{}; callRate = [pscustomobject]@{} } }
     try {
         $state = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($state.schemaVersion -ne 1 -or $null -eq $state.providers) { throw 'invalid schema' }
+        # callRate는 구 상태 파일(rate-limit 도입 이전)에는 없을 수 있다 — 없으면 빈 객체로 채워
+        # 하위호환을 유지한다(opencode 시간당 호출 상한).
+        if ($null -eq $state.callRate) { $state | Add-Member -NotePropertyName callRate -NotePropertyValue ([pscustomobject]@{}) -Force }
         return $state
     } catch {
         Write-Log "provider health state corrupt; ignoring it until the next classified result: $($_.Exception.Message)" WARN
-        return [pscustomobject]@{ schemaVersion = 1; providers = [pscustomobject]@{} }
+        return [pscustomobject]@{ schemaVersion = 1; providers = [pscustomobject]@{}; callRate = [pscustomobject]@{} }
     }
 }
 
@@ -2892,6 +2915,39 @@ function Update-ProviderHealth {
             $state.providers | Add-Member -NotePropertyName $principalKey -NotePropertyValue $principalEntry -Force
         }
     }
+    Write-ProviderHealth -Path $script:ProviderHealthPath -Value $state
+}
+
+function Get-CallRateCount {
+    param([object]$State, [string]$Principal, [int]$WindowMinutes = 60)
+    if ($null -eq $State.callRate) { return 0 }
+    $entry = $State.callRate."principal:$Principal"
+    if (-not $entry) { return 0 }
+    $cutoff = [datetime]::UtcNow.AddMinutes(-$WindowMinutes)
+    $count = 0
+    foreach ($ts in @($entry)) {
+        [datetime]$parsed = [datetime]::MinValue
+        if ([datetime]::TryParse([string]$ts, [ref]$parsed) -and $parsed.ToUniversalTime() -gt $cutoff) { $count++ }
+    }
+    return $count
+}
+
+function Update-CallRate {
+    param([string]$Model)
+    if (-not $script:ProviderHealthPath -or $Model -notmatch '^([^/]+)/') { return }
+    $principal = if ($script:ProfileConfig.modelCatalog -and $script:ProfileConfig.modelCatalog.$Model) { [string]$script:ProfileConfig.modelCatalog.$Model.principal } else { '' }
+    # rateLimit 설정이 없는 principal은 기록하지 않는다 — 상한 검사에 쓰이지 않을 타임스탬프로
+    # 공유 상태 파일(provider-health.json)이 모든 어댑터 호출마다 무한정 커지는 것을 막기 위함이다.
+    if (-not $principal -or -not ($script:ProfileConfig.rateLimit -and $script:ProfileConfig.rateLimit.$principal)) { return }
+    $state = Read-ProviderHealth -Path $script:ProviderHealthPath
+    $key = "principal:$principal"
+    $cutoff = [datetime]::UtcNow.AddMinutes(-60)
+    $existing = @($state.callRate.$key) | Where-Object {
+        [datetime]$parsed = [datetime]::MinValue
+        [datetime]::TryParse([string]$_, [ref]$parsed) -and $parsed.ToUniversalTime() -gt $cutoff
+    }
+    $updated = @($existing) + @([datetime]::UtcNow.ToString('o'))
+    $state.callRate | Add-Member -NotePropertyName $key -NotePropertyValue $updated -Force
     Write-ProviderHealth -Path $script:ProviderHealthPath -Value $state
 }
 
