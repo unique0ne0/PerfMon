@@ -265,6 +265,13 @@ $report | ConvertTo-Json -Depth 6 | Out-File -FilePath $reportPath -Encoding UTF
 Write-Host ""
 Write-Host "리포트: $reportPath" -ForegroundColor Cyan
 
-$hasErrors = @($results | Where-Object { $_.Status -in @('error', 'skipped-locked') }).Count -gt 0
+$canonicalRepoRoot = [System.IO.Path]::GetFullPath($RepoRoot)
+# 현재 파이프라인이 실행 중인 정본 저장소는 자기 락 때문에 사본 커밋을 할 수 없다.
+# 정본은 이후 Integration에서 커밋하므로 이 한 대상의 skipped-locked는 정상이다.
+# 반대로 하류 대상의 락은 배포-커밋 미완료이므로 성공으로 숨기지 않는다.
+$hasErrors = @($results | Where-Object {
+    $_.Status -eq 'error' -or
+    ($_.Status -eq 'skipped-locked' -and [System.IO.Path]::GetFullPath($_.Repo) -ne $canonicalRepoRoot)
+}).Count -gt 0
 if ($hasErrors) { exit 1 }
 exit 0
