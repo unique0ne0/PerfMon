@@ -2026,20 +2026,67 @@ function Get-EffectivePipelineStage {
 
 function Get-RuntimeRoleBinding {
     param([string]$PacketPath)
-    $result = [ordered]@{ Present = $false; Valid = $false; Legacy = $true; PlanningProfile = $null; PlanningAdapter = $null; Error = $null }
+    $result = [ordered]@{
+        Present = $false
+        Valid = $false
+        Legacy = $true
+        PlanningProfile = $null
+        PlanningAdapter = $null
+        QaProfile = $null
+        QaAdapter = $null
+        IntegrationProfile = $null
+        IntegrationAdapter = $null
+        ImplementationRoute = $null
+        RoleContentionAck = $null
+        Error = $null
+    }
     if (-not $PacketPath -or -not (Test-Path -LiteralPath $PacketPath)) { return [pscustomobject]$result }
     $text = Get-Content -LiteralPath $PacketPath -Raw -Encoding UTF8
     $profileMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+Planning\s+Profile|actual\s+planning\s+profile)\s*:\s*`?([^`\r\n]+)`?\s*$')
     $adapterMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+Planning\s+Adapter|actual\s+planning\s+adapter)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $qaProfileMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+QA\s+Profile|actual\s+qa\s+profile)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $qaAdapterMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+QA\s+Adapter|actual\s+qa\s+adapter)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $integrationProfileMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+Integration\s+Profile|actual\s+integration\s+profile)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $integrationAdapterMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+Integration\s+Adapter|actual\s+integration\s+adapter)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $implRouteMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+Implementation\s+Route|actual\s+implementation\s+route)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $ackMatch = [regex]::Match($text, '(?im)^-\s*(?:Role\s+Contention\s+Ack|role\s+contention\s+ack)\s*:\s*`?([^`\r\n]+)`?\s*$')
     $legacyMatch = [regex]::Match($text, '(?im)^-\s*legacy\s+packet\s*:\s*`?(true|false)`?\s*$')
-    $result.Present = $profileMatch.Success -or $adapterMatch.Success -or $legacyMatch.Success
+
+    $result.Present = $profileMatch.Success -or $adapterMatch.Success -or $qaProfileMatch.Success -or $qaAdapterMatch.Success -or $integrationProfileMatch.Success -or $integrationAdapterMatch.Success -or $implRouteMatch.Success -or $ackMatch.Success -or $legacyMatch.Success
     if ($legacyMatch.Success) { $result.Legacy = $legacyMatch.Groups[1].Value -eq 'true' }
+    if ($ackMatch.Success) { $result.RoleContentionAck = $ackMatch.Groups[1].Value.Trim() }
+
+    # Planning pair check
     if (-not ($profileMatch.Success -and $adapterMatch.Success)) {
         if ($result.Present -and -not $result.Legacy) { $result.Error = 'Runtime Role Binding must contain both actual planning profile and adapter.' }
         return [pscustomobject]$result
     }
+
+    # QA pair check
+    if ($qaProfileMatch.Success -ne $qaAdapterMatch.Success) {
+        $result.Error = 'Runtime Role Binding must contain both actual QA profile and adapter when specified.'
+        return [pscustomobject]$result
+    }
+
+    # Integration pair check
+    if ($integrationProfileMatch.Success -ne $integrationAdapterMatch.Success) {
+        $result.Error = 'Runtime Role Binding must contain both actual Integration profile and adapter when specified.'
+        return [pscustomobject]$result
+    }
+
     $result.PlanningProfile = $profileMatch.Groups[1].Value.Trim()
     $result.PlanningAdapter = $adapterMatch.Groups[1].Value.Trim()
+    if ($qaProfileMatch.Success) {
+        $result.QaProfile = $qaProfileMatch.Groups[1].Value.Trim()
+        $result.QaAdapter = $qaAdapterMatch.Groups[1].Value.Trim()
+    }
+    if ($integrationProfileMatch.Success) {
+        $result.IntegrationProfile = $integrationProfileMatch.Groups[1].Value.Trim()
+        $result.IntegrationAdapter = $integrationAdapterMatch.Groups[1].Value.Trim()
+    }
+    if ($implRouteMatch.Success) {
+        $result.ImplementationRoute = $implRouteMatch.Groups[1].Value.Trim()
+    }
     $result.Valid = $true
     return [pscustomobject]$result
 }
@@ -2062,6 +2109,35 @@ function Resolve-ForceFreeModelChain {
     }
     Write-Log ("[impl] {0}: 유료 슬롯 건너뛰고 무료로 직행 ({1})" -f $sourceLabel, ($freeModels -join ' → ')) INFO
     return @($freeModels)
+}
+
+function Test-PipelineRoleContention {
+    param(
+        [string]$ImplPrincipal,
+        [string]$QaPrincipal,
+        [string]$IntegrationPrincipal
+    )
+    $stages = [ordered]@{
+        impl = $ImplPrincipal
+        qa = $QaPrincipal
+        integration = $IntegrationPrincipal
+    }
+    $seen = @{}
+    $contentions = @()
+    foreach ($stageName in $stages.Keys) {
+        $p = $stages[$stageName]
+        if ([string]::IsNullOrWhiteSpace($p)) { continue }
+        if ($seen.ContainsKey($p)) {
+            $otherStage = $seen[$p]
+            $contentions += "$otherStage & $stageName share principal '$p'"
+        } else {
+            $seen[$p] = $stageName
+        }
+    }
+    if ($contentions.Count -gt 0) {
+        return [pscustomobject]@{ Contention = $true; Details = ($contentions -join '; ') }
+    }
+    return [pscustomobject]@{ Contention = $false; Details = $null }
 }
 
 function Set-CompletedStageApprovalsSuperseded {
@@ -3062,16 +3138,36 @@ $script:RuntimeRoleBinding = [pscustomobject]@{
     planningProfile = $planningProfile
     planningAdapter = $planningAdapter
 }
+$packetQaProfile = $null
+$packetQaAdapter = $null
+$packetIntegrationProfile = $null
+$packetIntegrationAdapter = $null
+$packetImplRoute = $null
+$packetRoleContentionAck = $null
+
 if ($checkPipelinePacket) {
     $runtimeBinding = Get-RuntimeRoleBinding -PacketPath $checkPipelinePacket
     if ($runtimeBinding.Valid) {
         $planningProfile = $runtimeBinding.PlanningProfile
         $planningAdapter = $runtimeBinding.PlanningAdapter
+        $packetQaProfile = $runtimeBinding.QaProfile
+        $packetQaAdapter = $runtimeBinding.QaAdapter
+        $packetIntegrationProfile = $runtimeBinding.IntegrationProfile
+        $packetIntegrationAdapter = $runtimeBinding.IntegrationAdapter
+        $packetImplRoute = $runtimeBinding.ImplementationRoute
+        $packetRoleContentionAck = $runtimeBinding.RoleContentionAck
+
         $script:RuntimeRoleBinding = [pscustomobject]@{
             source = 'packet'
             legacy = $false
             planningProfile = $planningProfile
             planningAdapter = $planningAdapter
+            qaProfile = $packetQaProfile
+            qaAdapter = $packetQaAdapter
+            integrationProfile = $packetIntegrationProfile
+            integrationAdapter = $packetIntegrationAdapter
+            implementationRoute = $packetImplRoute
+            roleContentionAck = $packetRoleContentionAck
         }
     } elseif ($runtimeBinding.Error) {
         throw $runtimeBinding.Error
@@ -3085,7 +3181,7 @@ if ($checkPipelinePacket) {
         Write-Log 'Runtime Role Binding missing; using configured planning profile for legacy packet.' WARN
     }
 }
-$script:PipelineRouting = Resolve-PipelineRouting -Config $script:ProfileConfig -PlanningProfile $planningProfile -PlanningAdapter $planningAdapter
+$script:PipelineRouting = Resolve-PipelineRouting -Config $script:ProfileConfig -PlanningProfile $planningProfile -PlanningAdapter $planningAdapter -QaProfile $packetQaProfile -QaAdapter $packetQaAdapter -IntegrationProfile $packetIntegrationProfile -IntegrationAdapter $packetIntegrationAdapter -ImplementationRoute $packetImplRoute
 $StageConfig.impl.ModelFallback = @($script:PipelineRouting.ImplementationModels)
 $StageConfig.impl.ModelFallback = @(Resolve-ForceFreeModelChain -ModelFallback $StageConfig.impl.ModelFallback -ProfileConfig $script:ProfileConfig -ForceFreeModel $ForceFreeModel)
 
@@ -3146,6 +3242,40 @@ $StageConfig.integration.ReportFile = "$TaskLogPrefix-integration-last.md"
 # scripts/verify.ps1의 회귀 검사가 막는다.
 $stateRoot = if ($env:USERPROFILE) { Join-Path $env:USERPROFILE '.agents\harness-state' } else { Join-Path ([IO.Path]::GetTempPath()) 'agents-harness-state' }
 $script:ProviderHealthPath = Join-Path $stateRoot 'provider-health.json'
+# CFG048 Done When 7: 팀 경합 탐지 및 보고 (②구현·④QA·⑤Integration 간 principal 충돌 검사)
+$implPrincipal = if ($implFirstSlot -and $script:ProfileConfig.modelCatalog -and $script:ProfileConfig.modelCatalog.$implFirstSlot) {
+    if ($script:ProfileConfig.modelCatalog.$implFirstSlot.principal) { [string]$script:ProfileConfig.modelCatalog.$implFirstSlot.principal } else { [string]$StageConfig.impl.Adapter }
+} else { [string]$StageConfig.impl.Adapter }
+
+$qaPrincipal = if ($script:PipelineRouting.QaProfile) {
+    $qaModel = $script:PipelineRouting.QaProfile.Model
+    if ($script:ProfileConfig.modelCatalog -and $script:ProfileConfig.modelCatalog.$qaModel -and $script:ProfileConfig.modelCatalog.$qaModel.principal) {
+        [string]$script:ProfileConfig.modelCatalog.$qaModel.principal
+    } else {
+        [string]$script:PipelineRouting.QaProfile.Adapter
+    }
+} else { $null }
+
+$integrationPrincipal = if ($script:PipelineRouting.IntegrationProfile) {
+    $intModel = $script:PipelineRouting.IntegrationProfile.Model
+    if ($script:ProfileConfig.modelCatalog -and $script:ProfileConfig.modelCatalog.$intModel -and $script:ProfileConfig.modelCatalog.$intModel.principal) {
+        [string]$script:ProfileConfig.modelCatalog.$intModel.principal
+    } else {
+        [string]$script:PipelineRouting.IntegrationProfile.Adapter
+    }
+} else { $null }
+
+$contentionCheck = Test-PipelineRoleContention -ImplPrincipal $implPrincipal -QaPrincipal $qaPrincipal -IntegrationPrincipal $integrationPrincipal
+if ($contentionCheck.Contention) {
+    if ([string]::IsNullOrWhiteSpace($packetRoleContentionAck)) {
+        Write-Log "⛔ [role-contention] 파이프라인 단계 간 principal 경합 감지: $($contentionCheck.Details)" ERROR
+        Write-Log "동일 principal(계정/어댑터)이 복수 단계를 수행하면 쿼터 경합 또는 독립성 훼손이 발생할 수 있습니다. 패킷에 '- Role Contention Ack: <사유>'를 명시하거나 역할을 분리하세요." ERROR
+        exit 1
+    } else {
+        Write-Log "⚠️ [role-contention] 파이프라인 단계 간 principal 경합 ($($contentionCheck.Details)) — Role Contention Ack 확인됨: $packetRoleContentionAck" WARN
+    }
+}
+
 Write-Log "planner=$planningProfile/$planningAdapter impl-route=$($script:PipelineRouting.ImplementationRoute) impl=$implFirstSlot(adapter=$($StageConfig.impl.Adapter)) qa=$($StageConfig.qa.Adapter)/$($StageConfig.qa.Model) project=$($StageConfig.qa.ProjectId) integration=$($StageConfig.integration.Adapter)/$($StageConfig.integration.Model)" INFO
 
 trap {

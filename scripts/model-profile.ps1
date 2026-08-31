@@ -120,9 +120,13 @@ function Read-ModelProfileConfig {
             $config | Add-Member -NotePropertyName preferCost -NotePropertyValue $costVal -Force
         }
         if ($null -ne $local.roles) {
-            $unexpectedRoles = @($local.roles.psobject.Properties.Name | Where-Object { $_ -notin @('planning', 'orchestration') })
+            $unexpectedRoles = @($local.roles.psobject.Properties.Name | Where-Object { $_ -notin @('planning', 'orchestration', 'impl', 'qa', 'integration') })
             if ($unexpectedRoles.Count -gt 0) { throw 'Local model profile config contains an unsupported role.' }
-            foreach ($role in @('planning', 'orchestration')) { if ($null -ne $local.roles.$role) { $config.roles.$role = [string]$local.roles.$role } }
+            foreach ($role in @('planning', 'orchestration', 'impl', 'qa', 'integration')) {
+                if ($null -ne $local.roles.$role) {
+                    $config.roles | Add-Member -NotePropertyName $role -NotePropertyValue ([string]$local.roles.$role) -Force
+                }
+            }
         }
         if ($null -ne $local.plannerRouting) {
             foreach ($adapter in @($local.plannerRouting.psobject.Properties)) {
@@ -146,7 +150,7 @@ function Read-ModelProfileConfig {
 }
 
 function Resolve-RoleProfile {
-    param([ValidateSet('planning','orchestration')][string]$Role, [object]$Config, [string]$ExplicitProfile)
+    param([ValidateSet('planning','orchestration','qa','integration')][string]$Role, [object]$Config, [string]$ExplicitProfile)
     $name = if ($ExplicitProfile) { $ExplicitProfile } else { [string]$Config.roles.$Role }
     $profile = $Config.profiles.$name
     if ($null -eq $profile) { throw "Unknown profile: $name" }
@@ -174,15 +178,36 @@ function Resolve-ProfileChain {
 }
 
 function Resolve-PipelineRouting {
-    param([object]$Config, [string]$PlanningProfile, [string]$PlanningAdapter)
+    param(
+        [object]$Config,
+        [string]$PlanningProfile,
+        [string]$PlanningAdapter,
+        [string]$QaProfile,
+        [string]$QaAdapter,
+        [string]$IntegrationProfile,
+        [string]$IntegrationAdapter,
+        [string]$ImplementationRoute
+    )
     $planner = $Config.profiles.$PlanningProfile
     if ($null -eq $planner) { throw "Unknown actual planning profile: $PlanningProfile" }
     if ($planner.adapter -ne $PlanningAdapter) { throw "Actual planning adapter does not match profile: $PlanningProfile" }
     $route = $Config.plannerRouting.$PlanningAdapter
     if ($null -eq $route) { throw "No downstream route for planner adapter: $PlanningAdapter" }
-    $qa = Resolve-RoleProfile -Role planning -Config $Config -ExplicitProfile ([string]$route.qaProfile)
-    $integration = Resolve-RoleProfile -Role planning -Config $Config -ExplicitProfile ([string]$route.integrationProfile)
-    $routeName = [string]$route.implementationRoute
+
+    $qaProfileName = if ($QaProfile) { $QaProfile } elseif ($Config.roles.qa) { [string]$Config.roles.qa } else { [string]$route.qaProfile }
+    $integrationProfileName = if ($IntegrationProfile) { $IntegrationProfile } elseif ($Config.roles.integration) { [string]$Config.roles.integration } else { [string]$route.integrationProfile }
+    $routeName = if ($ImplementationRoute) { $ImplementationRoute } elseif ($Config.roles.impl) { [string]$Config.roles.impl } else { [string]$route.implementationRoute }
+
+    if ($null -eq $Config.routes.$routeName) { throw "Unknown implementation route: $routeName" }
+    $qa = Resolve-RoleProfile -Role qa -Config $Config -ExplicitProfile $qaProfileName
+    $integration = Resolve-RoleProfile -Role integration -Config $Config -ExplicitProfile $integrationProfileName
+    if ($QaAdapter -and $qa.Adapter -ne $QaAdapter) {
+        throw "Actual QA adapter does not match profile: $qaProfileName"
+    }
+    if ($IntegrationAdapter -and $integration.Adapter -ne $IntegrationAdapter) {
+        throw "Actual Integration adapter does not match profile: $integrationProfileName"
+    }
+
     foreach ($m in @($Config.routes.$routeName)) {
         $mFamily = if ($Config.modelCatalog.$m) { [string]$Config.modelCatalog.$m.family } else { '' }
         if ($mFamily -ne '' -and $mFamily -ne 'unknown' -and $mFamily -eq $qa.Family) {
