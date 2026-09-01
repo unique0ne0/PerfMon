@@ -1394,14 +1394,6 @@ function Get-AntigravityTerminalEvidence {
     return $null
 }
 
-# Extract only the structured terminal target; ordinary attempt-log text is not evidence.
-function Get-ApprovalTarget {
-    param([string]$AttemptLog)
-    $evidence = Get-AntigravityTerminalEvidence -AttemptLog $AttemptLog
-    if ($evidence) { return $evidence.Target }
-    return $null
-}
-
 # 원자적 JSON 승인 대기 기록. status='pending'으로 시작하며, 성공한 fresh cycle이 resolved로 바꾼다.
 function Write-ApprovalRecord {
     param([string]$Stage, [int]$CycleNumber, [int]$AttemptNumber, [string]$Model, [string]$AttemptLog, [object]$Evidence)
