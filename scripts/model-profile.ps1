@@ -220,6 +220,92 @@ function Resolve-PipelineRouting {
     return [pscustomobject]@{ PlanningProfile = $PlanningProfile; PlanningAdapter = $PlanningAdapter; ImplementationRoute = $routeName; ImplementationModels = @($Config.routes.$routeName); QaProfile = $qa; IntegrationProfile = $integration }
 }
 
+# CFG028 / CFG054: Antigravity 프로젝트 ID 해석 단일 정본 구현.
+# projects/*.json 에서 RepositoryRoot 와 일치하는 매핑을 탐색한다.
+# 결정성을 위해 파일명 순(Sort-Object Name)으로 정렬하고, 다중 매핑 시 WARN 경고를 남긴다.
+function Resolve-AntigravityProjectId {
+    param([string]$RepositoryRoot)
+    if (-not $env:USERPROFILE) { throw 'Antigravity project resolution requires USERPROFILE.' }
+    $projectsDir = Join-Path $env:USERPROFILE '.gemini\config\projects'
+    if (-not (Test-Path -LiteralPath $projectsDir)) { throw "Antigravity projects directory not found: $projectsDir" }
+    $wanted = [IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\').Replace('\','/').ToLowerInvariant()
+    $matchedProjects = @()
+    foreach ($file in @(Get-ChildItem -LiteralPath $projectsDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+        try { $project = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+        foreach ($resource in @($project.projectResources.resources)) {
+            $uri = if ($resource.folderUri) { [string]$resource.folderUri } elseif ($resource.gitFolder.folderUri) { [string]$resource.gitFolder.folderUri } else { '' }
+            if (-not $uri.StartsWith('file:', [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $decoded = [Uri]::UnescapeDataString(($uri -replace '^file:/+', ''))
+            $candidate = $decoded.TrimEnd('/').ToLowerInvariant()
+            if ($candidate -eq $wanted) {
+                $id = [string]$project.id
+                if ($id -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,127}$') { throw "Invalid Antigravity project id in $($file.FullName)" }
+                $matchedProjects += [pscustomobject]@{ Id = $id; File = $file.Name; FullPath = $file.FullName }
+                break
+            }
+        }
+    }
+    if ($matchedProjects.Count -eq 0) {
+        throw "No Antigravity project maps repository '$RepositoryRoot'. Run 'agy --new-project' from that repository root after explicit user approval."
+    }
+    if ($matchedProjects.Count -gt 1) {
+        $candidateList = ($matchedProjects | ForEach-Object { "$($_.Id) ($($_.File))" }) -join ', '
+        if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+            Write-Log "Multiple Antigravity projects ($($matchedProjects.Count)) map '$RepositoryRoot': $candidateList - using first ($($matchedProjects[0].Id))" WARN
+        }
+        Write-Warning "Multiple Antigravity projects ($($matchedProjects.Count)) map '$RepositoryRoot': $candidateList - using first ($($matchedProjects[0].Id))"
+    }
+    return $matchedProjects[0].Id
+}
+
+function Get-AdapterExecutable {
+    param([ValidateSet('claude','codex','opencode','gemini','antigravity')][string]$Adapter)
+    switch ($Adapter) {
+        'antigravity' { return 'agy' }
+        'claude' { return 'claude' }
+        'codex' { return 'codex' }
+        'opencode' { return 'opencode' }
+        'gemini' { return 'gemini' }
+    }
+}
+
+# CFG054: 어댑터 실행 플래그 단일 테이블(SSOT).
+# 프롬프트 자리에 '<PROMPT>' 센티널 토큰을 포함한 argv 배열을 반환한다.
+# orchestrate-packet(ConvertTo-CoordinatorArgv), model-profile(Build-AntigravityCommand),
+# dispatch-with-hang-detect(Build-ToolCommand) 세 소비자가 이 공용 테이블을 공유한다.
+# (opencode: 'opencode run --pure --auto' allow-all 승인 계약을 고정한다)
+function Get-AdapterInvocationArgv {
+    param(
+        [ValidateSet('claude','codex','opencode','gemini','antigravity')][string]$Adapter,
+        [string]$Model,
+        [string]$ReportFile,
+        [string]$ProjectId,
+        [string]$PrintTimeout = '25m'
+    )
+    switch ($Adapter) {
+        'antigravity' {
+            if ([string]::IsNullOrWhiteSpace($ProjectId)) { throw 'Antigravity ProjectId is required.' }
+            $argv = @('--project', $ProjectId, '--model', $Model)
+            if ($Model -eq 'gemini-3.7-flash') { $argv += @('--effort', 'medium') }
+            $argv += @('--mode', 'accept-edits', '--dangerously-skip-permissions', '--output-format', 'stream-json', '--print-timeout', $PrintTimeout, '--print', '<PROMPT>')
+            return @($argv)
+        }
+        'claude' {
+            return @('-p', '<PROMPT>', '--model', $Model, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions')
+        }
+        'codex' {
+            return @('exec', '<PROMPT>', '-m', $Model, '-s', 'danger-full-access', '-o', $ReportFile)
+        }
+        'opencode' {
+            return @('run', '--pure', '--auto', '-m', $Model, '<PROMPT>')
+        }
+        'gemini' {
+            return @('--approval-mode', 'yolo', '-m', $Model, '<PROMPT>')
+        }
+    }
+    throw "Unsupported adapter: $Adapter"
+}
+
 function ConvertTo-DriverQuoted { param([string]$Text) return '"' + ($Text -replace '"', '\"') + '"' }
 
 # bash 작은따옴표 리터럴로 감싼다 — 프롬프트·실행 파일 경로 안의 $·백틱·"가 bash에서 확장되지
@@ -231,30 +317,22 @@ function ConvertTo-BashSingleQuoted {
     return "'" + ($Text -replace "'", "'\''") + "'"
 }
 
-# CFG046 R11: Antigravity(agy) 커맨드는 여기 한 곳에서만 만든다. 이 함수가
-#  - dispatch-with-hang-detect.ps1 의 Build-ToolCommand (qa·integration antigravity 분기)
-#  - model-profile.ps1 의 Build-AdapterCommand (antigravity 분기)
-# 양쪽이 공유하는 단일 구현이다. 프로젝트 매핑(ProjectId)이 없으면 agy 는 헤드리스 디스패치에서
-# 실행 불가하므로 즉시 실패한다 — 조용히 매달리지 않는다(본문 Done When 3).
-# 프롬프트의 인용(작은따옴표)은 dispatch 의 bash 래퍼 규약(CFG-BL-031)을 따른다.
+# CFG046 R11 / CFG054: Antigravity(agy) 커맨드는 Get-AdapterInvocationArgv 공용 테이블을 bash 문자열로 렌더링한다.
+# 프로젝트 매핑(ProjectId)이 없으면 agy 는 헤드리스 디스패치에서 실행 불가하므로 즉시 실패한다.
 function Build-AntigravityCommand {
     param([string]$Model, [string]$Prompt, [string]$ProjectId, [string]$Executable, [string]$PrintTimeout = '25m')
-    if ([string]::IsNullOrWhiteSpace($ProjectId)) { throw 'Antigravity ProjectId is required.' }
+    $argv = Get-AdapterInvocationArgv -Adapter 'antigravity' -Model $Model -ProjectId $ProjectId -PrintTimeout $PrintTimeout
     $agyBase = if ([string]::IsNullOrWhiteSpace($Executable)) { 'agy' } else { ConvertTo-BashSingleQuoted ([string]$Executable).Replace('\','/') }
-    # agy 는 권한 프롬프트로 단계가 멈추는 일이 잦아, 사용자 지시(2026-08-31)에 따라 항상 사용자 권한으로 실행한다.
-    $effortFlag = if ($Model -eq 'gemini-3.7-flash') { ' --effort medium' } else { '' }
     $quotedPrompt = ConvertTo-BashSingleQuoted $Prompt
-    return "$agyBase --project $ProjectId --model $Model$effortFlag --mode accept-edits --dangerously-skip-permissions --output-format stream-json --print-timeout $PrintTimeout --print $quotedPrompt"
-}
-
-function Build-AdapterCommand {
-    param([ValidateSet('claude','codex','opencode','gemini','antigravity')][string]$Adapter, [string]$Model, [string]$Prompt, [string]$ReportFile, [string]$ProjectId)
-    $quotedPrompt = ConvertTo-DriverQuoted $Prompt
-    switch ($Adapter) {
-        'claude' { return "claude -p $quotedPrompt --model $Model --output-format stream-json --verbose --dangerously-skip-permissions" }
-        'codex' { return "codex exec $quotedPrompt -m $Model -s danger-full-access -o $(ConvertTo-DriverQuoted $ReportFile)" }
-        'opencode' { return "opencode run --pure --auto -m $Model $quotedPrompt" }
-        'gemini' { return "gemini --approval-mode yolo -m $Model $quotedPrompt" }
-        'antigravity' { return Build-AntigravityCommand -Model $Model -Prompt $Prompt -ProjectId $ProjectId }
+    $tailTokens = @()
+    for ($i = 0; $i -lt $argv.Count; $i++) {
+        $tok = $argv[$i]
+        if ($tok -eq '<PROMPT>') {
+            $tailTokens += $quotedPrompt
+        } else {
+            $tailTokens += $tok
+        }
     }
+    $joined = $tailTokens -join ' '
+    return "$agyBase $joined"
 }

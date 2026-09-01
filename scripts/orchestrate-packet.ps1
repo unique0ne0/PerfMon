@@ -159,28 +159,10 @@ function Build-CoordinatorPrompt {
     return $prompt
 }
 
-function Resolve-AntigravityProjectId {
-    param([string]$RepositoryRoot)
-    if (-not $env:USERPROFILE) { throw 'Antigravity project resolution requires USERPROFILE.' }
-    $projectsDir = Join-Path $env:USERPROFILE '.gemini\config\projects'
-    if (-not (Test-Path -LiteralPath $projectsDir)) { throw "Antigravity projects directory not found: $projectsDir" }
-    $wanted = [IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\').Replace('\','/').ToLowerInvariant()
-    foreach ($file in @(Get-ChildItem -LiteralPath $projectsDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
-        try { $project = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
-        foreach ($resource in @($project.projectResources.resources)) {
-            $uri = if ($resource.folderUri) { [string]$resource.folderUri } elseif ($resource.gitFolder.folderUri) { [string]$resource.gitFolder.folderUri } else { '' }
-            if (-not $uri.StartsWith('file:', [StringComparison]::OrdinalIgnoreCase)) { continue }
-            $decoded = [Uri]::UnescapeDataString(($uri -replace '^file:/+', ''))
-            $candidate = $decoded.TrimEnd('/').ToLowerInvariant()
-            if ($candidate -eq $wanted) {
-                $id = [string]$project.id
-                if ($id -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,127}$') { throw "Invalid Antigravity project id in $($file.FullName)" }
-                return $id
-            }
-        }
-    }
-    throw "No Antigravity project maps repository '$RepositoryRoot'. Run 'agy --new-project' from that repository root after explicit user approval."
-}
+# Load model profile config for orchestration profile resolution
+$ProfileModule = Join-Path $repoRoot 'global\harness\model-profile.ps1'
+$ProfileConfigPath = Join-Path $repoRoot 'global\harness\model-profiles.json'
+. $ProfileModule
 
 # CFG046 QA-003: 어댑터별 실행 전제를 검증한다. 없으면 사유와 함께 즉시 실패한다 — "조용한
 # 승인 대기"는 이 패킷이 없애려는 대상이다. antigravity는 프로젝트 매핑(Resolve-AntigravityProjectId)
@@ -207,37 +189,17 @@ function Assert-CoordinatorReady {
     }
 }
 
-# CFG046 QA-002/R11/R14: 오케스트레이션 실행 커맨드를 argv 단위로 만든다(단일 근원). 플래그 순서는
-# model-profile.ps1 Build-AntigravityCommand(문자열 빌더)와 동일하게 유지하고, antigravity는
-# ProjectId 부재 시 즉시 실패하며 항상 --dangerously-skip-permissions를 붙인다. '<PROMPT>'는 러너가
-# 프롬프트 텍스트로 치환하는 센티널이다(A2#2 — 프롬프트는 반드시 단일 인자).
+# CFG046 QA-002/R11/R14 / CFG054: 오케스트레이션 실행 커맨드를 argv 단위로 만든다(단일 근원).
+# 플래그 테이블의 정본은 model-profile.ps1 의 Get-AdapterInvocationArgv 이며, 이 함수는 이를 그대로 반환한다.
+# '<PROMPT>'는 러너가 프롬프트 텍스트로 치환하는 센티널이다(A2#2 — 프롬프트는 반드시 단일 인자).
 function ConvertTo-CoordinatorArgv {
     param([ValidateSet('claude','codex','opencode','gemini','antigravity')][string]$Adapter, [string]$Model, [string]$ReportFile, [string]$ProjectId, [string]$PrintTimeout = '25m')
-    switch ($Adapter) {
-        'antigravity' {
-            if ([string]::IsNullOrWhiteSpace($ProjectId)) { throw 'Antigravity ProjectId is required.' }
-            $argv = @('--project', $ProjectId, '--model', $Model)
-            if ($Model -eq 'gemini-3.7-flash') { $argv += @('--effort', 'medium') }
-            $argv += @('--mode', 'accept-edits', '--dangerously-skip-permissions', '--output-format', 'stream-json', '--print-timeout', $PrintTimeout, '--print', '<PROMPT>')
-            return @($argv)
-        }
-        'claude' { return @('-p', '<PROMPT>', '--model', $Model, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions') }
-        'codex' { return @('exec', '<PROMPT>', '-m', $Model, '-s', 'danger-full-access', '-o', $ReportFile) }
-        'opencode' { return @('run', '--pure', '--auto', '-m', $Model, '<PROMPT>') }
-        'gemini' { return @('--approval-mode', 'yolo', '-m', $Model, '<PROMPT>') }
-    }
-    throw "Unsupported coordinator adapter: $Adapter"
+    return Get-AdapterInvocationArgv -Adapter $Adapter -Model $Model -ReportFile $ReportFile -ProjectId $ProjectId -PrintTimeout $PrintTimeout
 }
 
 function Get-CoordinatorExecutable {
     param([ValidateSet('claude','codex','opencode','gemini','antigravity')][string]$Adapter)
-    switch ($Adapter) {
-        'antigravity' { return 'agy' }
-        'claude' { return 'claude' }
-        'codex' { return 'codex' }
-        'opencode' { return 'opencode' }
-        'gemini' { return 'gemini' }
-    }
+    return Get-AdapterExecutable -Adapter $Adapter
 }
 
 $existingEscalation = Join-Path $logs "$TaskId-orchestration-escalation.json"
@@ -257,10 +219,6 @@ $attempts = @()
 
 Write-Host "driver task=$TaskId driverCycleId=$driverCycleId deadline=${HardTimeoutMinutes}m"
 
-# Load model profile config for orchestration profile resolution
-$ProfileModule = Join-Path $repoRoot 'global\harness\model-profile.ps1'
-$ProfileConfigPath = Join-Path $repoRoot 'global\harness\model-profiles.json'
-. $ProfileModule
 $script:ProfileConfig = Read-ModelProfileConfig -CentralPath $ProfileConfigPath -LocalPath (Join-Path $repoRoot 'model-profiles.local.json')
 
 # Resolve the orchestration profile — explicit -DriverProfile wins, else roles.orchestration.

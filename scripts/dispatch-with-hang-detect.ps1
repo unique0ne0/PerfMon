@@ -311,49 +311,6 @@ function Resolve-BashExe {
     return $null
 }
 
-# bash 작은따옴표 리터럴로 감싼다 — 프롬프트 안의 $·백틱·"가 bash에서 확장되지 않도록.
-# 전달되는 프롬프트 문자열 자체는 그대로다(verbatim 원칙 유지).
-function ConvertTo-BashSingleQuoted {
-    param([string]$Text)
-    return "'" + ($Text -replace "'", "'\''") + "'"
-}
-
-# 단계별 도구 명령 문자열(리다이렉트 제외 — bash 래퍼에서 처리).
-# $Model: ModelFallback 체인을 쓰는 단계(impl)에서 Command의 {MODEL} 자리에 넣을 값. 다른 단계는 무시.
-function Resolve-AntigravityProjectId {
-    param([string]$RepositoryRoot)
-    if (-not $env:USERPROFILE) { throw 'Antigravity project resolution requires USERPROFILE.' }
-    $projectsDir = Join-Path $env:USERPROFILE '.gemini\config\projects'
-    if (-not (Test-Path -LiteralPath $projectsDir)) { throw "Antigravity projects directory not found: $projectsDir" }
-    $wanted = [IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\').Replace('\','/').ToLowerInvariant()
-    $matchedProjects = @()
-    foreach ($file in @(Get-ChildItem -LiteralPath $projectsDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
-        try { $project = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
-        foreach ($resource in @($project.projectResources.resources)) {
-            $uri = if ($resource.folderUri) { [string]$resource.folderUri } elseif ($resource.gitFolder.folderUri) { [string]$resource.gitFolder.folderUri } else { '' }
-            if (-not $uri.StartsWith('file:', [StringComparison]::OrdinalIgnoreCase)) { continue }
-            $decoded = [Uri]::UnescapeDataString(($uri -replace '^file:/+', ''))
-            $candidate = $decoded.TrimEnd('/').ToLowerInvariant()
-            if ($candidate -eq $wanted) {
-                $id = [string]$project.id
-                if ($id -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,127}$') { throw "Invalid Antigravity project id in $($file.FullName)" }
-                $matchedProjects += [pscustomobject]@{ Id = $id; File = $file.Name; FullPath = $file.FullName }
-                break
-            }
-        }
-    }
-    if ($matchedProjects.Count -eq 0) {
-        throw "No Antigravity project maps repository '$RepositoryRoot'. Run 'agy --new-project' from that repository root after explicit user approval."
-    }
-    if ($matchedProjects.Count -gt 1) {
-        $candidateList = ($matchedProjects | ForEach-Object { "$($_.Id) ($($_.File))" }) -join ', '
-        if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
-            Write-Log "⚠️ 저장소 '$RepositoryRoot'에 매핑된 Antigravity 프로젝트가 $($matchedProjects.Count)개 발견되었습니다: $candidateList — 결정적 첫 번째($($matchedProjects[0].Id))를 사용합니다" WARN
-        }
-    }
-    return $matchedProjects[0].Id
-}
-
 # CFG017: Antigravity 어댑터 단계의 읽기 전용 preflight. PATH·버전·project mapping을 진단만 하고
 # 외부 설정(설치·매핑 생성·환경 변수·config 변경)을 절대 수정하지 않는다. 실패는 재시도 불가능한
 # config failure이며, 성공해도 Diagnostics(읽기 전용 확인 결과)만 반환한다.
@@ -418,41 +375,60 @@ function Resolve-InvocationModel {
     return $Model
 }
 
+function Render-BashInvocationCommand {
+    param([string[]]$Argv, [string]$Executable, [string]$Prompt)
+    $quotedPrompt = ConvertTo-BashSingleQuoted $Prompt
+    $tailTokens = @()
+    for ($i = 0; $i -lt $Argv.Count; $i++) {
+        $tok = $Argv[$i]
+        if ($tok -eq '<PROMPT>') {
+            $tailTokens += $quotedPrompt
+        } elseif ($i -gt 0 -and $Argv[$i - 1] -eq '-o') {
+            $tailTokens += ConvertTo-BashSingleQuoted $tok
+        } else {
+            $tailTokens += $tok
+        }
+    }
+    $joined = $tailTokens -join ' '
+    return "$Executable $joined"
+}
+
 function Build-ToolCommand {
     param([hashtable]$Config, [string]$Stage, [string]$PromptOverride, [string]$Model, [switch]$BypassToolPermissions)
     $Model = Resolve-InvocationModel -Config $Config -Model $Model
     $p = if ([string]::IsNullOrWhiteSpace($PromptOverride)) { $Config.DefaultPrompt } else { $PromptOverride }
     $q = ConvertTo-BashSingleQuoted $p
     $cmd = if ($Model) { $Config.Command -replace '\{MODEL\}', $Model } else { $Config.Command }
-    # agy(Antigravity) 커맨드는 model-profile.ps1 의 Build-AntigravityCommand 단일 구현으로 만든다
-    # (CFG046 R11 — Build-AdapterCommand 와 중복을 허용하지 않는다). ProjectId 누락 시 즉시 실패한다.
+    # CFG046 R11 / CFG054: 어댑터 커맨드는 model-profile.ps1 의 Get-AdapterInvocationArgv 공용 플래그 테이블을 따른다.
+    # 스테이지별 기본 어댑터(qa: codex, integration: claude)와 impl Command 템플릿(--variant 제거)은 그대로 유지한다.
+    $targetAdapter = $null
     switch ($Stage) {
-                'impl'        {
-            # 개발1팀도 어댑터가 고정이 아니다(모든 팀이 모든 역할 수행). 라우트 슬롯의 어댑터를
-            # 따르고, 어댑터가 없거나 opencode일 때만 기존 Command 템플릿을 쓴다.
-            if ($Config.Adapter -eq 'antigravity') { return Build-AntigravityCommand -Model $Model -Prompt $p -ProjectId $Config.ProjectId -Executable $Config.Executable }
-            if ($Config.Adapter -eq 'claude') { return "claude -p $q --model $Model --dangerously-skip-permissions --output-format stream-json --verbose" }
-            if ($Config.Adapter -eq 'codex') { return "codex exec $q -m $Model -s danger-full-access -o $(ConvertTo-BashSingleQuoted $Config.ReportFile)" }
-            if ($Config.Adapter -eq 'gemini') { return "gemini --approval-mode yolo -m $Model $q" }
-            if ($Model -and $Model -match '(?i)(big-pickle|free|flash)' -and $cmd -match ' --variant \S+') {
-                $cmd = $cmd -replace ' --variant \S+', ''
+        'impl' {
+            if ($Config.Adapter -and $Config.Adapter -ne 'opencode') {
+                $targetAdapter = $Config.Adapter
+            } else {
+                if ($Model -and $Model -match '(?i)(big-pickle|free|flash)' -and $cmd -match ' --variant \S+') {
+                    $cmd = $cmd -replace ' --variant \S+', ''
+                }
+                return "$cmd $q"
             }
-            return "$cmd $q"
         }
         'qa' {
-            if ($Config.Adapter -eq 'gemini') { return "gemini --approval-mode yolo -m $Model $q" }
-            if ($Config.Adapter -eq 'antigravity') { return Build-AntigravityCommand -Model $Model -Prompt $p -ProjectId $Config.ProjectId -Executable $Config.Executable }
-            if ($Config.Adapter -eq 'opencode') { return "opencode run --pure --auto -m $Model $q" }
-            return "codex exec $q -m $Model -s danger-full-access -o $(ConvertTo-BashSingleQuoted $Config.ReportFile)"
+            $targetAdapter = if ($Config.Adapter) { $Config.Adapter } else { 'codex' }
         }
         'integration' {
-            if ($Config.Adapter -eq 'codex') { return "codex exec $q -m $Model -s danger-full-access -o $(ConvertTo-BashSingleQuoted $Config.ReportFile)" }
-            if ($Config.Adapter -eq 'gemini') { return "gemini --approval-mode yolo -m $Model $q" }
-            if ($Config.Adapter -eq 'antigravity') { return Build-AntigravityCommand -Model $Model -Prompt $p -ProjectId $Config.ProjectId -Executable $Config.Executable }
-            if ($Config.Adapter -eq 'opencode') { return "opencode run --pure --auto -m $Model $q" }
-            return "claude -p $q --model $Model --dangerously-skip-permissions --output-format stream-json --verbose"
+            $targetAdapter = if ($Config.Adapter) { $Config.Adapter } else { 'claude' }
         }
     }
+
+    if ($targetAdapter -eq 'antigravity') {
+        return Build-AntigravityCommand -Model $Model -Prompt $p -ProjectId $Config.ProjectId -Executable $Config.Executable
+    }
+    # model-profile.ps1 is dot-sourced before any Dispatch-Stage invocation (below), so all
+    # adapter flags and executable names always come from its shared argv contract.
+    $argv = Get-AdapterInvocationArgv -Adapter $targetAdapter -Model $Model -ReportFile $Config.ReportFile -ProjectId $Config.ProjectId
+    $exe = Get-AdapterExecutable -Adapter $targetAdapter
+    return Render-BashInvocationCommand -Argv $argv -Executable $exe -Prompt $p
 }
 #endregion 로깅·경로·사전진단
 #region hang 탐지·프로세스 트리·작업트리
