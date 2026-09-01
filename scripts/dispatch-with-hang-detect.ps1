@@ -213,25 +213,9 @@ function Resolve-RepoPath {
 function Write-StageState {
     param([string]$Stage, [int]$Cycle, [string]$State, [int]$ProcessId, [string[]]$EvidencePaths, [string]$Reason, [string]$Model)
     $path = Resolve-RepoPath "$LogDir/$TaskId-stage-state.json"
-    $parent = Split-Path -Parent $path
-    if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-    $previous = $null
-    try { if (Test-Path -LiteralPath $path) { $previous = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json } } catch { }
-    # 사이클은 단계마다 독립적으로 증가하므로 비교를 같은 단계로 한정한다. 같은 단계의 늦은
-    # 과거 사이클 기록만 거부하고, 새 단계(impl→qa→integration)는 이전 단계 lease를 대체한다.
-    # CFG020: impl cycle 5 완료 후 qa cycle 1이 이전 단계 cycle에 막혀 'starting'을 쓰지 못하면
-    # 대시보드가 실제 진행 중인 qa를 이전 단계 상태로 계속 보여주는 오탐이 생긴다.
-    $sameStage = $previous -and ([string]$previous.stage -eq $Stage)
-    $previousCycle = 0
-    if ($sameStage -and [int]::TryParse([string]$previous.cycle, [ref]$previousCycle) -and $previousCycle -gt $Cycle) { return }
-    $sequence = if ($previous -and $previous.sequence) { [int]$previous.sequence + 1 } else { 1 }
-    $now = [datetime]::UtcNow.ToString('o')
-    $sameCycle = $sameStage -and ($previous -and [string]$previous.cycle -eq [string]$Cycle)
-    $wasRunning = $previous -and ([string]$previous.state -match '^(starting|running)$')
-    $startedAt = if ($sameCycle -and $wasRunning -and $previous.startedAt) { [string]$previous.startedAt } else { $now }
-    $value = [ordered]@{ schemaVersion = 1; taskId = $TaskId; stage = $Stage; cycle = $Cycle; sequence = $sequence; state = $State; owner = 'dispatcher'; pid = $ProcessId; model = $Model; startedAt = $startedAt; heartbeatAt = $now; eventAt = $now; evidencePaths = @($EvidencePaths); reason = $Reason }
-    Write-AtomicJson -Path $path -Value $value -Depth 6
+    Write-HarnessStageState -Path $path -TaskId $TaskId -Stage $Stage -Cycle $Cycle -State $State -ProcessId $ProcessId -EvidencePaths $EvidencePaths -Reason $Reason -Model $Model -Owner 'dispatcher'
 }
+
 
 function Get-SessionHealthRole {
     param([string]$Stage)

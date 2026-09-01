@@ -16,14 +16,14 @@ $packet = @(Get-ChildItem -Path (Join-Path $repoRoot '.agents\briefs\packets') -
 if ($packet.Count -ne 1) { throw "Expected exactly one active packet for $TaskId; found $($packet.Count)." }
 if ($HardTimeoutMinutes -lt 1 -or $HardTimeoutMinutes -gt 120) { throw 'HardTimeoutMinutes must be between 1 and 120.' }
 
-function Write-AtomicJson {
-    param([string]$Path, [object]$Value)
-    $parent = Split-Path -Parent $Path
-    if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-    $temp = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
-    [System.IO.File]::WriteAllText($temp, ($Value | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($true)))
-    Move-Item -LiteralPath $temp -Destination $Path -Force
+$HarnessIoModule = Join-Path $PSScriptRoot 'harness-io.ps1'
+if (-not (Test-Path -LiteralPath $HarnessIoModule)) {
+    $HarnessIoModule = Join-Path $repoRoot 'global\harness\harness-io.ps1'
 }
+if (-not (Test-Path -LiteralPath $HarnessIoModule)) {
+    throw "Required harness I/O module not found: $HarnessIoModule"
+}
+. $HarnessIoModule
 
 function Write-OrchestrationEscalation {
     param([string]$ReasonCode, [string]$Summary, [string[]]$EvidencePaths, [object[]]$Attempts, [string]$DecisionNeeded)
@@ -33,10 +33,11 @@ function Write-OrchestrationEscalation {
 }
 
 function Write-StartingStageState {
+    param([string]$Model = $null)
     $path = Join-Path $logs "$TaskId-stage-state.json"
-    $now = [datetime]::UtcNow.ToString('o')
-    Write-AtomicJson -Path $path -Value ([ordered]@{ schemaVersion = 1; taskId = $TaskId; stage = 'unknown'; cycle = $driverCycleId; sequence = 1; state = 'starting'; owner = 'host'; pid = $PID; startedAt = $now; heartbeatAt = $now; eventAt = $now; evidencePaths = @($logPath); reason = 'hidden host launcher started' })
+    Write-HarnessStageState -Path $path -TaskId $TaskId -Stage 'unknown' -Cycle $driverCycleId -State 'starting' -ProcessId $PID -EvidencePaths @($logPath) -Reason 'hidden host launcher started' -Model $Model -Owner 'host'
 }
+
 
 function Get-DriverFailureReason {
     param([string]$LogPath)
@@ -270,7 +271,8 @@ $coordinatorArgv = ConvertTo-CoordinatorArgv -Adapter $orchAdapter -Model $orchM
 $coordinatorArgvLiteral = ($coordinatorArgv | ForEach-Object { "'" + $_.Replace("'", "''") + "'" }) -join ', '
 $coordinatorExecutable = Get-CoordinatorExecutable -Adapter $orchAdapter
 
-Write-StartingStageState
+Write-StartingStageState -Model $orchModel
+
 
 $runner = Join-Path ([IO.Path]::GetTempPath()) ("orchestrate-$driverCycleId.ps1")
 $promptFile = Join-Path ([IO.Path]::GetTempPath()) ("orchestrate-$driverCycleId-prompt.txt")
