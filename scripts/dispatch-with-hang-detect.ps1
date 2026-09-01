@@ -87,6 +87,13 @@ if (-not (Test-Path -LiteralPath $HarnessIoModule)) {
     throw "Required harness I/O module not found: $HarnessIoModule"
 }
 . $HarnessIoModule
+# CFG055 회귀 핫픽스: model-profile.ps1은 여기 top-level에서 한 번 로드해야 한다. Resolve-DispatchPlan
+# 내부에서만 dot-source하면 PowerShell 함수 스코프상 그 함수 호출이 끝나는 즉시 사라져,
+# 이후 Invoke-DispatchChain -> Dispatch-Stage -> Build-ToolCommand/Test-AntigravityPreflight가
+# ConvertTo-BashSingleQuoted/Resolve-AntigravityProjectId를 찾지 못하고 실패한다(실측: CFG056 디스패치).
+if (Test-Path -LiteralPath $ProfileModule) {
+    . $ProfileModule
+}
 
 # 동시 디스패치 락. 로그 디렉터리 **안**에 둔다 — Get-TreeState가 이 경로를 이미 걸러내므로
 # 락 파일 자체가 작업트리를 더럽혀 무변경 감지를 무력화하는 자충수를 피한다.
