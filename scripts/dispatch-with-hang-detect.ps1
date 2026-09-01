@@ -2983,375 +2983,464 @@ function Invoke-DispatcherCleanup {
 }
 
 #endregion 관측·집계·감독·정리
-# ── 메인 ─────────────────────────────────────────────────────────────────────
-Validate-TaskId -Id $TaskId
+function Resolve-DispatchPlan {
+    param(
+        [Parameter(Mandatory=$true)][string]$TaskId,
+        [Parameter(Mandatory=$false)][string]$Stage,
+        [Parameter(Mandatory=$false)][string]$Prompt,
+        [Parameter(Mandatory=$false)][string]$Model,
+        [Parameter(Mandatory=$false)][switch]$Chain,
+        [Parameter(Mandatory=$false)][switch]$DryRun,
+        [Parameter(Mandatory=$false)][switch]$SkipVerdictGate,
+        [Parameter(Mandatory=$false)][switch]$ForceFreeModel,
+        [Parameter(Mandatory=$false)][switch]$ResetStageLedger,
+        [Parameter(Mandatory=$false)][string]$ResetReason,
+        [Parameter(Mandatory=$false)][switch]$ManualComplete,
+        [Parameter(Mandatory=$false)][switch]$ManualAbort,
+        [Parameter(Mandatory=$false)][string]$Reason,
+        [Parameter(Mandatory=$false)][hashtable]$StageConfig,
+        [Parameter(Mandatory=$false)][string]$RepoRoot,
+        [Parameter(Mandatory=$false)][string]$ProfileModule,
+        [Parameter(Mandatory=$false)][string]$ProfileConfigPath
+    )
 
-if ($ResetStageLedger) {
-    if (-not $Stage) { Write-Log '오류: -ResetStageLedger는 -Stage와 함께 사용하세요 (예: -Stage qa).' ERROR; exit 1 }
-    if ([string]::IsNullOrWhiteSpace($ResetReason)) {
-        Write-Log '오류: -ResetStageLedger는 -ResetReason으로 초기화 사유를 반드시 남기세요 (예: "구조적 원인 수정 완료 — BypassToolPermissions 적용").' ERROR
-        exit 1
+    Validate-TaskId -Id $TaskId
+
+    if ($ResetStageLedger) {
+        if (-not $Stage) {
+            Write-Log '오류: -ResetStageLedger는 -Stage와 함께 사용하세요 (예: -Stage qa).' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'ResetStageLedger requires Stage' }
+        }
+        if ([string]::IsNullOrWhiteSpace($ResetReason)) {
+            Write-Log '오류: -ResetStageLedger는 -ResetReason으로 초기화 사유를 반드시 남기세요 (예: "구조적 원인 수정 완료 — BypassToolPermissions 적용").' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'ResetStageLedger requires ResetReason' }
+        }
+        return [pscustomobject]@{ EarlyExit = $true; ExitCode = 0; Reason = 'StageLedger reset requested'; Action = 'resetStageLedger'; ActionStage = $Stage; ActionReason = $ResetReason }
     }
-    Reset-StageLedger -Stage $Stage -Reason $ResetReason
-    exit 0
-}
 
-# ── CFG043: 수동 완료/중단 (실행 대신 lease 종결) ──
-if ($ManualComplete -and $ManualAbort) {
-    Write-Log '-ManualComplete와 -ManualAbort는 동시에 사용할 수 없습니다.' ERROR; exit 1
-}
-if ($ManualComplete) { exit (Invoke-ManualStageTermination -Stage $Stage -Complete -ReasonText $Reason) }
-if ($ManualAbort) { exit (Invoke-ManualStageTermination -Stage $Stage -Complete:$false -ReasonText $Reason) }
+    # ── CFG043: 수동 완료/중단 (실행 대신 lease 종결) ──
+    if ($ManualComplete -and $ManualAbort) {
+        Write-Log '-ManualComplete와 -ManualAbort는 동시에 사용할 수 없습니다.' ERROR
+        return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'Mutually exclusive manual complete/abort' }
+    }
+    if ($ManualComplete) {
+        return [pscustomobject]@{ EarlyExit = $true; ExitCode = 0; Reason = 'ManualComplete requested'; Action = 'manualStageTermination'; ActionStage = $Stage; ActionComplete = $true; ActionReason = $Reason }
+    }
+    if ($ManualAbort) {
+        return [pscustomobject]@{ EarlyExit = $true; ExitCode = 0; Reason = 'ManualAbort requested'; Action = 'manualStageTermination'; ActionStage = $Stage; ActionComplete = $false; ActionReason = $Reason }
+    }
 
-if ($Chain -and $Stage) { Write-Log '-Chain and -Stage are mutually exclusive.' ERROR; exit 1 }
-if ($Chain -and $Prompt) { Write-Log '-Prompt is ignored in -Chain mode; using each stage default prompt.' WARN }
-if (-not $Chain -and $Stage -ne 'impl' -and $Model) { Write-Log "-Model is ignored for [$Stage]." WARN }
-if ($script:Model) { Assert-ModelIdentifier -Value $script:Model -Source '-Model' }
-foreach ($configuredStage in $StageConfig.Keys) {
-    if ($StageConfig[$configuredStage].ModelFallback) {
-        foreach ($configuredModel in $StageConfig[$configuredStage].ModelFallback) {
-            Assert-ModelIdentifier -Value $configuredModel -Source "StageConfig.$configuredStage.ModelFallback"
+    if ($Chain -and $Stage) {
+        Write-Log '-Chain and -Stage are mutually exclusive.' ERROR
+        return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'Chain and Stage mutually exclusive' }
+    }
+    if ($Chain -and $Prompt) {
+        Write-Log '-Prompt is ignored in -Chain mode; using each stage default prompt.' WARN
+    }
+    if (-not $Chain -and $Stage -ne 'impl' -and $Model) {
+        Write-Log "-Model is ignored for [$Stage]." WARN
+    }
+    if ($Model) {
+        Assert-ModelIdentifier -Value $Model -Source '-Model'
+    }
+
+    # $StageConfig 불변성 보장을 위한 딥 복제(Clone)
+    $resolvedStageConfig = @{}
+    if ($StageConfig) {
+        foreach ($k in $StageConfig.Keys) {
+            $resolvedStageConfig[$k] = @{}
+            foreach ($subKey in $StageConfig[$k].Keys) {
+                $val = $StageConfig[$k][$subKey]
+                if ($val -is [System.Array]) {
+                    $resolvedStageConfig[$k][$subKey] = @($val)
+                } else {
+                    $resolvedStageConfig[$k][$subKey] = $val
+                }
+            }
         }
     }
-}
-$packetMatches = @(Get-ChildItem -Path (Join-Path $RepoRoot '.agents\briefs\packets') -Filter "$TaskId-*.md" -File -ErrorAction SilentlyContinue)
-$archiveMatches = @(Get-ChildItem -Path (Join-Path $RepoRoot '.agents\briefs\archive') -Filter "$TaskId-*.md" -File -ErrorAction SilentlyContinue)
-if ($packetMatches.Count -eq 0 -and $archiveMatches.Count -eq 0) {
-    Write-Log "작업 패킷을 찾지 못했습니다: $TaskId (저장소별 패킷 경로가 다를 수 있어 경고만 남기고 진행)" WARN
-}
-$checkPipelinePacket = if ($packetMatches.Count -eq 1) { $packetMatches[0].FullName } else { $null }
 
-# CFG041: 패킷 해석 직후·모델 프로필 로드 전에 조건부 기획 챌린지 리뷰 게이트를 검사한다.
-# 이 위치는 -Chain과 -Stage impl 단일 경로를 모두 덮는다. 미해소(requested)·결손·잘못된 Decision은
-# 모델 호출 전에 fail-closed로 차단하고, 레거시·not-required·completed는 그대로 통과시킨다.
-if ($checkPipelinePacket) {
-    try {
-        Assert-PlanningChallengeReviewReady -PacketPath $checkPipelinePacket | Out-Null
-    } catch {
-        Write-Log $_.Exception.Message ERROR
-        exit 1
-    }
-}
-
-. $ProfileModule
-$script:ProfileConfig = Read-ModelProfileConfig -CentralPath $ProfileConfigPath -LocalPath (Join-Path $RepoRoot 'model-profiles.local.json')
-$configuredPlanning = Resolve-RoleProfile -Role planning -Config $script:ProfileConfig
-$planningProfile = $configuredPlanning.Name
-$planningAdapter = $configuredPlanning.Adapter
-$script:RuntimeRoleBinding = [pscustomobject]@{
-    source = 'config'
-    legacy = $false
-    planningProfile = $planningProfile
-    planningAdapter = $planningAdapter
-}
-$packetQaProfile = $null
-$packetQaAdapter = $null
-$packetIntegrationProfile = $null
-$packetIntegrationAdapter = $null
-$packetImplRoute = $null
-$packetRoleContentionAck = $null
-
-if ($checkPipelinePacket) {
-    $runtimeBinding = Get-RuntimeRoleBinding -PacketPath $checkPipelinePacket
-    if ($runtimeBinding.Valid) {
-        $planningProfile = $runtimeBinding.PlanningProfile
-        $planningAdapter = $runtimeBinding.PlanningAdapter
-        $packetQaProfile = $runtimeBinding.QaProfile
-        $packetQaAdapter = $runtimeBinding.QaAdapter
-        $packetIntegrationProfile = $runtimeBinding.IntegrationProfile
-        $packetIntegrationAdapter = $runtimeBinding.IntegrationAdapter
-        $packetImplRoute = $runtimeBinding.ImplementationRoute
-        $packetRoleContentionAck = $runtimeBinding.RoleContentionAck
-
-        $script:RuntimeRoleBinding = [pscustomobject]@{
-            source = 'packet'
-            legacy = $false
-            planningProfile = $planningProfile
-            planningAdapter = $planningAdapter
-            qaProfile = $packetQaProfile
-            qaAdapter = $packetQaAdapter
-            integrationProfile = $packetIntegrationProfile
-            integrationAdapter = $packetIntegrationAdapter
-            implementationRoute = $packetImplRoute
-            roleContentionAck = $packetRoleContentionAck
+    foreach ($configuredStage in $resolvedStageConfig.Keys) {
+        if ($resolvedStageConfig[$configuredStage].ModelFallback) {
+            foreach ($configuredModel in $resolvedStageConfig[$configuredStage].ModelFallback) {
+                Assert-ModelIdentifier -Value $configuredModel -Source "StageConfig.$configuredStage.ModelFallback"
+            }
         }
-    } elseif ($runtimeBinding.Error) {
-        throw $runtimeBinding.Error
-    } else {
-        $script:RuntimeRoleBinding = [pscustomobject]@{
-            source = 'config'
-            legacy = $true
-            planningProfile = $planningProfile
-            planningAdapter = $planningAdapter
+    }
+
+    $packetMatches = @(Get-ChildItem -Path (Join-Path $RepoRoot '.agents\briefs\packets') -Filter "$TaskId-*.md" -File -ErrorAction SilentlyContinue)
+    $archiveMatches = @(Get-ChildItem -Path (Join-Path $RepoRoot '.agents\briefs\archive') -Filter "$TaskId-*.md" -File -ErrorAction SilentlyContinue)
+    if ($packetMatches.Count -eq 0 -and $archiveMatches.Count -eq 0) {
+        Write-Log "작업 패킷을 찾지 못했습니다: $TaskId (저장소별 패킷 경로가 다를 수 있어 경고만 남기고 진행)" WARN
+    }
+    $checkPipelinePacket = if ($packetMatches.Count -eq 1) { $packetMatches[0].FullName } else { $null }
+
+    # CFG041: 조건부 기획 챌린지 리뷰 게이트
+    if ($checkPipelinePacket) {
+        try {
+            Assert-PlanningChallengeReviewReady -PacketPath $checkPipelinePacket | Out-Null
+        } catch {
+            Write-Log $_.Exception.Message ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = "PlanningChallengeReview not ready: $($_.Exception.Message)" }
         }
-        Write-Log 'Runtime Role Binding missing; using configured planning profile for legacy packet.' WARN
     }
-}
-$script:PipelineRouting = Resolve-PipelineRouting -Config $script:ProfileConfig -PlanningProfile $planningProfile -PlanningAdapter $planningAdapter -QaProfile $packetQaProfile -QaAdapter $packetQaAdapter -IntegrationProfile $packetIntegrationProfile -IntegrationAdapter $packetIntegrationAdapter -ImplementationRoute $packetImplRoute
-$StageConfig.impl.ModelFallback = @($script:PipelineRouting.ImplementationModels)
-$StageConfig.impl.ModelFallback = @(Resolve-ForceFreeModelChain -ModelFallback $StageConfig.impl.ModelFallback -ProfileConfig $script:ProfileConfig -ForceFreeModel $ForceFreeModel)
 
-# 구현(②③) 슬롯의 어댑터를 modelCatalog에서 해석한다. 개발1팀 역할이 opencode에 고정되어 있으면
-# 다른 팀이 구현을 대체 수행할 수 없어(지시 6·11) 프로바이더 장애가 곧 파이프라인 정지가 된다.
-# adapter/invokeModel이 없는 기존 슬롯은 종전과 동일하게 opencode + 식별자 그대로 동작한다.
-$implAdapterMap = @{}
-$implModelMap = @{}
-foreach ($implSlot in @($StageConfig.impl.ModelFallback)) {
-    $implMeta = $null
-    if ($script:ProfileConfig.modelCatalog) { $implMeta = $script:ProfileConfig.modelCatalog.$implSlot }
-    $implAdapterMap[$implSlot] = if ($implMeta -and $implMeta.adapter) { [string]$implMeta.adapter } else { 'opencode' }
-    if ($implMeta -and $implMeta.invokeModel) { $implModelMap[$implSlot] = [string]$implMeta.invokeModel }
-}
-$StageConfig.impl.AdapterMap = $implAdapterMap
-$StageConfig.impl.ModelMap = $implModelMap
-$implFirstSlot = @($StageConfig.impl.ModelFallback)[0]
-if ($implFirstSlot -and $implAdapterMap.ContainsKey($implFirstSlot)) { $StageConfig.impl.Adapter = $implAdapterMap[$implFirstSlot] }
-if ($StageConfig.impl.Adapter -eq 'antigravity') { $StageConfig.impl.ProjectId = Resolve-AntigravityProjectId -RepositoryRoot $RepoRoot }
+    if ($ProfileModule -and (Test-Path -LiteralPath $ProfileModule)) {
+        . $ProfileModule
+    }
+    $profileConfig = Read-ModelProfileConfig -CentralPath $ProfileConfigPath -LocalPath (Join-Path $RepoRoot 'model-profiles.local.json')
+    $configuredPlanning = Resolve-RoleProfile -Role planning -Config $profileConfig
+    $planningProfile = $configuredPlanning.Name
+    $planningAdapter = $configuredPlanning.Adapter
+    $runtimeRoleBinding = [pscustomobject]@{
+        source = 'config'
+        legacy = $false
+        planningProfile = $planningProfile
+        planningAdapter = $planningAdapter
+    }
+    $packetQaProfile = $null
+    $packetQaAdapter = $null
+    $packetIntegrationProfile = $null
+    $packetIntegrationAdapter = $null
+    $packetImplRoute = $null
+    $packetRoleContentionAck = $null
 
-# CFG024 §Done When 4: QA·Integration에 실제로 동작하는 폴백 체인을 배선한다.
-# ModelChain/AdapterChain이 Resolve-ModelChain에서 소비되며, Dispatch-Stage 루프가 슬롯마다
-# AdapterChain을 따라 $config.Adapter를 갱신한다(위 Dispatch-Stage 본문 참조).
-$implFamilies = @($script:PipelineRouting.ImplementationModels | ForEach-Object {
-    if ($script:ProfileConfig.modelCatalog.$_) { [string]$script:ProfileConfig.modelCatalog.$_.family }
-} | Where-Object { $_ -and $_ -ne 'unknown' } | Select-Object -Unique)
+    if ($checkPipelinePacket) {
+        $runtimeBinding = Get-RuntimeRoleBinding -PacketPath $checkPipelinePacket
+        if ($runtimeBinding.Valid) {
+            $planningProfile = $runtimeBinding.PlanningProfile
+            $planningAdapter = $runtimeBinding.PlanningAdapter
+            $packetQaProfile = $runtimeBinding.QaProfile
+            $packetQaAdapter = $runtimeBinding.QaAdapter
+            $packetIntegrationProfile = $runtimeBinding.IntegrationProfile
+            $packetIntegrationAdapter = $runtimeBinding.IntegrationAdapter
+            $packetImplRoute = $runtimeBinding.ImplementationRoute
+            $packetRoleContentionAck = $runtimeBinding.RoleContentionAck
 
-$qaChainNames = Resolve-ProfileChain -ProfileName $script:PipelineRouting.QaProfile.Name -Config $script:ProfileConfig
-# QA 폴백 후보도 must 불변조건(구현자와 family 겹치면 안 됨)을 통과해야 한다 — 겹치는 후보는 건너뛴다.
-$qaSlots = Resolve-StageProfileSlots -ProfileNames $qaChainNames -Config $script:ProfileConfig -ImplementerFamilies $implFamilies -Stage 'qa'
-if ($qaSlots.Count -eq 0) {
-    $StageConfig.qa.ModelChain = @()
-    Write-Log "❌ [qa] 구현자와 family가 겹치지 않는 QA 후보가 없음 — 사람 개입 필요 (구현 family: $($implFamilies -join ', '))" ERROR
-} else {
-    $StageConfig.qa.ModelChain = @($qaSlots | ForEach-Object { $_.Model })
-    $StageConfig.qa.AdapterChain = @($qaSlots | ForEach-Object { $_.Adapter })
-    $StageConfig.qa.Adapter = $qaSlots[0].Adapter
-    $StageConfig.qa.Model = $qaSlots[0].Model
-}
-if ($StageConfig.qa.Adapter -eq 'antigravity') { $StageConfig.qa.ProjectId = Resolve-AntigravityProjectId -RepositoryRoot $RepoRoot }
+            $runtimeRoleBinding = [pscustomobject]@{
+                source = 'packet'
+                legacy = $false
+                planningProfile = $planningProfile
+                planningAdapter = $planningAdapter
+                qaProfile = $packetQaProfile
+                qaAdapter = $packetQaAdapter
+                integrationProfile = $packetIntegrationProfile
+                integrationAdapter = $packetIntegrationAdapter
+                implementationRoute = $packetImplRoute
+                roleContentionAck = $packetRoleContentionAck
+            }
+        } elseif ($runtimeBinding.Error) {
+            throw $runtimeBinding.Error
+        } else {
+            $runtimeRoleBinding = [pscustomobject]@{
+                source = 'config'
+                legacy = $true
+                planningProfile = $planningProfile
+                planningAdapter = $planningAdapter
+            }
+            Write-Log 'Runtime Role Binding missing; using configured planning profile for legacy packet.' WARN
+        }
+    }
 
-$integrationChainNames = Resolve-ProfileChain -ProfileName $script:PipelineRouting.IntegrationProfile.Name -Config $script:ProfileConfig
-$integrationSlots = Resolve-StageProfileSlots -ProfileNames $integrationChainNames -Config $script:ProfileConfig -Stage 'integration'
-if ($integrationSlots.Count -eq 0) {
-    $StageConfig.integration.ModelChain = @()
-    Write-Log "❌ [integration] Integration 후보를 하나도 해석하지 못함 — 사람 개입 필요" ERROR
-} else {
-    $StageConfig.integration.ModelChain = @($integrationSlots | ForEach-Object { $_.Model })
-    $StageConfig.integration.AdapterChain = @($integrationSlots | ForEach-Object { $_.Adapter })
-    $StageConfig.integration.Adapter = $integrationSlots[0].Adapter
-    $StageConfig.integration.Model = $integrationSlots[0].Model
-}
-$StageConfig.integration.ReportFile = "$TaskLogPrefix-integration-last.md"
-# 상태 저장소는 반드시 `~/.agents/harness` **밖**에 둔다. 그 폴더는 sync-configs.ps1이
-# robocopy /MIR로 미러링하는 배포 대상이라, 저장소에 없는 하위 폴더는 Push 한 번에 purge된다.
-# 종전 경로(`.agents\harness\state`)는 그 안에 있었고, 다음 Push에서 provider health cooldown이
-# 통째로 삭제될 상태였다(2026-08-30 발견 · 이관). 여기를 다시 harness 아래로 옮기지 말 것 —
-# scripts/verify.ps1의 회귀 검사가 막는다.
-$stateRoot = if ($env:USERPROFILE) { Join-Path $env:USERPROFILE '.agents\harness-state' } else { Join-Path ([IO.Path]::GetTempPath()) 'agents-harness-state' }
-$script:ProviderHealthPath = Join-Path $stateRoot 'provider-health.json'
-# CFG048 Done When 7: 팀 경합 탐지 및 보고 (②구현·④QA·⑤Integration 간 principal 충돌 검사)
-$implPrincipal = if ($implFirstSlot -and $script:ProfileConfig.modelCatalog -and $script:ProfileConfig.modelCatalog.$implFirstSlot) {
-    if ($script:ProfileConfig.modelCatalog.$implFirstSlot.principal) { [string]$script:ProfileConfig.modelCatalog.$implFirstSlot.principal } else { [string]$StageConfig.impl.Adapter }
-} else { [string]$StageConfig.impl.Adapter }
+    $pipelineRouting = Resolve-PipelineRouting -Config $profileConfig -PlanningProfile $planningProfile -PlanningAdapter $planningAdapter -QaProfile $packetQaProfile -QaAdapter $packetQaAdapter -IntegrationProfile $packetIntegrationProfile -IntegrationAdapter $packetIntegrationAdapter -ImplementationRoute $packetImplRoute
+    $resolvedStageConfig.impl.ModelFallback = @($pipelineRouting.ImplementationModels)
+    $resolvedStageConfig.impl.ModelFallback = @(Resolve-ForceFreeModelChain -ModelFallback $resolvedStageConfig.impl.ModelFallback -ProfileConfig $profileConfig -ForceFreeModel $ForceFreeModel)
 
-$qaPrincipal = if ($script:PipelineRouting.QaProfile) {
-    $qaModel = $script:PipelineRouting.QaProfile.Model
-    if ($script:ProfileConfig.modelCatalog -and $script:ProfileConfig.modelCatalog.$qaModel -and $script:ProfileConfig.modelCatalog.$qaModel.principal) {
-        [string]$script:ProfileConfig.modelCatalog.$qaModel.principal
+    $implAdapterMap = @{}
+    $implModelMap = @{}
+    foreach ($implSlot in @($resolvedStageConfig.impl.ModelFallback)) {
+        $implMeta = $null
+        if ($profileConfig.modelCatalog) { $implMeta = $profileConfig.modelCatalog.$implSlot }
+        $implAdapterMap[$implSlot] = if ($implMeta -and $implMeta.adapter) { [string]$implMeta.adapter } else { 'opencode' }
+        if ($implMeta -and $implMeta.invokeModel) { $implModelMap[$implSlot] = [string]$implMeta.invokeModel }
+    }
+    $resolvedStageConfig.impl.AdapterMap = $implAdapterMap
+    $resolvedStageConfig.impl.ModelMap = $implModelMap
+    $implFirstSlot = @($resolvedStageConfig.impl.ModelFallback)[0]
+    if ($implFirstSlot -and $implAdapterMap.ContainsKey($implFirstSlot)) { $resolvedStageConfig.impl.Adapter = $implAdapterMap[$implFirstSlot] }
+    if ($resolvedStageConfig.impl.Adapter -eq 'antigravity') { $resolvedStageConfig.impl.ProjectId = Resolve-AntigravityProjectId -RepositoryRoot $RepoRoot }
+
+    $implFamilies = @($pipelineRouting.ImplementationModels | ForEach-Object {
+        if ($profileConfig.modelCatalog.$_) { [string]$profileConfig.modelCatalog.$_.family }
+    } | Where-Object { $_ -and $_ -ne 'unknown' } | Select-Object -Unique)
+
+    $qaChainNames = Resolve-ProfileChain -ProfileName $pipelineRouting.QaProfile.Name -Config $profileConfig
+    $qaSlots = Resolve-StageProfileSlots -ProfileNames $qaChainNames -Config $profileConfig -ImplementerFamilies $implFamilies -Stage 'qa'
+    if ($qaSlots.Count -eq 0) {
+        $resolvedStageConfig.qa.ModelChain = @()
+        Write-Log "❌ [qa] 구현자와 family가 겹치지 않는 QA 후보가 없음 — 사람 개입 필요 (구현 family: $($implFamilies -join ', '))" ERROR
     } else {
-        [string]$script:PipelineRouting.QaProfile.Adapter
+        $resolvedStageConfig.qa.ModelChain = @($qaSlots | ForEach-Object { $_.Model })
+        $resolvedStageConfig.qa.AdapterChain = @($qaSlots | ForEach-Object { $_.Adapter })
+        $resolvedStageConfig.qa.Adapter = $qaSlots[0].Adapter
+        $resolvedStageConfig.qa.Model = $qaSlots[0].Model
     }
-} else { $null }
+    if ($resolvedStageConfig.qa.Adapter -eq 'antigravity') { $resolvedStageConfig.qa.ProjectId = Resolve-AntigravityProjectId -RepositoryRoot $RepoRoot }
 
-$integrationPrincipal = if ($script:PipelineRouting.IntegrationProfile) {
-    $intModel = $script:PipelineRouting.IntegrationProfile.Model
-    if ($script:ProfileConfig.modelCatalog -and $script:ProfileConfig.modelCatalog.$intModel -and $script:ProfileConfig.modelCatalog.$intModel.principal) {
-        [string]$script:ProfileConfig.modelCatalog.$intModel.principal
+    $integrationChainNames = Resolve-ProfileChain -ProfileName $pipelineRouting.IntegrationProfile.Name -Config $profileConfig
+    $integrationSlots = Resolve-StageProfileSlots -ProfileNames $integrationChainNames -Config $profileConfig -Stage 'integration'
+    if ($integrationSlots.Count -eq 0) {
+        $resolvedStageConfig.integration.ModelChain = @()
+        Write-Log "❌ [integration] Integration 후보를 하나도 해석하지 못함 — 사람 개입 필요" ERROR
     } else {
-        [string]$script:PipelineRouting.IntegrationProfile.Adapter
+        $resolvedStageConfig.integration.ModelChain = @($integrationSlots | ForEach-Object { $_.Model })
+        $resolvedStageConfig.integration.AdapterChain = @($integrationSlots | ForEach-Object { $_.Adapter })
+        $resolvedStageConfig.integration.Adapter = $integrationSlots[0].Adapter
+        $resolvedStageConfig.integration.Model = $integrationSlots[0].Model
     }
-} else { $null }
+    $resolvedStageConfig.integration.ReportFile = "$TaskLogPrefix-integration-last.md"
 
-$contentionCheck = Test-PipelineRoleContention -ImplPrincipal $implPrincipal -QaPrincipal $qaPrincipal -IntegrationPrincipal $integrationPrincipal
-if ($contentionCheck.Contention) {
-    if ([string]::IsNullOrWhiteSpace($packetRoleContentionAck)) {
-        Write-Log "⛔ [role-contention] 파이프라인 단계 간 principal 경합 감지: $($contentionCheck.Details)" ERROR
-        Write-Log "동일 principal(계정/어댑터)이 복수 단계를 수행하면 쿼터 경합 또는 독립성 훼손이 발생할 수 있습니다. 패킷에 '- Role Contention Ack: <사유>'를 명시하거나 역할을 분리하세요." ERROR
-        exit 1
-    } else {
-        Write-Log "⚠️ [role-contention] 파이프라인 단계 간 principal 경합 ($($contentionCheck.Details)) — Role Contention Ack 확인됨: $packetRoleContentionAck" WARN
+    $stateRoot = if ($env:USERPROFILE) { Join-Path $env:USERPROFILE '.agents\harness-state' } else { Join-Path ([IO.Path]::GetTempPath()) 'agents-harness-state' }
+    $providerHealthPath = Join-Path $stateRoot 'provider-health.json'
+
+    $implPrincipal = if ($implFirstSlot -and $profileConfig.modelCatalog -and $profileConfig.modelCatalog.$implFirstSlot) {
+        if ($profileConfig.modelCatalog.$implFirstSlot.principal) { [string]$profileConfig.modelCatalog.$implFirstSlot.principal } else { [string]$resolvedStageConfig.impl.Adapter }
+    } else { [string]$resolvedStageConfig.impl.Adapter }
+
+    $qaPrincipal = if ($pipelineRouting.QaProfile) {
+        $qaModel = $pipelineRouting.QaProfile.Model
+        if ($profileConfig.modelCatalog -and $profileConfig.modelCatalog.$qaModel -and $profileConfig.modelCatalog.$qaModel.principal) {
+            [string]$profileConfig.modelCatalog.$qaModel.principal
+        } else {
+            [string]$pipelineRouting.QaProfile.Adapter
+        }
+    } else { $null }
+
+    $integrationPrincipal = if ($pipelineRouting.IntegrationProfile) {
+        $intModel = $pipelineRouting.IntegrationProfile.Model
+        if ($profileConfig.modelCatalog -and $profileConfig.modelCatalog.$intModel -and $profileConfig.modelCatalog.$intModel.principal) {
+            [string]$profileConfig.modelCatalog.$intModel.principal
+        } else {
+            [string]$pipelineRouting.IntegrationProfile.Adapter
+        }
+    } else { $null }
+
+    $contentionCheck = Test-PipelineRoleContention -ImplPrincipal $implPrincipal -QaPrincipal $qaPrincipal -IntegrationPrincipal $integrationPrincipal
+    if ($contentionCheck.Contention) {
+        if ([string]::IsNullOrWhiteSpace($packetRoleContentionAck)) {
+            Write-Log "⛔ [role-contention] 파이프라인 단계 간 principal 경합 감지: $($contentionCheck.Details)" ERROR
+            Write-Log "동일 principal(계정/어댑터)이 복수 단계를 수행하면 쿼터 경합 또는 독립성 훼손이 발생할 수 있습니다. 패킷에 '- Role Contention Ack: <사유>'를 명시하거나 역할을 분리하세요." ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = "Role contention detected without Ack: $($contentionCheck.Details)" }
+        } else {
+            Write-Log "⚠️ [role-contention] 파이프라인 단계 간 principal 경합 ($($contentionCheck.Details)) — Role Contention Ack 확인됨: $packetRoleContentionAck" WARN
+        }
+    }
+
+    Write-Log "planner=$planningProfile/$planningAdapter impl-route=$($pipelineRouting.ImplementationRoute) impl=$implFirstSlot(adapter=$($resolvedStageConfig.impl.Adapter)) qa=$($resolvedStageConfig.qa.Adapter)/$($resolvedStageConfig.qa.Model) project=$($resolvedStageConfig.qa.ProjectId) integration=$($resolvedStageConfig.integration.Adapter)/$($resolvedStageConfig.integration.Model)" INFO
+
+    return [pscustomobject]@{
+        EarlyExit = $false
+        ExitCode = 0
+        Reason = $null
+        TaskId = $TaskId
+        Stage = $Stage
+        Prompt = $Prompt
+        Model = $Model
+        Chain = [bool]$Chain
+        DryRun = [bool]$DryRun
+        SkipVerdictGate = [bool]$SkipVerdictGate
+        CheckPipelinePacket = $checkPipelinePacket
+        ProfileConfig = $profileConfig
+        RuntimeRoleBinding = $runtimeRoleBinding
+        PipelineRouting = $pipelineRouting
+        ResolvedStageConfig = $resolvedStageConfig
+        ProviderHealthPath = $providerHealthPath
+        PlanningProfile = $planningProfile
+        PlanningAdapter = $planningAdapter
+        ImplFirstSlot = $implFirstSlot
     }
 }
 
-Write-Log "planner=$planningProfile/$planningAdapter impl-route=$($script:PipelineRouting.ImplementationRoute) impl=$implFirstSlot(adapter=$($StageConfig.impl.Adapter)) qa=$($StageConfig.qa.Adapter)/$($StageConfig.qa.Model) project=$($StageConfig.qa.ProjectId) integration=$($StageConfig.integration.Adapter)/$($StageConfig.integration.Model)" INFO
+function Invoke-DispatchChain {
+    param(
+        [Parameter(Mandatory=$true)][pscustomobject]$Plan
+    )
 
-trap {
-    Invoke-DispatcherCleanup
-    break
-}
+    # 계획 단계가 표현한 상태 변경은 여기서만 실행한다. 계획 자체는 파일·프로세스 상태를 바꾸지 않는다.
+    if ($Plan.EarlyExit) {
+        if ($Plan.Action -eq 'resetStageLedger') {
+            Reset-StageLedger -Stage $Plan.ActionStage -Reason $Plan.ActionReason
+            return 0
+        }
+        if ($Plan.Action -eq 'manualStageTermination') {
+            return (Invoke-ManualStageTermination -Stage $Plan.ActionStage -Complete:$Plan.ActionComplete -ReasonText $Plan.ActionReason)
+        }
+        return [int]$Plan.ExitCode
+    }
 
-try {
-    # Console.CancelKeyPress is raised on a native console thread. A PowerShell
-    # scriptblock delegate attached with add_CancelKeyPress has no runspace on
-    # that thread and silently fails to invoke cleanup. Register-ObjectEvent
-    # marshals the callback onto PowerShell's event queue/runspace.
-    $null = Register-ObjectEvent -InputObject ([Console]) -EventName CancelKeyPress -Action {
-        $event.SourceEventArgs.Cancel = $true
+    trap {
         Invoke-DispatcherCleanup
+        break
     }
-    $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { Invoke-DispatcherCleanup }
-} catch {
-    Write-Log "⚠️ 종료 이벤트 등록 실패: $($_.Exception.Message)" WARN
-}
 
-# 저장소 루트 검증 — $RepoRoot는 "이 스크립트가 <프로젝트>/scripts/ 에 있다"는 전제로 계산된다.
-# 중앙 저장소(ai-agents-config/global/harness/)에서 직접 실행하면 $RepoRoot가 조용히 `global`이 되어
-# 패킷도 없는 디렉터리에서 모델이 한 판 다 돌고 쓸모없는 로그만 남는다
-# (2026-08-04 실측: AC006 impl이 global/.agents/briefs/logs/ 에 기록, handoff-log.md 0 matches).
-# verify 게이트는 어차피 단계 종료 후 호출되므로(Dispatch-Stage), 없으면 여기서 먼저 끊는 게 맞다.
-$verifyGate = Join-Path $RepoRoot "scripts\verify.ps1"
-if (-not (Test-Path $verifyGate)) {
-    Write-Log "저장소 루트로 판정된 경로에 scripts\verify.ps1 이 없습니다: $RepoRoot" ERROR
-    Write-Log "각 프로젝트의 scripts\ 에 배포된 사본으로 실행하세요 — 중앙 저장소 harness\ 에서 직접 실행하면 루트가 어긋납니다." ERROR
-    exit 1
-}
-
-$script:BashExe = Resolve-BashExe
-if (-not $DryRun -and -not $script:BashExe) {
-    Write-Log "bash를 찾을 수 없습니다 — Git Bash 설치/PATH를 확인하세요." ERROR
-    exit 1
-}
-
-if ($Chain) {
-    Write-Log "📋 자동 연쇄 모드 시작 (TaskId: $TaskId): 패킷 첫 미완료 단계부터 수렴" INFO
-    # CFG043: 안전 재개 가드 — 살아 있는 lease·락이 있으면 자동 연쇄/재개가 그것을 건드리지 않고
-    # 중단한다(Done When 3). 완료 재개는 종결된 이전 단계 뒤 첫 미완료 단계부터라야 하므로,
-    # 만료(stale) lease는 가드하지 않는다 — 그것이 재개 대상이다.
-    $liveActivity = Test-LiveStageActivity
-    if ($liveActivity) {
-        Write-Log "⛔ 자동 연쇄/재개 중단 — 살아 있는 단계 실행이 있어 재개하지 않습니다: $liveActivity" ERROR
-        Write-Log '살아 있는 lease·락·승인 대기를 보존한 채 종료합니다. 실행이 끝난 뒤 다시 재개하세요.' ERROR
-        $holdingPipeline = Get-PacketPipelineStatus -PacketPath $checkPipelinePacket
-        Write-ChainSummary -State 'blocked' -Stages @() -Warnings @("살아 있는 실행으로 인한 재개 보류 — $liveActivity") -StartedAt (Get-Date) -PipelineBefore $holdingPipeline -PipelineAfter $holdingPipeline -TreeBefore (Get-TreeState) -TreeAfter (Get-TreeState) -QaVerdict @{ verdict = $null; fresh = $false } | Out-Null
-        exit 1
-    }
-    $chainStartedAt = Get-Date
-    $chainPipelineBefore = Get-PacketPipelineStatus -PacketPath $checkPipelinePacket
-    Set-CompletedStageApprovalsSuperseded -PipelineStatus $chainPipelineBefore -Evidence $checkPipelinePacket | Out-Null
-    $chainTreeBefore = Get-TreeState
-    $gateTier = Get-PacketGateTier -PacketPath $checkPipelinePacket
-    $chainQaVerdict = @{ verdict = if ($gateTier -eq 'light') { 'skipped_light_tier' } else { $null }; fresh = $false }
-    $chainStages = @()
-    $effectiveStage = Get-EffectivePipelineStage -PipelineStatus $chainPipelineBefore
-    $allStages = @('impl','qa','integration')
-    $effectiveIndex = [array]::IndexOf($allStages, $effectiveStage)
-    if ($effectiveIndex -lt 0) {
-        Write-ChainSummary -State 'completed' -Stages @() -Warnings @('packet has no incomplete executable stage') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter $chainPipelineBefore -TreeBefore $chainTreeBefore -TreeAfter $chainTreeBefore -QaVerdict $chainQaVerdict | Out-Null
-        Write-Log '✅ 패킷에 미완료 실행 단계가 없습니다 — 재디스패치 없이 종료' SUCCESS
-        exit 0
-    }
-    $stagesToRun = @($allStages[$effectiveIndex..($allStages.Count - 1)])
-    Write-Log "유효 시작 단계: $effectiveStage (완료 단계 재디스패치 금지)" INFO
-    foreach ($stage in $stagesToRun) {
-        if ($stage -eq 'integration' -and -not $DryRun -and $gateTier -eq 'light') {
-            Write-Log 'ℹ️ 경량 게이트 등급(패킷 선언) — QA verdict 게이트 생략, ⑤ 그대로 진행' INFO
-        } elseif ($stage -eq 'integration' -and -not $DryRun -and -not (Test-QaVerdict -QaDispatchedAt $null)) {
-            Write-FailureMarker -Stage 'integration' -Reason 'QA verdict 미통과 — ⑤ 진행 중단'
-            Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @('QA verdict 미통과 — ⑤ 진행 중단') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
-            exit 1
+    try {
+        $null = Register-ObjectEvent -InputObject ([Console]) -EventName CancelKeyPress -Action {
+            $event.SourceEventArgs.Cancel = $true
+            Invoke-DispatcherCleanup
         }
-        # CFG042 QA pass→Integration 자동 연쇄 경계: 여기까지 도달하면 verdict 게이트(경량 등급 또는
-        # fresh pass)를 통과했다는 뜻이므로 ⑤ Integration을 자동 기동한다. 완료 정리(⑤ 체크·router DONE·
-        # 아카이브 이동·완료 커밋)는 Dispatch-Stage 안에서 Integration 검증 게이트를 통과한 뒤에만 허용된다.
-        if ($stage -eq 'integration' -and -not $DryRun) {
-            Write-Log '📌 [integration] QA verdict pass — 자동 연쇄 진행. 완료 정리는 검증 통과 후에만 허용' INFO
+        $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { Invoke-DispatcherCleanup }
+    } catch {
+        Write-Log "⚠️ 종료 이벤트 등록 실패: $($_.Exception.Message)" WARN
+    }
+
+    $verifyGate = Join-Path $RepoRoot "scripts\verify.ps1"
+    if (-not (Test-Path $verifyGate)) {
+        Write-Log "저장소 루트로 판정된 경로에 scripts\verify.ps1 이 없습니다: $RepoRoot" ERROR
+        Write-Log "각 프로젝트의 scripts\ 에 배포된 사본으로 실행하세요 — 중앙 저장소 harness\ 에서 직접 실행하면 루트가 어긋납니다." ERROR
+        return 1
+    }
+
+    $script:BashExe = Resolve-BashExe
+    if (-not $Plan.DryRun -and -not $script:BashExe) {
+        Write-Log "bash를 찾을 수 없습니다 — Git Bash 설치/PATH를 확인하세요." ERROR
+        return 1
+    }
+
+    $checkPipelinePacket = $Plan.CheckPipelinePacket
+    $DryRun = $Plan.DryRun
+
+    if ($Plan.Chain) {
+        Write-Log "📋 자동 연쇄 모드 시작 (TaskId: $($Plan.TaskId)): 패킷 첫 미완료 단계부터 수렴" INFO
+        $liveActivity = Test-LiveStageActivity
+        if ($liveActivity) {
+            Write-Log "⛔ 자동 연쇄/재개 중단 — 살아 있는 단계 실행이 있어 재개하지 않습니다: $liveActivity" ERROR
+            Write-Log '살아 있는 lease·락·승인 대기를 보존한 채 종료합니다. 실행이 끝난 뒤 다시 재개하세요.' ERROR
+            $holdingPipeline = Get-PacketPipelineStatus -PacketPath $checkPipelinePacket
+            Write-ChainSummary -State 'blocked' -Stages @() -Warnings @("살아 있는 실행으로 인한 재개 보류 — $liveActivity") -StartedAt (Get-Date) -PipelineBefore $holdingPipeline -PipelineAfter $holdingPipeline -TreeBefore (Get-TreeState) -TreeAfter (Get-TreeState) -QaVerdict @{ verdict = $null; fresh = $false } | Out-Null
+            return 1
         }
-        $result = Invoke-StageWithLock -Stage $stage -PromptOverride '' -CheckPipelineBefore ($stage -eq 'impl') -CheckPipelinePacket $checkPipelinePacket
-        $chainStages += [ordered]@{ stage = $stage; success = [bool]$result.Success; failureReason = $result.FailureReason; verifyPassed = [bool]$result.Success; logPath = $StageConfig[$stage].LogFile }
-        if (-not $result.Success) {
-            # CFG017: 승인 대기는 'failed'가 아니라 'approval_required'로 연쇄를 중단한다 — 오케스트레이터가
-            # 이 상태를 보고 재시도하지 않고 judgment_required로 멈춘다.
-            $chainState = if ($result.Outcome -eq 'approval_required') { 'approval_required' } else { 'failed' }
-            $chainWarnings = if ($result.Outcome -eq 'approval_required') { @("승인 대기 — 기록: $($result.ApprovalPath)") } else { @($result.FailureReason) }
-            if ($stage -eq 'qa') {
+        $chainStartedAt = Get-Date
+        $chainPipelineBefore = Get-PacketPipelineStatus -PacketPath $checkPipelinePacket
+        Set-CompletedStageApprovalsSuperseded -PipelineStatus $chainPipelineBefore -Evidence $checkPipelinePacket | Out-Null
+        $chainTreeBefore = Get-TreeState
+        $gateTier = Get-PacketGateTier -PacketPath $checkPipelinePacket
+        $chainQaVerdict = @{ verdict = if ($gateTier -eq 'light') { 'skipped_light_tier' } else { $null }; fresh = $false }
+        $chainStages = @()
+        $effectiveStage = Get-EffectivePipelineStage -PipelineStatus $chainPipelineBefore
+        $allStages = @('impl','qa','integration')
+        $effectiveIndex = [array]::IndexOf($allStages, $effectiveStage)
+        if ($effectiveIndex -lt 0) {
+            Write-ChainSummary -State 'completed' -Stages @() -Warnings @('packet has no incomplete executable stage') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter $chainPipelineBefore -TreeBefore $chainTreeBefore -TreeAfter $chainTreeBefore -QaVerdict $chainQaVerdict | Out-Null
+            Write-Log '✅ 패킷에 미완료 실행 단계가 없습니다 — 재디스패치 없이 종료' SUCCESS
+            return 0
+        }
+        $stagesToRun = @($allStages[$effectiveIndex..($allStages.Count - 1)])
+        Write-Log "유효 시작 단계: $effectiveStage (완료 단계 재디스패치 금지)" INFO
+        foreach ($stage in $stagesToRun) {
+            if ($stage -eq 'integration' -and -not $DryRun -and $gateTier -eq 'light') {
+                Write-Log 'ℹ️ 경량 게이트 등급(패킷 선언) — QA verdict 게이트 생략, ⑤ 그대로 진행' INFO
+            } elseif ($stage -eq 'integration' -and -not $DryRun -and -not (Test-QaVerdict -QaDispatchedAt $null)) {
+                Write-FailureMarker -Stage 'integration' -Reason 'QA verdict 미통과 — ⑤ 진행 중단'
+                Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @('QA verdict 미통과 — ⑤ 진행 중단') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
+                return 1
+            }
+            if ($stage -eq 'integration' -and -not $DryRun) {
+                Write-Log '📌 [integration] QA verdict pass — 자동 연쇄 진행. 완료 정리는 검증 통과 후에만 허용' INFO
+            }
+            $result = Invoke-StageWithLock -Stage $stage -PromptOverride '' -CheckPipelineBefore ($stage -eq 'impl') -CheckPipelinePacket $checkPipelinePacket
+            $chainStages += [ordered]@{ stage = $stage; success = [bool]$result.Success; failureReason = $result.FailureReason; verifyPassed = [bool]$result.Success; logPath = $StageConfig[$stage].LogFile }
+            if (-not $result.Success) {
+                $chainState = if ($result.Outcome -eq 'approval_required') { 'approval_required' } else { 'failed' }
+                $chainWarnings = if ($result.Outcome -eq 'approval_required') { @("승인 대기 — 기록: $($result.ApprovalPath)") } else { @($result.FailureReason) }
+                if ($stage -eq 'qa') {
+                    try {
+                        $vfPath = Resolve-RepoPath ($StageConfig['qa'].VerdictFile)
+                        if (Test-Path -LiteralPath $vfPath) {
+                            $vfJson = Get-Content -LiteralPath $vfPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                            $chainQaVerdict = @{ verdict = [string]$vfJson.verdict; reason = [string]$vfJson.reason; fresh = $true; synthetic = [bool]$vfJson.synthetic }
+                        }
+                    } catch { }
+                }
+                Write-ChainSummary -State $chainState -Stages $chainStages -Warnings $chainWarnings -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
+                Write-Log "❌ [$stage] 파이프라인 중단 (상태: $chainState, 로그: $($StageConfig[$stage].LogFile))" ERROR
+                return 1
+            }
+            if ($stage -eq 'qa' -and -not $DryRun -and -not (Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt)) {
+                $actualQaVerdict = $null
                 try {
                     $vfPath = Resolve-RepoPath ($StageConfig['qa'].VerdictFile)
                     if (Test-Path -LiteralPath $vfPath) {
                         $vfJson = Get-Content -LiteralPath $vfPath -Raw -Encoding UTF8 | ConvertFrom-Json
-                        $chainQaVerdict = @{ verdict = [string]$vfJson.verdict; reason = [string]$vfJson.reason; fresh = $true; synthetic = [bool]$vfJson.synthetic }
+                        $actualQaVerdict = @{ verdict = [string]$vfJson.verdict; reason = [string]$vfJson.reason; fresh = $true; synthetic = [bool]$vfJson.synthetic }
                     }
                 } catch { }
+                if ($actualQaVerdict) { $chainQaVerdict = $actualQaVerdict }
+                Write-FailureMarker -Stage 'qa' -Reason 'QA verdict 미통과 — ⑤ 진행 중단'
+                Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @('QA verdict 미통과 — ⑤ 진행 중단') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
+                return 1
             }
-            Write-ChainSummary -State $chainState -Stages $chainStages -Warnings $chainWarnings -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
-            Write-Log "❌ [$stage] 파이프라인 중단 (상태: $chainState, 로그: $($StageConfig[$stage].LogFile))" ERROR
-            exit 1
+            if ($stage -eq 'qa') {
+                $actualQaVerdict = $null
+                try {
+                    $vfPath = Resolve-RepoPath ($StageConfig['qa'].VerdictFile)
+                    if (Test-Path -LiteralPath $vfPath) {
+                        $vfJson = Get-Content -LiteralPath $vfPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                        $actualQaVerdict = @{ verdict = [string]$vfJson.verdict; fresh = $true; synthetic = [bool]$vfJson.synthetic }
+                    }
+                } catch { }
+                $chainQaVerdict = if ($actualQaVerdict) { $actualQaVerdict } else { @{ verdict = 'pass'; fresh = $true } }
+            }
+            if ($stage -eq 'qa' -and -not $DryRun -and $result.CycleId) { Resolve-ApprovalRecords -Stage 'qa' -ResolvingCycle $result.CycleId }
+            Start-Sleep -Seconds 2
         }
-        # QA 자체는 성공했어도 verdict가 ⑤를 막으면 파이프라인은 거기서 멈춘다 —
-        # 사용자 눈에는 이것도 "중단"이므로 마커를 남긴다.
-        if ($stage -eq 'qa' -and -not $DryRun -and -not (Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt)) {
-            $actualQaVerdict = $null
-            try {
-                $vfPath = Resolve-RepoPath ($StageConfig['qa'].VerdictFile)
-                if (Test-Path -LiteralPath $vfPath) {
-                    $vfJson = Get-Content -LiteralPath $vfPath -Raw -Encoding UTF8 | ConvertFrom-Json
-                    $actualQaVerdict = @{ verdict = [string]$vfJson.verdict; reason = [string]$vfJson.reason; fresh = $true; synthetic = [bool]$vfJson.synthetic }
-                }
-            } catch { }
-            if ($actualQaVerdict) { $chainQaVerdict = $actualQaVerdict }
-            Write-FailureMarker -Stage 'qa' -Reason 'QA verdict 미통과 — ⑤ 진행 중단'
-            Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @('QA verdict 미통과 — ⑤ 진행 중단') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
-            exit 1
+        Write-ChainSummary -State 'completed' -Stages $chainStages -Warnings @() -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
+        Write-Log "🎉 파이프라인 완료 — impl/qa/integration 로그는 $LogDir 참조" SUCCESS
+        return 0
+    } else {
+        $singleStage = $Plan.Stage
+        if (-not $singleStage) { Write-Log "오류: -Stage 또는 -Chain 옵션이 필요합니다." ERROR; return 1 }
+        $standalonePipeline = Get-PacketPipelineStatus -PacketPath $checkPipelinePacket
+        Set-CompletedStageApprovalsSuperseded -PipelineStatus $standalonePipeline -Evidence $checkPipelinePacket | Out-Null
+        $effectiveStage = Get-EffectivePipelineStage -PipelineStatus $standalonePipeline
+        if ($effectiveStage -and $effectiveStage -ne $singleStage) {
+            $requestedIndexes = Get-StagePipelineIndexes -Stage $singleStage
+            $requestedItems = @($standalonePipeline.Items | Where-Object { $requestedIndexes -contains $_.Index })
+            if ($requestedItems.Count -gt 0 -and @($requestedItems | Where-Object { -not $_.Checked }).Count -eq 0) {
+                Write-Log "✅ [$singleStage] 이미 완료됨 — 재디스패치하지 않고 첫 미완료 단계 [$effectiveStage]로 수렴" SUCCESS
+                $singleStage = $effectiveStage
+            }
         }
-        if ($stage -eq 'qa') {
-            $actualQaVerdict = $null
-            try {
-                $vfPath = Resolve-RepoPath ($StageConfig['qa'].VerdictFile)
-                if (Test-Path -LiteralPath $vfPath) {
-                    $vfJson = Get-Content -LiteralPath $vfPath -Raw -Encoding UTF8 | ConvertFrom-Json
-                    $actualQaVerdict = @{ verdict = [string]$vfJson.verdict; fresh = $true; synthetic = [bool]$vfJson.synthetic }
-                }
-            } catch { }
-            $chainQaVerdict = if ($actualQaVerdict) { $actualQaVerdict } else { @{ verdict = 'pass'; fresh = $true } }
+        if ($singleStage -eq 'integration' -and -not $DryRun) {
+            if ($Plan.SkipVerdictGate) {
+                Write-Log 'WARNING: -SkipVerdictGate bypasses the standalone integration QA verdict gate.' WARN
+            } elseif ((Get-PacketGateTier -PacketPath $checkPipelinePacket) -eq 'light') {
+                Write-Log 'ℹ️ 경량 게이트 등급(패킷 선언) — QA verdict 게이트 생략, ⑤ 그대로 진행' INFO
+            } elseif (-not (Test-QaVerdict -QaDispatchedAt $null)) {
+                Write-FailureMarker -Stage 'integration' -Reason 'QA verdict 미통과 — ⑤ 진행 중단'
+                return 1
+            }
         }
-        # CFG017: QA 승인 대기는 fresh verdict pass를 확인한 뒤에만 해소한다 — Dispatch-Stage 안에서
-        # 해소하면 "실행 성공이지만 verdict 미통과" 케이스에 승인 기록이 조기 해소된다.
-        if ($stage -eq 'qa' -and -not $DryRun -and $result.CycleId) { Resolve-ApprovalRecords -Stage 'qa' -ResolvingCycle $result.CycleId }
-        Start-Sleep -Seconds 2
+        $result = Invoke-StageWithLock -Stage $singleStage -PromptOverride $Plan.Prompt -CheckPipelineBefore $true -CheckPipelinePacket $checkPipelinePacket
+        $ok = $result.Success
+        if ($ok -and $singleStage -eq 'qa' -and -not $DryRun) {
+            $ok = Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt
+            if (-not $ok) { Write-FailureMarker -Stage 'qa' -Reason 'QA verdict 미통과 — ⑤ 진행 중단' }
+            if ($ok -and $result.CycleId) { Resolve-ApprovalRecords -Stage 'qa' -ResolvingCycle $result.CycleId }
+        }
+        return [int](-not $ok)
     }
-    Write-ChainSummary -State 'completed' -Stages $chainStages -Warnings @() -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
-    Write-Log "🎉 파이프라인 완료 — impl/qa/integration 로그는 $LogDir 참조" SUCCESS
-    exit 0
-} else {
-    if (-not $Stage) { Write-Log "오류: -Stage 또는 -Chain 옵션이 필요합니다." ERROR; exit 1 }
-    $standalonePipeline = Get-PacketPipelineStatus -PacketPath $checkPipelinePacket
-    Set-CompletedStageApprovalsSuperseded -PipelineStatus $standalonePipeline -Evidence $checkPipelinePacket | Out-Null
-    $effectiveStage = Get-EffectivePipelineStage -PipelineStatus $standalonePipeline
-    if ($effectiveStage -and $effectiveStage -ne $Stage) {
-        $requestedIndexes = Get-StagePipelineIndexes -Stage $Stage
-        $requestedItems = @($standalonePipeline.Items | Where-Object { $requestedIndexes -contains $_.Index })
-        if ($requestedItems.Count -gt 0 -and @($requestedItems | Where-Object { -not $_.Checked }).Count -eq 0) {
-            Write-Log "✅ [$Stage] 이미 완료됨 — 재디스패치하지 않고 첫 미완료 단계 [$effectiveStage]로 수렴" SUCCESS
-            $Stage = $effectiveStage
-        }
-    }
-    if ($Stage -eq 'integration' -and -not $DryRun) {
-        if ($SkipVerdictGate) {
-            Write-Log 'WARNING: -SkipVerdictGate bypasses the standalone integration QA verdict gate.' WARN
-        } elseif ((Get-PacketGateTier -PacketPath $checkPipelinePacket) -eq 'light') {
-            Write-Log 'ℹ️ 경량 게이트 등급(패킷 선언) — QA verdict 게이트 생략, ⑤ 그대로 진행' INFO
-        } elseif (-not (Test-QaVerdict -QaDispatchedAt $null)) {
-            Write-FailureMarker -Stage 'integration' -Reason 'QA verdict 미통과 — ⑤ 진행 중단'
-            exit 1
-        }
-    }
-    $result = Invoke-StageWithLock -Stage $Stage -PromptOverride $Prompt -CheckPipelineBefore $true -CheckPipelinePacket $checkPipelinePacket
-    $ok = $result.Success
-    # -Chain has its existing verdict gate above. A standalone QA dispatch must enforce
-    # the same fresh pass verdict before its process can exit successfully.
-    if ($ok -and $Stage -eq 'qa' -and -not $DryRun) {
-        $ok = Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt
-        if (-not $ok) { Write-FailureMarker -Stage 'qa' -Reason 'QA verdict 미통과 — ⑤ 진행 중단' }
-        # CFG017: fresh verdict pass 확인 후에만 QA 승인 대기를 해소한다.
-        if ($ok -and $result.CycleId) { Resolve-ApprovalRecords -Stage 'qa' -ResolvingCycle $result.CycleId }
-    }
-    exit ([int](-not $ok))
 }
+
+# ── 메인 진입점 ─────────────────────────────────────────────────────────────
+$dispatchPlan = Resolve-DispatchPlan -TaskId $TaskId -Stage $Stage -Prompt $Prompt -Model $Model `
+    -Chain:$Chain -DryRun:$DryRun -SkipVerdictGate:$SkipVerdictGate -ForceFreeModel:$ForceFreeModel `
+    -ResetStageLedger:$ResetStageLedger -ResetReason $ResetReason `
+    -ManualComplete:$ManualComplete -ManualAbort:$ManualAbort -Reason $Reason `
+    -StageConfig $StageConfig -RepoRoot $RepoRoot -ProfileModule $ProfileModule -ProfileConfigPath $ProfileConfigPath
+
+if ($dispatchPlan.EarlyExit) {
+    if ($dispatchPlan.Action) {
+        exit (Invoke-DispatchChain -Plan $dispatchPlan)
+    }
+    exit $dispatchPlan.ExitCode
+}
+
+# 후속 Dispatch-Stage 및 내부 함수들이 전역 $StageConfig 및 스크립트 스코프 상태를 참조하므로 동기화
+$script:ProfileConfig = $dispatchPlan.ProfileConfig
+$script:RuntimeRoleBinding = $dispatchPlan.RuntimeRoleBinding
+$script:PipelineRouting = $dispatchPlan.PipelineRouting
+$script:ProviderHealthPath = $dispatchPlan.ProviderHealthPath
+$StageConfig = $dispatchPlan.ResolvedStageConfig
+
+$exitCode = Invoke-DispatchChain -Plan $dispatchPlan
+exit $exitCode
