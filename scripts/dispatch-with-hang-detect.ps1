@@ -43,7 +43,7 @@
 #>
 
 param(
-    [Parameter(Mandatory=$true)][string]$TaskId,
+    [Parameter(Mandatory=$false)][string]$TaskId,
     [Parameter(Mandatory=$false)][ValidateSet('impl','qa','integration')][string]$Stage,
     [Parameter(Mandatory=$false)][string]$Prompt,
     [Parameter(Mandatory=$false)][string]$Model,
@@ -136,7 +136,7 @@ $StageConfig = @{
     }
     'qa' = @{
         Command = ''
-        DefaultPrompt = "작업 $TaskId — 개발팀의 1차 구현과 자체 리뷰가 완료되었어. Handoff 확인하고 제로베이스에서 구현 및 코드 품질에 대해 리뷰해. 리뷰 시작 전 패킷의 Done When 항목을 전부 나열하고, 각 항목마다 실제 diff·코드 근거와 diff 밖이라도 이 변경이 영향을 주는 호출부·계약·회귀 테스트를 함께 확인해 개별 충족 여부를 검증해 — 근거 없이 통째로 '완료'로 넘기지 마. 발견한 결함은 직접 수정한 뒤 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ④를 갱신해. 마지막으로 QA 판정을 .agents/briefs/logs/$TaskId-qa-verdict.json 파일에 JSON으로 남겨 — schemaVersion은 2로, findings 배열에는 당신이 발견한 결함을 각각 {id, severity, doneWhenItem, description, fixedInQa, evidence} 형태로 개별 기록해(fixedInQa:true는 당신이 직접 수정했음을 뜻하며, 수정했더라도 findings에서 빠지면 안 된다). doneWhen 배열에 각 항목을 {item, satisfied, evidence} 형태로 개별 기록하고, 하나라도 satisfied가 false면 verdict는 반드시 blocked여야 해. 빈 findings 배열은 '결함을 하나도 발견하지 못했다'는 적극적 진술이며, 결함을 고쳐 놓고 findings를 비워 두는 것은 기록 위반으로 간주된다. ⑤ 진행 가능하면 verdict를 pass, 차단성 이슈로 ⑤ 진행 불가면 verdict를 blocked(사유는 reason)로 기록해"
+        DefaultPrompt = "작업 $TaskId — 개발팀의 1차 구현과 자체 리뷰가 완료되었어. Handoff 확인하고 제로베이스에서 구현 및 코드 품질에 대해 리뷰해. 리뷰 시작 전 패킷의 Done When 항목을 전부 나열하고, 각 항목마다 실제 diff·코드 근거와 diff 밖이라도 이 변경이 영향을 주는 호출부·계약·회귀 테스트를 함께 확인해 개별 충족 여부를 검증해 — 근거 없이 통째로 '완료'로 넘기지 마. 발견한 결함은 직접 수정한 뒤 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ④를 갱신해. 마지막으로 QA 판정을 .agents/briefs/logs/$TaskId-qa-verdict.json 파일에 JSON으로 남겨 — schemaVersion은 3으로, findings 배열에는 당신이 발견한 결함을 각각 {id, severity, confidenceTier, doneWhenItem, description, fixedInQa, evidence} 형태로 개별 기록해(fixedInQa:true는 당신이 직접 수정했음을 뜻하며, 수정했더라도 findings에서 빠지면 안 된다). confidenceTier는 'RESOLVED'(코드 정적 대조 확정), 'OBSERVED'(테스트/실행 관측), 'CANDIDATE'(미실행 잠재 추론) 중 하나여야 하며, CANDIDATE 단독 지적은 verdict를 blocked로 만들지 않는다(RESOLVED/OBSERVED만 확정 결함으로 blocked 사유가 됨). doneWhen 배열에 각 항목을 {item, satisfied, evidence} 형태로 개별 기록하고, 하나라도 satisfied가 false면 verdict는 반드시 blocked여야 해. 빈 findings 배열은 '결함을 하나도 발견하지 못했다'는 적극적 진술이며, 결함을 고쳐 놓고 findings를 비워 두는 것은 기록 위반으로 간주된다. ⑤ 진행 가능하면 verdict를 pass, 차단성 이슈로 ⑤ 진행 불가면 verdict를 blocked(사유는 reason)로 기록해"
         LogFile = "$TaskLogPrefix-qa.log"
         ReportFile = "$TaskLogPrefix-qa-last.md"
         VerdictFile = "$TaskLogPrefix-qa-verdict.json"
@@ -146,7 +146,7 @@ $StageConfig = @{
     }
     'integration' = @{
         Command = ''
-        DefaultPrompt = "작업 $TaskId — 현재 프로세스가 하네스가 시작한 유일한 Integration 본체다. 별도 Integration을 디스패치하거나 PID·락을 감시하거나 프로세스를 종료하지 마. 개발1팀의 구현과 QA팀의 리뷰가 완료되었어. 제로베이스에서 문제없는지 리뷰해. scripts/verify.ps1 게이트 통과 + 실동작 E2E 검증까지 마치고, 문제없으면 Integration을 로컬 완료 처리하고 Pipeline Status ⑤와 history.md를 갱신한 뒤, 관련 변경을 커밋하고 원격에 push까지 자동으로 수행해(추가 승인 대기 없음; 정본 하네스를 수정했으면 sync-configs.ps1 -Action Push -CommitTargets -PushTargets 까지 수행해야 배포와 하류 사본 커밋이 완료된다). 패킷 Amendment에 자동 commit/push를 명시적으로 금지하는 지시가 있으면 그 지시를 따르고 사유를 남겨. 만약 QA가 pass를 줬지만 이 Integration 단계에서 새 결함(탈출 결함)을 발견하면, .agents/briefs/logs/$TaskId-integration-findings.json 파일에 schemaVersion 2로 {taskId, stage:'integration', findings:[{id, severity, doneWhenItem, description, fixedInQa, evidence}]} 형태로 기록해. 빈 findings 배열은 '탈출 결함을 발견하지 못했다'는 적극적 진술이며, 결함을 고쳐 놓고 findings를 비워 두는 것은 기록 위반으로 간주된다."
+        DefaultPrompt = "작업 $TaskId — 현재 프로세스가 하네스가 시작한 유일한 Integration 본체다. 별도 Integration을 디스패치하거나 PID·락을 감시하거나 프로세스를 종료하지 마. 개발1팀의 구현과 QA팀의 리뷰가 완료되었어. 제로베이스에서 문제없는지 리뷰해. scripts/verify.ps1 게이트 통과 + 실동작 E2E 검증까지 마치고, 문제없으면 Integration을 로컬 완료 처리하고 Pipeline Status ⑤와 history.md를 갱신한 뒤, 관련 변경을 커밋하고 원격에 push까지 자동으로 수행해(추가 승인 대기 없음; 정본 하네스를 수정했으면 sync-configs.ps1 -Action Push -CommitTargets -PushTargets 까지 수행해야 배포와 하류 사본 커밋이 완료된다). 패킷 Amendment에 자동 commit/push를 명시적으로 금지하는 지시가 있으면 그 지시를 따르고 사유를 남겨. 만약 QA가 pass를 줬지만 이 Integration 단계에서 새 결함(탈출 결함)을 발견하면, .agents/briefs/logs/$TaskId-integration-findings.json 파일에 schemaVersion 3으로 {taskId, stage:'integration', findings:[{id, severity, confidenceTier, doneWhenItem, description, fixedInQa, evidence}]} 형태로 기록해(confidenceTier: RESOLVED|OBSERVED|CANDIDATE). 빈 findings 배열은 '탈출 결함을 발견하지 못했다'는 적극적 진술이며, 결함을 고쳐 놓고 findings를 비워 두는 것은 기록 위반으로 간주된다."
         LogFile = "$TaskLogPrefix-integration.log"
         FindingsFile = "$TaskLogPrefix-integration-findings.json"
         KillOnHang = $false
@@ -3413,25 +3413,30 @@ function Invoke-DispatchChain {
 }
 
 # ── 메인 진입점 ─────────────────────────────────────────────────────────────
-$dispatchPlan = Resolve-DispatchPlan -TaskId $TaskId -Stage $Stage -Prompt $Prompt -Model $Model `
-    -Chain:$Chain -DryRun:$DryRun -SkipVerdictGate:$SkipVerdictGate -ForceFreeModel:$ForceFreeModel `
-    -ResetStageLedger:$ResetStageLedger -ResetReason $ResetReason `
-    -ManualComplete:$ManualComplete -ManualAbort:$ManualAbort -Reason $Reason `
-    -StageConfig $StageConfig -RepoRoot $RepoRoot -ProfileModule $ProfileModule -ProfileConfigPath $ProfileConfigPath
-
-if ($dispatchPlan.EarlyExit) {
-    if ($dispatchPlan.Action) {
-        exit (Invoke-DispatchChain -Plan $dispatchPlan)
+if ($MyInvocation.InvocationName -ne '.' -and ($MyInvocation.Line -notmatch '^\s*\.\s' -or $MyInvocation.Line -eq $null)) {
+    if ([string]::IsNullOrWhiteSpace($TaskId)) {
+        throw 'TaskId is required when executing dispatch-with-hang-detect.ps1 directly.'
     }
-    exit $dispatchPlan.ExitCode
+    $dispatchPlan = Resolve-DispatchPlan -TaskId $TaskId -Stage $Stage -Prompt $Prompt -Model $Model `
+        -Chain:$Chain -DryRun:$DryRun -SkipVerdictGate:$SkipVerdictGate -ForceFreeModel:$ForceFreeModel `
+        -ResetStageLedger:$ResetStageLedger -ResetReason $ResetReason `
+        -ManualComplete:$ManualComplete -ManualAbort:$ManualAbort -Reason $Reason `
+        -StageConfig $StageConfig -RepoRoot $RepoRoot -ProfileModule $ProfileModule -ProfileConfigPath $ProfileConfigPath
+
+    if ($dispatchPlan.EarlyExit) {
+        if ($dispatchPlan.Action) {
+            exit (Invoke-DispatchChain -Plan $dispatchPlan)
+        }
+        exit $dispatchPlan.ExitCode
+    }
+
+    # 후속 Dispatch-Stage 및 내부 함수들이 전역 $StageConfig 및 스크립트 스코프 상태를 참조하므로 동기화
+    $script:ProfileConfig = $dispatchPlan.ProfileConfig
+    $script:RuntimeRoleBinding = $dispatchPlan.RuntimeRoleBinding
+    $script:PipelineRouting = $dispatchPlan.PipelineRouting
+    $script:ProviderHealthPath = $dispatchPlan.ProviderHealthPath
+    $StageConfig = $dispatchPlan.ResolvedStageConfig
+
+    $exitCode = Invoke-DispatchChain -Plan $dispatchPlan
+    exit $exitCode
 }
-
-# 후속 Dispatch-Stage 및 내부 함수들이 전역 $StageConfig 및 스크립트 스코프 상태를 참조하므로 동기화
-$script:ProfileConfig = $dispatchPlan.ProfileConfig
-$script:RuntimeRoleBinding = $dispatchPlan.RuntimeRoleBinding
-$script:PipelineRouting = $dispatchPlan.PipelineRouting
-$script:ProviderHealthPath = $dispatchPlan.ProviderHealthPath
-$StageConfig = $dispatchPlan.ResolvedStageConfig
-
-$exitCode = Invoke-DispatchChain -Plan $dispatchPlan
-exit $exitCode

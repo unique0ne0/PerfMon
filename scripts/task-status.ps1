@@ -7,10 +7,12 @@ param(
     [int]$IntervalSeconds = 5
 )
 # WinForms는 STA 스레드가 필요하다. 사용자가 -sta를 기억하지 않아도 되도록 재실행한다.
-if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA) {
-    $arguments = '-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -IntervalSeconds {1}' -f $PSCommandPath, $IntervalSeconds
-    Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -WindowStyle Hidden | Out-Null
-    exit 0
+if ($MyInvocation.InvocationName -ne '.' -and ($MyInvocation.Line -notmatch '^\s*\.\s' -or $MyInvocation.Line -eq $null)) {
+    if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA) {
+        $arguments = '-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -IntervalSeconds {1}' -f $PSCommandPath, $IntervalSeconds
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+        exit 0
+    }
 }
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -81,11 +83,13 @@ if (-not (Test-Path -LiteralPath $harnessIoModule)) { throw "Required harness I/
 # ── CFG042: 하네스 배포 동기화 요약 — 오버라이드(추적 가능한 로컬 예외)와 드리프트 분리 ──
 function Get-HarnessSyncSummary {
     $masterDir = Join-Path $root 'global\harness'
-    # 배포된 사본은 자기 옆(scripts\) 매니페스트를 먼저 읽는다. AST 임포트 테스트처럼 $PSScriptRoot가
-    # 없는 문맥이면 그대로 중앙 정본 경로로 폴백한다 — 딱 하나의 목록을 두 소비자가 공유하게 한다.
-    $manifestPath = $null
-    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $manifestPath = Join-Path $PSScriptRoot 'harness-assets.txt' }
-    if ([string]::IsNullOrWhiteSpace($manifestPath) -or -not (Test-Path -LiteralPath $manifestPath)) { $manifestPath = Join-Path $masterDir 'harness-assets.txt' }
+    # 정본(SSOT) 매니페스트를 우선 읽는다. $PSScriptRoot(호스트 파일 경로) 우선은 dot-source한 호스트의
+    # 옆 매니페스트로 치우쳐 hermetic 검증을 깨고, 배포 사본은 스테일 목록이라 오판 위험이 있다.
+    # 정본이 없는 예외적 문맥(global\harness에서 직접 실행된 연산자 등)에서만 호스트 옆 파일로 폴백한다.
+    $manifestPath = Join-Path $masterDir 'harness-assets.txt'
+    if (-not (Test-Path -LiteralPath $manifestPath) -and -not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        $manifestPath = Join-Path $PSScriptRoot 'harness-assets.txt'
+    }
     try { $assets = @(Read-HarnessAssets -ManifestPath $manifestPath) }
     catch { return [pscustomobject]@{ MasterChecks = 0; Overrides = @(); Drifts = @("manifest ($($_.Exception.Message))"); Projects = @() } }
     $harnessProjects = @(Get-HarnessProjects)
@@ -1235,6 +1239,7 @@ function Open-PacketFile {
     $routerPath = Join-Path $Row.ProjectPath '.agents\briefs\handoff-log.md'
     if (Test-Path $routerPath) { Start-Process -FilePath $routerPath | Out-Null }
 }
+if ($MyInvocation.InvocationName -ne '.' -and ($MyInvocation.Line -notmatch '^\s*\.\s' -or $MyInvocation.Line -eq $null)) {
 $form = New-Object System.Windows.Forms.Form
 $form.Text = '패킷 상태 대시보드'
 $form.ClientSize = New-Object System.Drawing.Size(1280, 430)
@@ -1487,3 +1492,4 @@ $clockTimer.Start()
 [void]$form.ShowDialog()
 $timer.Stop()
 $clockTimer.Stop()
+}
