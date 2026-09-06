@@ -1665,6 +1665,158 @@ function Record-StageAttempt {
     return @{ Blocked = $false; Count = $count; MaxAllowed = $maxAllowed }
 }
 
+# ── CFG065: 체인 단위 런타임 기록 ─────────────────────────────────────────
+# 각 단계의 실제 모델(family·adapter·principal)을 덮어쓰이지 않는 곳에 남긴다.
+# 기존 stage-state.json은 단계 진입 시 -Model $null로 초기화되고, 단계 원장은
+# CFG027/CFG037 구조적 수정 시 초기화되므로 체인 단위 독립 기록을 신설한다.
+function Get-ChainRuntimePath {
+    return (Resolve-RepoPath "$LogDir/$TaskId-chain-runtime.json")
+}
+
+function Read-ChainRuntime {
+    $path = Get-ChainRuntimePath
+    if (-not (Test-Path -LiteralPath $path)) {
+        return [pscustomobject]@{ schemaVersion = 1; taskId = $TaskId; stages = [pscustomobject]@{} }
+    }
+    try {
+        $json = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($null -eq $json.stages) { $json | Add-Member -NotePropertyName stages -NotePropertyValue ([pscustomobject]@{}) -Force }
+        return $json
+    } catch {
+        return [pscustomobject]@{ schemaVersion = 1; taskId = $TaskId; stages = [pscustomobject]@{} }
+    }
+}
+
+function Write-ChainRuntime {
+    param([object]$Runtime)
+    $path = Get-ChainRuntimePath
+    Write-AtomicJson -Path $path -Value $Runtime -Depth 6
+}
+
+function Reset-ChainRuntime {
+    $runtime = [pscustomobject]@{ schemaVersion = 1; taskId = $TaskId; stages = [pscustomobject]@{} }
+    Write-ChainRuntime -Runtime $runtime
+    Write-Log "체인 런타임 초기화 (TaskId: $TaskId)" INFO
+}
+
+function Record-ChainRuntime {
+    param([string]$Stage, [string]$Model, [string]$Status, [string]$Reason)
+    $runtime = Read-ChainRuntime
+    $family = ''; $adapter = ''; $principal = ''
+    $catalog = $null
+    if ($script:ProfileConfig -and $script:ProfileConfig.modelCatalog -and $Model) {
+        $catalog = $script:ProfileConfig.modelCatalog.$Model
+    } elseif ($Model) {
+        try {
+            $cfgPath = Join-Path $PSScriptRoot 'model-profiles.json'
+            if (Test-Path -LiteralPath $cfgPath) {
+                $cfg = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($cfg.modelCatalog) { $catalog = $cfg.modelCatalog.$Model }
+            }
+        } catch { }
+    }
+    if ($catalog) {
+        $family = [string]$catalog.family
+        $principal = [string]$catalog.principal
+        if ($catalog.adapter) { $adapter = [string]$catalog.adapter }
+    }
+    $entry = [pscustomobject]@{
+        stage = $Stage
+        model = $Model
+        family = $family
+        adapter = $adapter
+        principal = $principal
+        status = $Status
+        reason = $Reason
+        recordedAt = [datetime]::UtcNow.ToString('o')
+    }
+    $runtime.stages | Add-Member -NotePropertyName $Stage -NotePropertyValue $entry -Force
+    Write-ChainRuntime -Runtime $runtime
+    Write-Log "체인 런타임 기록: [$Stage] model=$Model family=$family status=$Status" INFO
+}
+
+function Test-ChainAdjacency {
+    param([string]$Stage)
+    $predecessorMap = @{ 'impl' = 'planning'; 'qa' = 'impl'; 'integration' = 'qa' }
+    if (-not $predecessorMap.ContainsKey($Stage)) {
+        return @{ Allowed = $true }
+    }
+    $predecessor = $predecessorMap[$Stage]
+    $runtime = Read-ChainRuntime
+    $preEntry = $runtime.stages.$predecessor
+    if (-not $preEntry) {
+        return @{ Allowed = $true }
+    }
+    $preFamily = [string]$preEntry.family
+    $preModel = [string]$preEntry.model
+    $preStatus = [string]$preEntry.status
+    if ($preStatus -eq 'manual' -or $preModel -eq 'human' -or $preModel -eq 'unknown' -or -not $preModel) {
+        return @{ Allowed = $true }
+    }
+    if (-not $preFamily -or $preFamily -eq 'unknown') {
+        return @{ Allowed = $true }
+    }
+    $currentFamily = ''
+    $currentModel = ''
+    if ($Stage -eq 'impl' -and $script:PipelineRouting) {
+        $implModels = @($script:PipelineRouting.ImplementationModels)
+        if ($implModels.Count -gt 0) {
+            $firstModel = $implModels[0]
+            $currentModel = $firstModel
+            if ($script:ProfileConfig -and $script:ProfileConfig.modelCatalog -and $script:ProfileConfig.modelCatalog.$firstModel) {
+                $currentFamily = [string]$script:ProfileConfig.modelCatalog.$firstModel.family
+            }
+        }
+    } else {
+        $currentStageCfg = $null
+        if ($StageConfig) { $currentStageCfg = $StageConfig[$Stage] }
+        if ($currentStageCfg) {
+            $models = @()
+            if ($currentStageCfg.ModelChain) { $models = @($currentStageCfg.ModelChain) }
+            elseif ($currentStageCfg.ModelFallback) { $models = @($currentStageCfg.ModelFallback) }
+            elseif ($currentStageCfg.Model) { $models = @($currentStageCfg.Model) }
+            if ($models.Count -gt 0) {
+                $currentModel = $models[0]
+                $cat = $null
+                if ($script:ProfileConfig -and $script:ProfileConfig.modelCatalog) { $cat = $script:ProfileConfig.modelCatalog.$currentModel }
+                if ($cat) { $currentFamily = [string]$cat.family }
+            }
+        }
+    }
+    if (-not $currentFamily -or $currentFamily -eq 'unknown') {
+        return @{ Allowed = $true }
+    }
+    if ($preFamily -eq $currentFamily) {
+        return @{
+            Allowed = $false
+            Predecessor = $predecessor
+            PredecessorModel = $preModel
+            PredecessorFamily = $preFamily
+            CurrentFamily = $currentFamily
+            CurrentModel = $currentModel
+        }
+    }
+    return @{ Allowed = $true }
+}
+
+function Write-ChainBlockedMarker {
+    param([string]$Reason, [string]$PredecessorStage, [string]$PredecessorModel, [string]$CurrentStage, [string]$CurrentModel, [string[]]$RecoverySteps)
+    $path = Resolve-RepoPath "$LogDir/$TaskId-blocked.json"
+    $value = [ordered]@{
+        schemaVersion = 1
+        taskId = $TaskId
+        timestamp = [datetime]::UtcNow.ToString('o')
+        reason = $Reason
+        stages = [ordered]@{
+            predecessor = [ordered]@{ stage = $PredecessorStage; model = $PredecessorModel }
+            current = [ordered]@{ stage = $CurrentStage; model = $CurrentModel }
+        }
+        recoverySteps = @($RecoverySteps)
+    }
+    Write-AtomicJson -Path $path -Value $value -Depth 6
+    Write-Log "중단 마커 기록: $path" WARN
+}
+
 #endregion 승인·continuation·시도 판정·스테이지 원장
 #region 원장 게이트·패킷·라우터 파싱·관측
 # CFG037: QA 단계가 완료된 후 qa-verdict.json이 없으면 하네스가 직접 기록한다.
@@ -2455,6 +2607,7 @@ function Complete-StageFailure {
         if (Test-Path $logAbs) { Get-Content $logAbs -Tail 15 | ForEach-Object { Write-Host "    $_" } }
     }
     Write-StageState -Stage $Stage -Cycle $Cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($LogRel) -Reason $failureReason -Model $Model
+    Record-ChainRuntime -Stage $Stage -Model $Model -Status 'failed' -Reason $failureReason
     return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $qaDispatchedAt }
 }
 
@@ -2474,6 +2627,7 @@ function Complete-StageExitFailure {
     $logAbs = Resolve-RepoPath $LogRel
     if (Test-Path $logAbs) { Get-Content $logAbs -Tail 15 | ForEach-Object { Write-Host "    $_" } }
     Write-StageState -Stage $Stage -Cycle $Cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($LogRel) -Reason $failureReason -Model $Model
+    Record-ChainRuntime -Stage $Stage -Model $Model -Status 'failed' -Reason $failureReason
     return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $qaDispatchedAt }
 }
 
@@ -2518,6 +2672,51 @@ function Dispatch-Stage {
 
     $models = Resolve-ModelChain -Config $config -Stage $Stage
     if ($models.Count -eq 0) {
+        $quotaExhausted = $false
+        $blockedPrincipalsList = @()
+        if ($script:ProviderHealthPath -and (Test-Path -LiteralPath $script:ProviderHealthPath)) {
+            try {
+                $health = Read-ProviderHealth -Path $script:ProviderHealthPath
+                foreach ($prop in @($health.providers.psobject.Properties)) {
+                    if ($prop.Name -like 'principal:*') {
+                        $pEntry = $prop.Value
+                        if ($pEntry.nextProbeAt) {
+                            [datetime]$pProbe = [datetime]::MinValue
+                            if ([datetime]::TryParse([string]$pEntry.nextProbeAt, [ref]$pProbe) -and $pProbe.ToUniversalTime() -gt [datetime]::UtcNow) {
+                                $quotaExhausted = $true
+                                $blockedPrincipalsList += "$($prop.Name -replace 'principal:','') (until $($pProbe.ToUniversalTime().ToString('o')))"
+                            }
+                        }
+                    }
+                }
+            } catch { }
+        }
+        if ($quotaExhausted) {
+            $failureReason = "쿼터 소진 — 역할 재배정 필요 (차단된 principal: $($blockedPrincipalsList -join ', '))"
+            Write-Log "❌ [$Stage] $failureReason" ERROR
+            Write-Log "재개 절차: 패킷의 Runtime Role Binding 5필드 또는 model-profiles.local.json을 편집해 쿼터가 남은 팀으로 재배정하세요." ERROR
+            Write-BlockedMarker -Stage $Stage -Reason $failureReason -OwnerTaskId $TaskId -OwnerProcessId $PID
+            $firstModel = ''
+            if ($config.ModelFallback) { $firstModel = @($config.ModelFallback)[0] }
+            elseif ($config.ModelChain) { $firstModel = @($config.ModelChain)[0] }
+            Record-ChainRuntime -Stage $Stage -Model $firstModel -Status 'quota_exhausted' -Reason $failureReason
+            $blockedPath = Resolve-RepoPath "$LogDir/$TaskId-blocked.json"
+            $blockedValue = [ordered]@{
+                schemaVersion = 1
+                taskId = $TaskId
+                timestamp = [datetime]::UtcNow.ToString('o')
+                reason = $failureReason
+                stages = [ordered]@{ current = [ordered]@{ stage = $Stage; model = $firstModel } }
+                recoverySteps = @(
+                    '패킷의 Runtime Role Binding 5필드(Planning Profile/Adapter, QA Profile/Adapter, Integration Profile/Adapter)를 쿼터가 남은 팀으로 변경'
+                    '또는 model-profiles.local.json의 roles 항목을 편집해 쿼터가 남은 프로필로 재배정'
+                    'provider-health.json의 nextProbeAt 만료 후 재시도 가능'
+                )
+            }
+            Write-AtomicJson -Path $blockedPath -Value $blockedValue -Depth 6
+            try { [System.Console]::Beep() } catch { }
+            return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $null }
+        }
         $failureReason = '모델 체인이 비어 있음 — 단계 구성 오류'
         Write-Log "❌ [$Stage] $failureReason" ERROR
         return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $null }
@@ -2640,6 +2839,7 @@ function Dispatch-Stage {
             Write-Log '⛔ [integration] 검증 실패 — 완료 정리 금지 (⑤ 체크·router DONE·아카이브·완료 커밋 불가, 패킷 미완료 유지)' ERROR
         }
         Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $verifyResult.FailureReason -Model $model
+        Record-ChainRuntime -Stage $Stage -Model $model -Status 'failed' -Reason $verifyResult.FailureReason
         return @{ Success = $false; FailureReason = $verifyResult.FailureReason; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
     }
 
@@ -2654,6 +2854,7 @@ function Dispatch-Stage {
         Write-Log '✅ [integration] 검증 성공 — 완료 정리 허용 (⑤ 체크·router DONE·아카이브·완료 커밋 가능)' INFO
     }
     Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'completed' -ProcessId $PID -EvidencePaths @($logRel) -Reason 'stage succeeded and verify passed' -Model $model
+    Record-ChainRuntime -Stage $Stage -Model $model -Status 'success' -Reason 'stage succeeded and verify passed'
     return @{ Success = $true; FailureReason = $null; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
 }
 #endregion 디스패치 본체
@@ -3317,7 +3518,25 @@ function Invoke-DispatchChain {
         }
         $stagesToRun = @($allStages[$effectiveIndex..($allStages.Count - 1)])
         Write-Log "유효 시작 단계: $effectiveStage (완료 단계 재디스패치 금지)" INFO
+        Reset-ChainRuntime
         foreach ($stage in $stagesToRun) {
+            if ($stage -ne $stagesToRun[0]) {
+                $adjCheck = Test-ChainAdjacency -Stage $stage
+                if (-not $adjCheck.Allowed) {
+                    $adjReason = "인접 단계 family 중복: [$($adjCheck.Predecessor)]($($adjCheck.PredecessorModel), family=$($adjCheck.PredecessorFamily)) → [$stage](family=$($adjCheck.CurrentFamily)) — 동일 family 연속 처리"
+                    Write-Log "⛔ [$stage] $adjReason" ERROR
+                    Write-Log "원칙 4: 동일 모델이 2단계 이상 연속 처리되지 않도록 해야 합니다. 사용자 지침을 받으세요." ERROR
+                    Write-BlockedMarker -Stage $stage -Reason $adjReason -OwnerTaskId $TaskId -OwnerProcessId $PID
+                    Record-ChainRuntime -Stage $stage -Model $adjCheck.CurrentModel -Status 'blocked_adjacency' -Reason $adjReason
+                    Write-ChainBlockedMarker -Reason $adjReason -PredecessorStage $adjCheck.Predecessor -PredecessorModel $adjCheck.PredecessorModel -CurrentStage $stage -CurrentModel $adjCheck.CurrentModel -RecoverySteps @(
+                        '패킷의 Runtime Role Binding을 변경해 다른 family의 팀으로 재배정'
+                        'model-profiles.local.json의 roles 항목을 편집해 쿼터가 남은 프로필로 재배정'
+                    )
+                    try { [System.Console]::Beep(1000, 2000); [System.Console]::Beep(800, 2000) } catch { }
+                    Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @($adjReason) -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
+                    return 1
+                }
+            }
             if ($stage -eq 'integration' -and -not $DryRun -and $gateTier -eq 'light') {
                 Write-Log 'ℹ️ 경량 게이트 등급(패킷 선언) — QA verdict 게이트 생략, ⑤ 그대로 진행' INFO
             } elseif ($stage -eq 'integration' -and -not $DryRun -and -not (Test-QaVerdict -QaDispatchedAt $null)) {
