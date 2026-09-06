@@ -1,0 +1,27 @@
+# agy-models.txt — `agy models` 제공 모델 스냅샷 (SSOT)
+# 실측 일자: 2026-09-06
+# 실측 명령: agy models
+#
+# 한 줄에 모델 ID 하나. '#'으로 시작하는 줄은 주석, 빈 줄 무시.
+# 이 파일이 없거나 비어 있으면 test-model-profiles.ps1 T7이 실패한다(조용한 무검사 방지).
+#
+# 2026-09-06: gemini-3.5-flash 계열 4종 제거(agy 제공 목록에서 사라짐 확인).
+#             gemini-3.8-flash 계열 추가(출시 확인).
+#             접미 없는 flash 기본값(3.8/3.7/3.6)은 목록에 없으나 실행됨 — 기존 주석의 실측 근거 유지.
+gemini-3.8-flash
+gemini-3.8-flash-high
+gemini-3.8-flash-medium
+gemini-3.8-flash-low
+gemini-3.7-flash
+gemini-3.7-flash-high
+gemini-3.7-flash-medium
+gemini-3.7-flash-low
+gemini-3.6-flash
+gemini-3.6-flash-high
+gemini-3.6-flash-medium
+gemini-3.6-flash-low
+gemini-3.1-pro-high
+gemini-3.1-pro-low
+claude-sonnet-4-6
+claude-opus-4-6-thinking
+gpt-oss-120b-medium

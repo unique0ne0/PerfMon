@@ -23,4 +23,5 @@ sweep-orphan-browsers.ps1
 stage-thresholds.json
 harness-contracts.ps1
 harness-io.ps1
+agy-models.txt
 harness-assets.txt
