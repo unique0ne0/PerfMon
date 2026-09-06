@@ -19,6 +19,14 @@ function Test-ProfileGraph {
         if ([string]::IsNullOrWhiteSpace([string]$profile.family) -or [string]$profile.family -notmatch '^[a-z][a-z0-9-]*$') { throw "Invalid family in profile: $($property.Name)" }
         if ([string]::IsNullOrWhiteSpace([string]$profile.model) -or [string]$profile.model -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$') { throw "Invalid model in profile: $($property.Name)" }
         foreach ($fallback in @($profile.fallbackProfiles)) { if ($null -eq $Config.profiles.$fallback) { throw "Unknown fallback profile '$fallback' in $($property.Name)" } }
+        if ($property.Name -match '-(qa|integration)$') {
+            foreach ($fallback in @($profile.fallbackProfiles)) {
+                $fbProfile = $Config.profiles.$fallback
+                if ($null -ne $fbProfile -and [string]$fbProfile.family -ne [string]$profile.family) {
+                    throw "Profile '$($property.Name)' (family=$([string]$profile.family)) has cross-family fallback '$fallback' (family=$([string]$fbProfile.family)) — pipeline role fallback must be provider swap only (same family)"
+                }
+            }
+        }
     }
     function Visit-ProfileFallback {
         param([string]$Name, [hashtable]$Visiting, [hashtable]$Visited)
@@ -95,6 +103,25 @@ function Test-ProfileGraph {
             if ($mFamily -ne '' -and $mFamily -ne 'unknown' -and $mFamily -eq $qa.family) {
                 throw "Implementation model $m (family=$mFamily) shares family with QA profile $($route.qaProfile) (family=$($qa.family)) — must violation"
             }
+        }
+        $planningProfilesForAdapter = @($Config.profiles.psobject.Properties | Where-Object { [string]$_.Value.adapter -eq $adapter -and $_.Name -match '-planning$' })
+        if ($planningProfilesForAdapter.Count -gt 0) {
+            $plannerFamily = [string]$planningProfilesForAdapter[0].Value.family
+            if ($plannerFamily -ne '' -and $plannerFamily -ne 'unknown') {
+                foreach ($adjM in $implModels) {
+                    $adjMFam = if ($Config.modelCatalog.$adjM) { [string]$Config.modelCatalog.$adjM.family } else { '' }
+                    if ($adjMFam -ne '' -and $adjMFam -ne 'unknown' -and $adjMFam -eq $plannerFamily) {
+                        $adjMsg = "Planner $adapter : planning (family=$plannerFamily) and implementation model $adjM (family=$adjMFam) are adjacent same-family (prefer violation)"
+                        if ($null -ne $Warnings) { $null = $Warnings.Add($adjMsg) } else { throw $adjMsg }
+                    }
+                }
+            }
+        }
+        $qaFamAdj = [string]$qa.family
+        $intFamAdj = [string]$Config.profiles.$integrationName.family
+        if ($qaFamAdj -ne '' -and $qaFamAdj -ne 'unknown' -and $qaFamAdj -eq $intFamAdj) {
+            $adjMsg45 = "Planner $adapter : QA profile $($route.qaProfile) (family=$qaFamAdj) and Integration profile $($route.integrationProfile) (family=$intFamAdj) are adjacent same-family (prefer violation)"
+            if ($null -ne $Warnings) { $null = $Warnings.Add($adjMsg45) } else { throw $adjMsg45 }
         }
     }
 }
