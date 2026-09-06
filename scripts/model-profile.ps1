@@ -18,7 +18,15 @@ function Test-ProfileGraph {
         if ($profile.adapter -notin @('claude', 'codex', 'opencode', 'gemini', 'antigravity')) { throw "Unsupported adapter in profile: $($property.Name)" }
         if ([string]::IsNullOrWhiteSpace([string]$profile.family) -or [string]$profile.family -notmatch '^[a-z][a-z0-9-]*$') { throw "Invalid family in profile: $($property.Name)" }
         if ([string]::IsNullOrWhiteSpace([string]$profile.model) -or [string]$profile.model -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$') { throw "Invalid model in profile: $($property.Name)" }
-        foreach ($fallback in @($profile.fallbackProfiles)) { if ($null -eq $Config.profiles.$fallback) { throw "Unknown fallback profile '$fallback' in $($property.Name)" } }
+        foreach ($fallback in @($profile.fallbackProfiles)) {
+            if ($null -eq $Config.profiles.$fallback) { throw "Unknown fallback profile '$fallback' in $($property.Name)" }
+            if ($property.Name -match '-(qa|integration)$') {
+                $targetFallback = $Config.profiles.$fallback
+                if ($null -ne $targetFallback -and [string]$targetFallback.family -ne [string]$profile.family) {
+                    throw "Pipeline role profile '$($property.Name)' (family=$($profile.family)) cannot fallback to cross-family profile '$fallback' (family=$($targetFallback.family))"
+                }
+            }
+        }
     }
     function Visit-ProfileFallback {
         param([string]$Name, [hashtable]$Visiting, [hashtable]$Visited)
@@ -89,12 +97,29 @@ function Test-ProfileGraph {
                 if ($null -ne $Warnings) { $null = $Warnings.Add($msg) } else { throw $msg }
             }
         }
+        # 인접 단계 동일 family 검사 (경고: prefer violation)
+        # ①기획 ↔ ②구현 (planner 프로필 vs route 내 슬롯 모델)
+        $plannerProfileName = "$adapter-planning"
+        $plannerProfile = $Config.profiles.$plannerProfileName
+        $plannerFamily = if ($plannerProfile) { [string]$plannerProfile.family } else { '' }
         $implModels = @($Config.routes.$routeName)
         foreach ($m in $implModels) {
             $mFamily = if ($Config.modelCatalog.$m) { [string]$Config.modelCatalog.$m.family } else { '' }
-            if ($mFamily -ne '' -and $mFamily -ne 'unknown' -and $mFamily -eq $qa.family) {
-                throw "Implementation model $m (family=$mFamily) shares family with QA profile $($route.qaProfile) (family=$($qa.family)) — must violation"
+            if ($mFamily -ne '' -and $mFamily -ne 'unknown') {
+                if ($plannerFamily -ne '' -and $plannerFamily -ne 'unknown' -and $mFamily -eq $plannerFamily) {
+                    $msg = "Planner $adapter (planningProfile=$plannerProfileName, family=$plannerFamily) shares family with implementation model $m (family=$mFamily) — stage 1/2 adjacency prefer violation"
+                    if ($null -ne $Warnings) { $null = $Warnings.Add($msg) } else { Write-Warning $msg }
+                }
+                if ($mFamily -eq $qa.family) {
+                    throw "Implementation model $m (family=$mFamily) shares family with QA profile $($route.qaProfile) (family=$($qa.family)) — must violation"
+                }
             }
+        }
+        # ④QA ↔ ⑤Integration
+        $integration = $Config.profiles.$integrationName
+        if ($null -ne $integration -and [string]$qa.family -ne '' -and [string]$qa.family -ne 'unknown' -and [string]$qa.family -eq [string]$integration.family) {
+            $msg = "Planner $adapter QA profile $($route.qaProfile) (family=$($qa.family)) shares family with Integration profile $integrationName (family=$($integration.family)) — stage 4/5 adjacency prefer violation"
+            if ($null -ne $Warnings) { $null = $Warnings.Add($msg) } else { Write-Warning $msg }
         }
     }
 }
