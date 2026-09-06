@@ -1700,7 +1700,7 @@ function Reset-ChainRuntime {
 }
 
 function Record-ChainRuntime {
-    param([string]$Stage, [string]$Model, [string]$Status, [string]$Reason)
+    param([string]$Stage, [string]$Model, [string]$Status, [string]$Reason, [string]$ProfileName)
     $runtime = Read-ChainRuntime
     $family = ''; $adapter = ''; $principal = ''
     $catalog = $null
@@ -1719,6 +1719,17 @@ function Record-ChainRuntime {
         $family = [string]$catalog.family
         $principal = [string]$catalog.principal
         if ($catalog.adapter) { $adapter = [string]$catalog.adapter }
+    }
+    # Planning is not spawned by this dispatcher, so its identity comes from the
+    # packet's Runtime Role Binding rather than modelCatalog's route slots.
+    if ($ProfileName -and $script:ProfileConfig -and $script:ProfileConfig.profiles) {
+        $profile = $script:ProfileConfig.profiles.$ProfileName
+        if ($profile) {
+            if (-not $Model) { $Model = [string]$profile.model }
+            if (-not $family) { $family = [string]$profile.family }
+            if (-not $adapter) { $adapter = [string]$profile.adapter }
+            if (-not $principal) { $principal = [string]$profile.adapter }
+        }
     }
     $entry = [pscustomobject]@{
         stage = $Stage
@@ -2674,7 +2685,13 @@ function Dispatch-Stage {
     if ($models.Count -eq 0) {
         $quotaExhausted = $false
         $blockedPrincipalsList = @()
-        if ($script:ProviderHealthPath -and (Test-Path -LiteralPath $script:ProviderHealthPath)) {
+        # qa/integration의 ModelChain은 Resolve-ProfileChain/Resolve-StageProfileSlots가 정적으로
+        # 미리 계산해 채워 넣으며(3370행 부근), 그 계산에는 provider-health.json 쿨다운이 관여하지
+        # 않는다 — family 충돌·알 수 없는 프로필로만 비워진다. impl만 Resolve-ModelChain 내부에서
+        # 쿨다운으로 필터링되어 0개가 될 수 있으므로(1167행), 쿼터 소진 판정도 impl로 한정한다.
+        # 그렇지 않으면 qa/integration의 family 충돌(모델 체인 비어있음)이 무관한 principal의
+        # 쿨다운과 우연히 겹칠 때 "쿼터 소진"으로 오분류되어 잘못된 재개 절차를 안내하게 된다.
+        if ($Stage -eq 'impl' -and $script:ProviderHealthPath -and (Test-Path -LiteralPath $script:ProviderHealthPath)) {
             try {
                 $health = Read-ProviderHealth -Path $script:ProviderHealthPath
                 foreach ($prop in @($health.providers.psobject.Properties)) {
@@ -3518,7 +3535,16 @@ function Invoke-DispatchChain {
         }
         $stagesToRun = @($allStages[$effectiveIndex..($allStages.Count - 1)])
         Write-Log "유효 시작 단계: $effectiveStage (완료 단계 재디스패치 금지)" INFO
-        Reset-ChainRuntime
+        # A task can resume at QA or Integration after a prior chain invocation.
+        # Preserve its per-stage runtime identities: resetting here would erase
+        # the logical predecessor before the adjacency check runs.
+        $existingRuntime = Read-ChainRuntime
+        if (-not $existingRuntime.stages.planning -and $script:PipelineRouting) {
+            $planningProfile = [string]$script:PipelineRouting.PlanningProfile
+            $planningModel = ''
+            if ($script:ProfileConfig.profiles.$planningProfile) { $planningModel = [string]$script:ProfileConfig.profiles.$planningProfile.model }
+            Record-ChainRuntime -Stage 'planning' -Model $planningModel -Status 'success' -Reason 'Runtime Role Binding planning identity' -ProfileName $planningProfile
+        }
         foreach ($stage in $stagesToRun) {
             if ($stage -ne $stagesToRun[0]) {
                 $adjCheck = Test-ChainAdjacency -Stage $stage
