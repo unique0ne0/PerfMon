@@ -3129,6 +3129,8 @@ function Validate-QaVerdict {
         if (-not [int]::TryParse([string]$VerdictObj.cycle, [ref]$verdictCycle) -or $verdictCycle -ne $ExpectedCycle) {
             $reasons += "cycle mismatch: expected=$ExpectedCycle actual=$($VerdictObj.cycle)"
         }
+    } else {
+        $reasons += 'cycle field missing'
     }
 
     # doneWhen 검사: satisfied가 boolean이 아닌 값 거부, 하나라도 false면 verdict=pass 차단
@@ -3137,7 +3139,12 @@ function Validate-QaVerdict {
         $doneWhenArr = @($VerdictObj.doneWhen)
         foreach ($dw in $doneWhenArr) {
             $itemId = $null
+            if ($null -eq $dw) {
+                $reasons += 'doneWhen contains null item'
+                continue
+            }
             if ($dw.PSObject.Properties.Name -contains 'item') { $itemId = [string]$dw.item }
+            if ([string]::IsNullOrWhiteSpace($itemId)) { $reasons += 'doneWhen item field missing or empty' }
             if ($itemId -and $seenItems.ContainsKey($itemId)) {
                 $reasons += "duplicate doneWhen item: $itemId"
             }
@@ -3149,8 +3156,12 @@ function Validate-QaVerdict {
                 } elseif ($satVal -eq $false -and [string]$VerdictObj.verdict -eq 'pass') {
                     $reasons += "contradiction: verdict=pass but doneWhen.satisfied=false for item=$itemId"
                 }
+            } else {
+                $reasons += "doneWhen.satisfied field missing for item=$itemId"
             }
         }
+    } else {
+        $reasons += 'doneWhen field missing'
     }
 
     # findings 필수 ID 누락·중복 검사
@@ -3168,13 +3179,20 @@ function Validate-QaVerdict {
                 $reasons += 'finding missing required id field'
             }
         }
+    } else {
+        $reasons += 'findings field missing'
     }
 
-    # Git 지문: verdict에 treeHash가 있으면 현재 HEAD와 비교
-    if ($VerdictObj.PSObject.Properties.Name -contains 'treeHash') {
-        $currentHead = (& git rev-parse HEAD 2>$null | Out-String).Trim()
-        if ($LASTEXITCODE -eq 0 -and [string]$VerdictObj.treeHash -ne $currentHead) {
-            $reasons += "treeHash mismatch: verdict=$($VerdictObj.treeHash) current=$currentHead"
+    # QA가 검토한 작업 트리 지문을 반드시 묶는다. HEAD만 비교하면 같은 커밋에서
+    # uncommitted 변경 후 오래된 pass가 재사용될 수 있으므로 Get-TreeState의 내용 지문을 쓴다.
+    if ($VerdictObj.PSObject.Properties.Name -notcontains 'treeHash' -or [string]::IsNullOrWhiteSpace([string]$VerdictObj.treeHash)) {
+        $reasons += 'treeHash field missing'
+    } else {
+        $treeState = Get-TreeState
+        if ($null -eq $treeState -or -not $treeState.FingerprintOk) {
+            $reasons += 'current worktree fingerprint could not be computed'
+        } elseif ([string]$VerdictObj.treeHash -ne [string]$treeState.Fingerprint) {
+            $reasons += "treeHash mismatch: verdict=$($VerdictObj.treeHash) current=$($treeState.Fingerprint)"
         }
     }
 
@@ -3184,7 +3202,7 @@ function Validate-QaVerdict {
 # ④ QA verdict 게이트: 이번 실행에서 새로 쓴 verdict가 pass일 때만 ⑤ 진행.
 # CFG066: Validate-QaVerdict로 판정 내용의 모순·일치성까지 검증한다.
 function Test-QaVerdict {
-    param([object]$QaDispatchedAt)
+    param([object]$QaDispatchedAt, [int]$ExpectedCycle = -1)
     $rel = $StageConfig['qa'].VerdictFile
     $vf = Resolve-RepoPath $rel
     if (-not (Test-Path $vf)) {
@@ -3208,6 +3226,45 @@ function Test-QaVerdict {
     }
     $verdictValue = [string]$verdictObj.verdict
 
+    # 현 QA 실행이 막 끝났을 때에만 하네스가 실제 작업 트리 지문을 봉인한다.
+    # 기존 산출물(Integration 단독 실행 등)은 절대 보완하지 않아, 오래된 pass를 새 상태에 재사용할 수 없다.
+    if ($verdictValue -eq 'pass' -and $null -ne $QaDispatchedAt -and
+        ($verdictObj.PSObject.Properties.Name -notcontains 'treeHash' -or [string]::IsNullOrWhiteSpace([string]$verdictObj.treeHash))) {
+        $treeState = Get-TreeState
+        if ($treeState -and $treeState.FingerprintOk) {
+            $verdictObj | Add-Member -NotePropertyName treeHash -NotePropertyValue ([string]$treeState.Fingerprint) -Force
+            Write-AtomicJson -Path $vf -Value $verdictObj -Depth 8
+        }
+    }
+
+    if ($ExpectedCycle -lt 0) {
+        # 호출자가 방금 실행한 QA cycle을 모르는 일반 조회(예: Set-CompletedStageApprovalsSuperseded,
+        # 통합 전 게이트)다. stage-state.json이 아직 'qa'를 가리키면 그 cycle을 신뢰하되, 파이프라인이
+        # 이미 다음 단계로 넘어갔거나 상태 파일이 없어 외부 근거가 없으면 verdict 자신이 기록한 cycle을
+        # 신뢰한다 — 무관한 단계로 전환됐다는 이유만으로 진짜 pass를 fail-closed 시키지 않는다.
+        # cycle 필드 자체가 없는 verdict는 Validate-QaVerdict가 별도로 거부한다.
+        $statePath = Resolve-RepoPath "$LogDir/$TaskId-stage-state.json"
+        $stateCycle = -1
+        try {
+            $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $parsedStateCycle = 0
+            if ([string]$state.stage -eq 'qa' -and [int]::TryParse([string]$state.cycle, [ref]$parsedStateCycle)) {
+                $stateCycle = $parsedStateCycle
+            }
+        } catch { }
+        if ($stateCycle -ge 0) {
+            $ExpectedCycle = $stateCycle
+        } else {
+            $selfCycle = 0
+            if ($verdictObj.PSObject.Properties.Name -contains 'cycle' -and [int]::TryParse([string]$verdictObj.cycle, [ref]$selfCycle)) {
+                $ExpectedCycle = $selfCycle
+            } else {
+                Write-Log "⚠️ QA verdict의 기대 cycle을 읽을 수 없음 — 안전상 ⑤ 중단" ERROR
+                return $false
+            }
+        }
+    }
+
     # CFG066: 합성 pass 차단 — synthetic=true이면 실제 QA 판정이 아니다.
     if ([bool]$verdictObj.synthetic -eq $true -and $verdictValue -eq 'pass') {
         Write-Log "⚠️ QA verdict가 합성(synthetic=true)인데 pass — 실제 QA 판정 없으므로 ⑤ 중단" ERROR
@@ -3215,8 +3272,7 @@ function Test-QaVerdict {
     }
 
     # CFG066 Done When 1: 심층 검증
-    $expectedCycle = 0
-    $validation = Validate-QaVerdict -VerdictObj $verdictObj -ExpectedTaskId $TaskId -ExpectedStage 'qa' -ExpectedCycle $expectedCycle
+    $validation = Validate-QaVerdict -VerdictObj $verdictObj -ExpectedTaskId $TaskId -ExpectedStage 'qa' -ExpectedCycle $ExpectedCycle
     if (-not $validation.Valid) {
         foreach ($r in $validation.Reasons) { Write-Log "⚠️ QA verdict 검증 실패: $r" ERROR }
         Write-Log "⚠️ QA verdict 심층 검증 실패($($validation.Reasons.Count)건) — 안전상 ⑤ 중단" ERROR
@@ -3714,7 +3770,7 @@ function Invoke-DispatchChain {
                 Write-Log "❌ [$stage] 파이프라인 중단 (상태: $chainState, 로그: $($StageConfig[$stage].LogFile))" ERROR
                 return 1
             }
-            if ($stage -eq 'qa' -and -not $DryRun -and -not (Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt)) {
+            if ($stage -eq 'qa' -and -not $DryRun -and -not (Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt -ExpectedCycle $result.CycleId)) {
                 $actualQaVerdict = $null
                 try {
                     $vfPath = Resolve-RepoPath ($StageConfig['qa'].VerdictFile)
@@ -3772,7 +3828,7 @@ function Invoke-DispatchChain {
         $result = Invoke-StageWithLock -Stage $singleStage -PromptOverride $Plan.Prompt -CheckPipelineBefore $true -CheckPipelinePacket $checkPipelinePacket
         $ok = $result.Success
         if ($ok -and $singleStage -eq 'qa' -and -not $DryRun) {
-            $ok = Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt
+            $ok = Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt -ExpectedCycle $result.CycleId
             if (-not $ok) { Write-FailureMarker -Stage 'qa' -Reason 'QA verdict 미통과 — ⑤ 진행 중단' }
             if ($ok -and $result.CycleId) { Resolve-ApprovalRecords -Stage 'qa' -ResolvingCycle $result.CycleId }
         }
