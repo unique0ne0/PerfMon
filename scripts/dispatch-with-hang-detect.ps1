@@ -3132,10 +3132,8 @@ function Validate-QaVerdict {
     }
 
     # doneWhen 검사: satisfied가 boolean이 아닌 값 거부, 하나라도 false면 verdict=pass 차단
-    $hasDoneWhen = $false
     $seenItems = @{}
     if ($VerdictObj.PSObject.Properties.Name -contains 'doneWhen') {
-        $hasDoneWhen = $true
         $doneWhenArr = @($VerdictObj.doneWhen)
         foreach ($dw in $doneWhenArr) {
             $itemId = $null
