@@ -28,7 +28,8 @@ function Write-HarnessStageState {
         [string[]]$EvidencePaths = @(),
         [string]$Reason = '',
         [string]$Model = $null,
-        [string]$Owner = 'dispatcher'
+        [string]$Owner = 'dispatcher',
+        [switch]$ManualIntervention
     )
     # A producer may not yet know its final model at the first state transition.
     # The shared schema still requires an explicit, non-empty value for dashboards
@@ -64,6 +65,7 @@ function Write-HarnessStageState {
         eventAt = $now
         evidencePaths = @($EvidencePaths)
         reason = $Reason
+        manualIntervention = [bool]$ManualIntervention
     }
     Write-AtomicJson -Path $Path -Value $value -Depth 6
 }

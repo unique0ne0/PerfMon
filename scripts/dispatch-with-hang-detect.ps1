@@ -211,9 +211,9 @@ function Resolve-RepoPath {
 }
 
 function Write-StageState {
-    param([string]$Stage, [int]$Cycle, [string]$State, [int]$ProcessId, [string[]]$EvidencePaths, [string]$Reason, [string]$Model)
+    param([string]$Stage, [int]$Cycle, [string]$State, [int]$ProcessId, [string[]]$EvidencePaths, [string]$Reason, [string]$Model, [switch]$ManualIntervention)
     $path = Resolve-RepoPath "$LogDir/$TaskId-stage-state.json"
-    Write-HarnessStageState -Path $path -TaskId $TaskId -Stage $Stage -Cycle $Cycle -State $State -ProcessId $ProcessId -EvidencePaths $EvidencePaths -Reason $Reason -Model $Model -Owner 'dispatcher'
+    Write-HarnessStageState -Path $path -TaskId $TaskId -Stage $Stage -Cycle $Cycle -State $State -ProcessId $ProcessId -EvidencePaths $EvidencePaths -Reason $Reason -Model $Model -Owner 'dispatcher' -ManualIntervention:$ManualIntervention
 }
 
 
@@ -3168,7 +3168,7 @@ function Invoke-ManualStageTermination {
     $target = if ($Complete) { 'completed' } else { 'failed' }
     $detail = if ([string]::IsNullOrWhiteSpace($ReasonText)) { '' } else { " — $ReasonText" }
     $reason = if ($Complete) { "수동 완료 — 사용자 권한으로 단계 실행 종결$detail" } else { "수동 중단 — 사용자 권한으로 실행 중단$detail" }
-    Write-StageState -Stage $Stage -Cycle $cycle -State $target -ProcessId $PID -EvidencePaths $evidence -Reason $reason -Model $null
+    Write-StageState -Stage $Stage -Cycle $cycle -State $target -ProcessId $PID -EvidencePaths $evidence -Reason $reason -Model $null -ManualIntervention
     $mark = if ($Complete) { '✅' } else { '❌' }
     Write-Log "$mark [$Stage] 수동 $(if ($Complete) { '완료' } else { '중단' }) — terminal lease '$target' 기록 (cycle $cycle, reason: $reason)" SUCCESS
     return 0
