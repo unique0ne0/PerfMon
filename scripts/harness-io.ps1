@@ -65,7 +65,10 @@ function Write-HarnessStageState {
         eventAt = $now
         evidencePaths = @($EvidencePaths)
         reason = $Reason
-        manualIntervention = [bool]$ManualIntervention
+        # stage-state는 작업당 최신 상태 하나만 보관한다. 이전 단계에서 수동으로
+        # 종결한 뒤 다음 단계가 자동으로 기록되더라도, 작업 단위 수동 개입률이
+        # 사라지지 않도록 이력 플래그를 단조롭게 보존한다.
+        manualIntervention = ([bool]$ManualIntervention -or ($previous -and [bool]$previous.manualIntervention))
     }
     Write-AtomicJson -Path $Path -Value $value -Depth 6
 }

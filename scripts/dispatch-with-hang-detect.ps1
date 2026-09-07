@@ -3111,11 +3111,12 @@ function Test-QaVerdict {
 # 실행 중('running'/'starting') lease가 아직 만료되지 않았거나 살아 있는 락이 있는지 판정한다.
 # 자동 재개(-Chain)가 이들을 "건드리지 않고" 멈추기 위한 가드다. stale(만료) lease나 종결
 # lease는 재개를 막지 않는다 — 그게 재개가 진행해야 할 대상이기 때문이다.
+# CFG071: -StagesToCheck 매개변수로 검사할 스테이지 집합을 좁힐 수 있다(기본값: 전체 3종).
 function Test-LiveStageActivity {
-    param([string]$TargetTaskId = $TaskId)
+    param([string]$TargetTaskId = $TaskId, [string[]]$StagesToCheck = @('impl','qa','integration'))
     $target = if ([string]::IsNullOrWhiteSpace($TargetTaskId)) { $TaskId } else { $TargetTaskId }
     $live = @()
-    foreach ($s in @('impl','qa','integration')) {
+    foreach ($s in $StagesToCheck) {
         $lock = Read-DispatchLock $s
         if ($lock -and $lock.Alive) { $live += "[$s] 살아있는 락 PID $($lock.ProcId)" }
         $leasePath = Resolve-RepoPath "$LogDir/$target-stage-state.json"
@@ -3510,16 +3511,17 @@ function Invoke-DispatchChain {
 
     if ($Plan.Chain) {
         Write-Log "📋 자동 연쇄 모드 시작 (TaskId: $($Plan.TaskId)): 패킷 첫 미완료 단계부터 수렴" INFO
-        $liveActivity = Test-LiveStageActivity
+        $chainPipelineBefore = Get-PacketPipelineStatus -PacketPath $checkPipelinePacket
+        $chainEffectiveStage = Get-EffectivePipelineStage -PipelineStatus $chainPipelineBefore
+        $stagesToCheck = if ($chainEffectiveStage) { @($chainEffectiveStage) } else { @('impl','qa','integration') }
+        $liveActivity = Test-LiveStageActivity -StagesToCheck $stagesToCheck
         if ($liveActivity) {
             Write-Log "⛔ 자동 연쇄/재개 중단 — 살아 있는 단계 실행이 있어 재개하지 않습니다: $liveActivity" ERROR
             Write-Log '살아 있는 lease·락·승인 대기를 보존한 채 종료합니다. 실행이 끝난 뒤 다시 재개하세요.' ERROR
-            $holdingPipeline = Get-PacketPipelineStatus -PacketPath $checkPipelinePacket
-            Write-ChainSummary -State 'blocked' -Stages @() -Warnings @("살아 있는 실행으로 인한 재개 보류 — $liveActivity") -StartedAt (Get-Date) -PipelineBefore $holdingPipeline -PipelineAfter $holdingPipeline -TreeBefore (Get-TreeState) -TreeAfter (Get-TreeState) -QaVerdict @{ verdict = $null; fresh = $false } | Out-Null
+            Write-ChainSummary -State 'blocked' -Stages @() -Warnings @("살아 있는 실행으로 인한 재개 보류 — $liveActivity") -StartedAt (Get-Date) -PipelineBefore $chainPipelineBefore -PipelineAfter $chainPipelineBefore -TreeBefore (Get-TreeState) -TreeAfter (Get-TreeState) -QaVerdict @{ verdict = $null; fresh = $false } | Out-Null
             return 1
         }
         $chainStartedAt = Get-Date
-        $chainPipelineBefore = Get-PacketPipelineStatus -PacketPath $checkPipelinePacket
         Set-CompletedStageApprovalsSuperseded -PipelineStatus $chainPipelineBefore -Evidence $checkPipelinePacket | Out-Null
         $chainTreeBefore = Get-TreeState
         $gateTier = Get-PacketGateTier -PacketPath $checkPipelinePacket
