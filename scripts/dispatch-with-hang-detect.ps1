@@ -2000,7 +2000,9 @@ function Invoke-VerifyGate {
     try {
         # See Invoke-StageProcess: keep the verify PowerShell invisible without mixing the
         # incompatible -WindowStyle Hidden and -NoNewWindow parameters on PS 5.1.
-        $verify = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $RepoRoot 'scripts\verify.ps1')) -PassThru -RedirectStandardOutput $verifyOut -RedirectStandardError $verifyErr
+        $verifyArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $RepoRoot 'scripts\verify.ps1'))
+        if ($Stage -eq 'integration') { $verifyArgs += '-NoSkip' }
+        $verify = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList $verifyArgs -PassThru -RedirectStandardOutput $verifyOut -RedirectStandardError $verifyErr
         $null = $verify.Handle
         if (-not $verify.WaitForExit($verifyMinutes * 60 * 1000)) {
             Stop-ProcessTree $verify.Id
