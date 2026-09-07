@@ -1843,11 +1843,13 @@ function Write-SyntheticQaVerdict {
     $verdictRel = $StageConfig['qa'].VerdictFile
     $verdictAbs = Resolve-RepoPath $verdictRel
     if (Test-Path -LiteralPath $verdictAbs) { return }
+    # CFG066 Done When 2: fail-open → fail-closed. verify 종료 코드만으로 pass를 합성하지 않는다.
+    # QA 모델이 실제로 검토하지 않아도 pass가 만들어지는 결함을 차단한다.
+    # CFG037/CFG038의 합성 원장·QA 무판단 집계 계약은 보존한다(synthetic/syntheticReason/findingsUnmeasured 필드 유지).
     $verdictValue = 'blocked'
     $reasonText = 'QA stage completed but no verdict file was written by the model'
     if ($Result.Success) {
-        $verdictValue = 'pass'
-        $reasonText = 'QA stage succeeded (verify passed) but model did not write verdict file — synthetic pass recorded by harness'
+        $reasonText = 'QA stage succeeded (verify passed) but model did not write verdict file — synthetic blocked recorded by harness (fail-closed: no actual QA judgment)'
     } elseif ($Result.FailureReason) {
         $reasonText = [string]$Result.FailureReason
     }
@@ -3082,7 +3084,107 @@ function Invoke-StageWithLock {
     }
 }
 
+# CFG066 Done When 1: QA 판정 심층 검증. Test-QaVerdict가 파일 존재·시각만 보던 것을
+# doneWhen 모순·taskId/stage/cycle 일치·스키마 허용 목록·satisfied boolean·필수 ID 누락·중복·
+# Git 지문·{verdict:"pass"}만으로 된 산출물 거부까지 확장한다.
+function Validate-QaVerdict {
+    param([object]$VerdictObj, [string]$ExpectedTaskId, [string]$ExpectedStage, [int]$ExpectedCycle)
+    $reasons = @()
+    if ($null -eq $VerdictObj) { return @{ Valid = $false; Reasons = @('verdict object is null') } }
+
+    # 스키마 버전 허용 목록
+    $allowedSchemas = @(2, 3)
+    $schemaVal = 0
+    $hasSchema = $false
+    if ($VerdictObj.PSObject.Properties.Name -contains 'schemaVersion') {
+        $hasSchema = [int]::TryParse([string]$VerdictObj.schemaVersion, [ref]$schemaVal)
+    }
+    if (-not $hasSchema -or $allowedSchemas -notcontains $schemaVal) {
+        $reasons += "schemaVersion missing or not in allowed list ($($allowedSchemas -join ','))"
+    }
+
+    # {verdict:"pass"}만 있는 산출물 거부 — doneWhen·findings 등 필수 필드 없이 verdict alone은 인정하지 않는다.
+    $propNames = @($VerdictObj.PSObject.Properties.Name)
+    if ($propNames.Count -le 1 -and $propNames -contains 'verdict') {
+        $reasons += 'verdict-only output is not accepted; doneWhen and findings fields are required'
+    }
+
+    # taskId·stage·cycle 일치
+    if ($VerdictObj.PSObject.Properties.Name -contains 'taskId') {
+        if ([string]$VerdictObj.taskId -ne $ExpectedTaskId) {
+            $reasons += "taskId mismatch: expected=$ExpectedTaskId actual=$($VerdictObj.taskId)"
+        }
+    } else {
+        $reasons += 'taskId field missing'
+    }
+    if ($VerdictObj.PSObject.Properties.Name -contains 'stage') {
+        if ([string]$VerdictObj.stage -ne $ExpectedStage) {
+            $reasons += "stage mismatch: expected=$ExpectedStage actual=$($VerdictObj.stage)"
+        }
+    } else {
+        $reasons += 'stage field missing'
+    }
+    if ($VerdictObj.PSObject.Properties.Name -contains 'cycle') {
+        $verdictCycle = 0
+        if (-not [int]::TryParse([string]$VerdictObj.cycle, [ref]$verdictCycle) -or $verdictCycle -ne $ExpectedCycle) {
+            $reasons += "cycle mismatch: expected=$ExpectedCycle actual=$($VerdictObj.cycle)"
+        }
+    }
+
+    # doneWhen 검사: satisfied가 boolean이 아닌 값 거부, 하나라도 false면 verdict=pass 차단
+    $hasDoneWhen = $false
+    $seenItems = @{}
+    if ($VerdictObj.PSObject.Properties.Name -contains 'doneWhen') {
+        $hasDoneWhen = $true
+        $doneWhenArr = @($VerdictObj.doneWhen)
+        foreach ($dw in $doneWhenArr) {
+            $itemId = $null
+            if ($dw.PSObject.Properties.Name -contains 'item') { $itemId = [string]$dw.item }
+            if ($itemId -and $seenItems.ContainsKey($itemId)) {
+                $reasons += "duplicate doneWhen item: $itemId"
+            }
+            if ($itemId) { $seenItems[$itemId] = $true }
+            if ($dw.PSObject.Properties.Name -contains 'satisfied') {
+                $satVal = $dw.satisfied
+                if ($satVal -isnot [bool]) {
+                    $reasons += "doneWhen.satisfied is not boolean for item=$itemId (value=$satVal, type=$($satVal.GetType().Name))"
+                } elseif ($satVal -eq $false -and [string]$VerdictObj.verdict -eq 'pass') {
+                    $reasons += "contradiction: verdict=pass but doneWhen.satisfied=false for item=$itemId"
+                }
+            }
+        }
+    }
+
+    # findings 필수 ID 누락·중복 검사
+    if ($VerdictObj.PSObject.Properties.Name -contains 'findings') {
+        $findingsArr = @($VerdictObj.findings)
+        $seenIds = @{}
+        foreach ($f in $findingsArr) {
+            if ($f.PSObject.Properties.Name -contains 'id') {
+                $fid = [string]$f.id
+                if ($seenIds.ContainsKey($fid)) {
+                    $reasons += "duplicate finding id: $fid"
+                }
+                $seenIds[$fid] = $true
+            } else {
+                $reasons += 'finding missing required id field'
+            }
+        }
+    }
+
+    # Git 지문: verdict에 treeHash가 있으면 현재 HEAD와 비교
+    if ($VerdictObj.PSObject.Properties.Name -contains 'treeHash') {
+        $currentHead = (& git rev-parse HEAD 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and [string]$VerdictObj.treeHash -ne $currentHead) {
+            $reasons += "treeHash mismatch: verdict=$($VerdictObj.treeHash) current=$currentHead"
+        }
+    }
+
+    return @{ Valid = ($reasons.Count -eq 0); Reasons = $reasons }
+}
+
 # ④ QA verdict 게이트: 이번 실행에서 새로 쓴 verdict가 pass일 때만 ⑤ 진행.
+# CFG066: Validate-QaVerdict로 판정 내용의 모순·일치성까지 검증한다.
 function Test-QaVerdict {
     param([object]$QaDispatchedAt)
     $rel = $StageConfig['qa'].VerdictFile
@@ -3099,14 +3201,32 @@ function Test-QaVerdict {
             return $false
         }
     }
+    $verdictObj = $null
     try {
-        $verdict = (Get-Content $vf -Raw -Encoding UTF8 | ConvertFrom-Json).verdict
+        $verdictObj = Get-Content $vf -Raw -Encoding UTF8 | ConvertFrom-Json
     } catch {
         Write-Log "⚠️ QA verdict JSON 파싱 실패 — 안전상 ⑤ 중단" ERROR
         return $false
     }
-    if ($verdict -eq 'pass') { Write-Log "✅ QA verdict=pass → ⑤ 진행" SUCCESS; return $true }
-    Write-Log "❌ QA verdict=$verdict → ⑤ 진행 중단 (QA 보고: $($StageConfig['qa'].ReportFile))" ERROR
+    $verdictValue = [string]$verdictObj.verdict
+
+    # CFG066: 합성 pass 차단 — synthetic=true이면 실제 QA 판정이 아니다.
+    if ([bool]$verdictObj.synthetic -eq $true -and $verdictValue -eq 'pass') {
+        Write-Log "⚠️ QA verdict가 합성(synthetic=true)인데 pass — 실제 QA 판정 없으므로 ⑤ 중단" ERROR
+        return $false
+    }
+
+    # CFG066 Done When 1: 심층 검증
+    $expectedCycle = 0
+    $validation = Validate-QaVerdict -VerdictObj $verdictObj -ExpectedTaskId $TaskId -ExpectedStage 'qa' -ExpectedCycle $expectedCycle
+    if (-not $validation.Valid) {
+        foreach ($r in $validation.Reasons) { Write-Log "⚠️ QA verdict 검증 실패: $r" ERROR }
+        Write-Log "⚠️ QA verdict 심층 검증 실패($($validation.Reasons.Count)건) — 안전상 ⑤ 중단" ERROR
+        return $false
+    }
+
+    if ($verdictValue -eq 'pass') { Write-Log "✅ QA verdict=pass → ⑤ 진행" SUCCESS; return $true }
+    Write-Log "❌ QA verdict=$verdictValue → ⑤ 진행 중단 (QA 보고: $($StageConfig['qa'].ReportFile))" ERROR
     return $false
 }
 

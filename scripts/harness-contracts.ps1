@@ -75,23 +75,38 @@ function Get-RuntimeRoleBinding {
     }
     if (-not $PacketPath -or -not (Test-Path -LiteralPath $PacketPath)) { return [pscustomobject]$result }
     $text = Get-Content -LiteralPath $PacketPath -Raw -Encoding UTF8
-    $profileMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+Planning\s+Profile|actual\s+planning\s+profile)\s*:\s*`?([^`\r\n]+)`?\s*$')
-    $adapterMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+Planning\s+Adapter|actual\s+planning\s+adapter)\s*:\s*`?([^`\r\n]+)`?\s*$')
-    $qaProfileMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+QA\s+Profile|actual\s+qa\s+profile)\s*:\s*`?([^`\r\n]+)`?\s*$')
-    $qaAdapterMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+QA\s+Adapter|actual\s+qa\s+adapter)\s*:\s*`?([^`\r\n]+)`?\s*$')
-    $integrationProfileMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+Integration\s+Profile|actual\s+integration\s+profile)\s*:\s*`?([^`\r\n]+)`?\s*$')
-    $integrationAdapterMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+Integration\s+Adapter|actual\s+integration\s+adapter)\s*:\s*`?([^`\r\n]+)`?\s*$')
-    $implRouteMatch = [regex]::Match($text, '(?im)^-\s*(?:Actual\s+Implementation\s+Route|actual\s+implementation\s+route)\s*:\s*`?([^`\r\n]+)`?\s*$')
-    $ackMatch = [regex]::Match($text, '(?im)^-\s*(?:Role\s+Contention\s+Ack|role\s+contention\s+ack)\s*:\s*`?([^`\r\n]+)`?\s*$')
-    $legacyMatch = [regex]::Match($text, '(?im)^-\s*legacy\s+packet\s*:\s*`?(true|false)`?\s*$')
+
+    # CFG066 Done When 4: ## Runtime Role Binding 섹션으로 스코프 한정
+    # Get-PacketPipelineStatus와 동일 패턴 — Amendments·예시 블록·인용문 매치를 방지한다.
+    $sectionMatch = [regex]::Match($text, '(?ms)^##\s+Runtime Role Binding\s*$\r?\n(.*?)(?=^##\s+|\z)')
+    if (-not $sectionMatch.Success) { return [pscustomobject]$result }
+    $sectionText = $sectionMatch.Groups[1].Value
+
+    $profileMatch = [regex]::Match($sectionText, '(?im)^-\s*(?:Actual\s+Planning\s+Profile|actual\s+planning\s+profile)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $adapterMatch = [regex]::Match($sectionText, '(?im)^-\s*(?:Actual\s+Planning\s+Adapter|actual\s+planning\s+adapter)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $qaProfileMatch = [regex]::Match($sectionText, '(?im)^-\s*(?:Actual\s+QA\s+Profile|actual\s+qa\s+profile)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $qaAdapterMatch = [regex]::Match($sectionText, '(?im)^-\s*(?:Actual\s+QA\s+Adapter|actual\s+qa\s+adapter)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $integrationProfileMatch = [regex]::Match($sectionText, '(?im)^-\s*(?:Actual\s+Integration\s+Profile|actual\s+integration\s+profile)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $integrationAdapterMatch = [regex]::Match($sectionText, '(?im)^-\s*(?:Actual\s+Integration\s+Adapter|actual\s+integration\s+adapter)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $implRouteMatch = [regex]::Match($sectionText, '(?im)^-\s*(?:Actual\s+Implementation\s+Route|actual\s+implementation\s+route)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $ackMatch = [regex]::Match($sectionText, '(?im)^-\s*(?:Role\s+Contention\s+Ack|role\s+contention\s+ack)\s*:\s*`?([^`\r\n]+)`?\s*$')
+    $legacyMatch = [regex]::Match($sectionText, '(?im)^-\s*legacy\s+packet\s*:\s*`?(true|false)`?\s*$')
 
     $result.Present = $profileMatch.Success -or $adapterMatch.Success -or $qaProfileMatch.Success -or $qaAdapterMatch.Success -or $integrationProfileMatch.Success -or $integrationAdapterMatch.Success -or $implRouteMatch.Success -or $ackMatch.Success -or $legacyMatch.Success
-    if ($legacyMatch.Success) { $result.Legacy = $legacyMatch.Groups[1].Value -eq 'true' }
+
+    # CFG066 Done When 3: 필드가 하나라도 있으면 레거시가 아니다(명시적 선언이 있으면 따름).
+    # 하나라도 있는데 쌍이 안 맞거나 필드가 빠지면 Valid=false + 비어 있지 않은 Error.
+    if ($legacyMatch.Success) {
+        $result.Legacy = $legacyMatch.Groups[1].Value -eq 'true'
+    } else {
+        $result.Legacy = -not $result.Present
+    }
+
     if ($ackMatch.Success) { $result.RoleContentionAck = $ackMatch.Groups[1].Value.Trim() }
 
     # Planning pair check
     if (-not ($profileMatch.Success -and $adapterMatch.Success)) {
-        if ($result.Present -and -not $result.Legacy) { $result.Error = 'Runtime Role Binding must contain both actual planning profile and adapter.' }
+        if ($result.Present) { $result.Error = 'Runtime Role Binding must contain both actual planning profile and adapter.' }
         return [pscustomobject]$result
     }
 
