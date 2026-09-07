@@ -246,7 +246,10 @@ function Invoke-SessionHealthCheck {
         }
         $warnings = @(& powershell @healthArgs 2>&1)
         foreach ($warning in $warnings) {
-            if (-not [string]::IsNullOrWhiteSpace([string]$warning)) { Write-Log "[$Stage] $warning" WARN }
+            if (-not [string]::IsNullOrWhiteSpace([string]$warning)) {
+                Write-Log "[$Stage] $warning" WARN
+                Write-Warning "[$Stage] $warning"
+            }
         }
     } catch {
         Write-Log "[$Stage] session-health advisory check failed: $($_.Exception.Message)" WARN

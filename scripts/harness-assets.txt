@@ -16,6 +16,7 @@ model-profiles.json
 model-profile.ps1
 orchestrate-packet.ps1
 session-health.ps1
+session-health-hook.ps1
 gy-orchestrator-prompt.md
 commit-harness-sync.ps1
 task-status.ps1
