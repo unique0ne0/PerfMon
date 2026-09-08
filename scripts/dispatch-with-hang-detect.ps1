@@ -2938,6 +2938,11 @@ function Dispatch-Stage {
         return (Show-StageDryRun -Stage $Stage -Config $config -LogRel $logRel -PromptOverride $PromptOverride -Model $models[0] -BypassToolPermissions $BypassToolPermissions)
     }
     $cycle = Initialize-StageDispatch -Stage $Stage -Config $config -LogRel $logRel
+    # CFG073: QA agent가 추측하지 않도록, cycle을 할당한 뒤 실제 값을 기본 프롬프트에 넣는다.
+    # PromptOverride는 호출자의 명시적 지시이므로 덮어쓰지 않는다.
+    if ($Stage -eq 'qa' -and [string]::IsNullOrWhiteSpace($PromptOverride)) {
+        $PromptOverride = "$($config.DefaultPrompt) 이번 QA verdict JSON의 cycle은 $($cycle.Id)로 기록해."
+    }
     $qaDispatchedAt = Clear-QaArtifacts -Stage $Stage -Config $config
     Invoke-SessionHealthCheck -Stage $Stage
     $preflight = Invoke-StagePreflightGate -Stage $Stage -config $config -Cycle $cycle -LogRel $logRel -qaDispatchedAt $qaDispatchedAt
@@ -3304,30 +3309,35 @@ function Repair-QaVerdictStageCycle {
             }
         } catch { }
     }
+    # verdict는 Set-QaVerdictStageHarnessFlag/treeHash 봉인 경로와 공유된다. 호출자가
+    # 읽어 온 $VerdictObj를 다시 쓰면 그 사이 추가된 필드를 잃을 수 있으므로, 파일 안의
+    # 최신 객체를 같은 path RMW mutex 아래에서 보정한다.
     $changed = $false
-    $currentStage = $null
-    if ($VerdictObj.PSObject.Properties.Name -contains 'stage') {
-        $currentStage = [string]$VerdictObj.stage
-    }
-    if ($currentStage -ne $actualStage) {
-        $VerdictObj | Add-Member -NotePropertyName 'stage' -NotePropertyValue $actualStage -Force
-        $changed = $true
-    }
-    if ($null -ne $actualCycle) {
-        $currentCycle = $null
-        if ($VerdictObj.PSObject.Properties.Name -contains 'cycle') {
-            $parsedCurrent = 0
-            if ([int]::TryParse([string]$VerdictObj.cycle, [ref]$parsedCurrent)) {
-                $currentCycle = $parsedCurrent
+    $script:cfg073RepairChanged = $false
+    Write-AtomicRMW -Path $VerdictPath -Transform {
+        param($current)
+        if ($null -eq $current) { return $null }
+        $currentStage = if ($current.PSObject.Properties.Name -contains 'stage') { [string]$current.stage } else { $null }
+        if ($currentStage -ne $actualStage) {
+            $current | Add-Member -NotePropertyName 'stage' -NotePropertyValue $actualStage -Force
+            $script:cfg073RepairChanged = $true
+        }
+        if ($null -ne $actualCycle) {
+            $currentCycle = $null
+            if ($current.PSObject.Properties.Name -contains 'cycle') {
+                $parsedCurrent = 0
+                if ([int]::TryParse([string]$current.cycle, [ref]$parsedCurrent)) { $currentCycle = $parsedCurrent }
+            }
+            if ($null -eq $currentCycle -or $currentCycle -ne $actualCycle) {
+                $current | Add-Member -NotePropertyName 'cycle' -NotePropertyValue $actualCycle -Force
+                $script:cfg073RepairChanged = $true
             }
         }
-        if ($null -eq $currentCycle -or $currentCycle -ne $actualCycle) {
-            $VerdictObj | Add-Member -NotePropertyName 'cycle' -NotePropertyValue $actualCycle -Force
-            $changed = $true
-        }
-    }
+        return $current
+    } -Depth 8
+    $changed = [bool]$script:cfg073RepairChanged
+    Remove-Variable -Name cfg073RepairChanged -Scope Script -ErrorAction SilentlyContinue
     if ($changed) {
-        Write-AtomicJson -Path $VerdictPath -Value $VerdictObj -Depth 8
         Write-Log "✅ QA verdict stage/cycle 자동 보정 (stage=$actualStage, cycle=$actualCycle)" INFO
     }
     return $changed
