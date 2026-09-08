@@ -136,7 +136,7 @@ $StageConfig = @{
     }
     'qa' = @{
         Command = ''
-        DefaultPrompt = "작업 $TaskId — 개발팀의 1차 구현과 자체 리뷰가 완료되었어. Handoff 확인하고 제로베이스에서 구현 및 코드 품질에 대해 리뷰해. 리뷰 시작 전 패킷의 Done When 항목을 전부 나열하고, 각 항목마다 실제 diff·코드 근거와 diff 밖이라도 이 변경이 영향을 주는 호출부·계약·회귀 테스트를 함께 확인해 개별 충족 여부를 검증해 — 근거 없이 통째로 '완료'로 넘기지 마. Done When 항목 하나가 여러 지점·형제 분기·유사 파일 등 다수 인스턴스를 포괄하면 대표 1건 확인으로 전체를 만족시켰다고 판단하지 말고 그 개수만큼 각각 실제 근거를 남겨. 근거는 패킷의 구현 노트·자체 리뷰 서술을 그대로 인정하지 말고 반드시 현재 작업 트리의 실제 코드·파일을 직접 열어 대조한 결과여야 해 — 서술과 실제 코드가 다를 수 있다는 전제로 검증해. 발견한 결함은 직접 수정한 뒤, 당신이 수정하거나 기록(메모·로그 추가 포함)을 남긴 모든 파일은 git diff로 스스로 재검토해 history.md·backlog.md 같은 누적 기록 파일을 실수로 통째로 덮어쓰거나 삭제하지 않았는지 확인하고, scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ④를 갱신해. 마지막으로 QA 판정을 .agents/briefs/logs/$TaskId-qa-verdict.json 파일에 JSON으로 남겨 — schemaVersion은 3으로, findings 배열에는 당신이 발견한 결함을 각각 {id, severity, confidenceTier, doneWhenItem, description, fixedInQa, evidence} 형태로 개별 기록해(fixedInQa:true는 당신이 직접 수정했음을 뜻하며, 수정했더라도 findings에서 빠지면 안 된다). confidenceTier는 'RESOLVED'(코드 정적 대조 확정), 'OBSERVED'(테스트/실행 관측), 'CANDIDATE'(미실행 잠재 추론) 중 하나여야 하며, CANDIDATE 단독 지적은 verdict를 blocked로 만들지 않는다(RESOLVED/OBSERVED만 확정 결함으로 blocked 사유가 됨). doneWhen 배열에 각 항목을 {item, satisfied, evidence} 형태로 개별 기록하고, 하나라도 satisfied가 false면 verdict는 반드시 blocked여야 해. 빈 findings 배열은 '결함을 하나도 발견하지 못했다'는 적극적 진술이며, 결함을 고쳐 놓고 findings를 비워 두는 것은 기록 위반으로 간주된다. ⑤ 진행 가능하면 verdict를 pass, 차단성 이슈로 ⑤ 진행 불가면 verdict를 blocked(사유는 reason)로 기록해"
+        DefaultPrompt = "작업 $TaskId — 개발팀의 1차 구현과 자체 리뷰가 완료되었어. Handoff 확인하고 제로베이스에서 구현 및 코드 품질에 대해 리뷰해. 리뷰 시작 전 패킷의 Done When 항목을 전부 나열하고, 각 항목마다 실제 diff·코드 근거와 diff 밖이라도 이 변경이 영향을 주는 호출부·계약·회귀 테스트를 함께 확인해 개별 충족 여부를 검증해 — 근거 없이 통째로 '완료'로 넘기지 마. Done When 항목 하나가 여러 지점·형제 분기·유사 파일 등 다수 인스턴스를 포괄하면 대표 1건 확인으로 전체를 만족시켰다고 판단하지 말고 그 개수만큼 각각 실제 근거를 남겨. 근거는 패킷의 구현 노트·자체 리뷰 서술을 그대로 인정하지 말고 반드시 현재 작업 트리의 실제 코드·파일을 직접 열어 대조한 결과여야 해 — 서술과 실제 코드가 다를 수 있다는 전제로 검증해. 발견한 결함은 직접 수정한 뒤, 당신이 수정하거나 기록(메모·로그 추가 포함)을 남긴 모든 파일은 git diff로 스스로 재검토해 history.md·backlog.md 같은 누적 기록 파일을 실수로 통째로 덮어쓰거나 삭제하지 않았는지 확인하고, scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ④를 갱신해. 마지막으로 QA 판정을 .agents/briefs/logs/$TaskId-qa-verdict.json 파일에 JSON으로 남겨 — schemaVersion은 3으로, stage는 `"qa`"로, cycle은 현재 사이클 번호로, findings 배열에는 당신이 발견한 결함을 각각 {id, severity, confidenceTier, doneWhenItem, description, fixedInQa, evidence} 형태로 개별 기록해(fixedInQa:true는 당신이 직접 수정했음을 뜻하며, 수정했더라도 findings에서 빠지면 안 된다). confidenceTier는 'RESOLVED'(코드 정적 대조 확정), 'OBSERVED'(테스트/실행 관측), 'CANDIDATE'(미실행 잠재 추론) 중 하나여야 하며, CANDIDATE 단독 지적은 verdict를 blocked로 만들지 않는다(RESOLVED/OBSERVED만 확정 결함으로 blocked 사유가 됨). doneWhen 배열에 각 항목을 {item, satisfied, evidence} 형태로 개별 기록하고, 하나라도 satisfied가 false면 verdict는 반드시 blocked여야 해. 빈 findings 배열은 '결함을 하나도 발견하지 못했다'는 적극적 진술이며, 결함을 고쳐 놓고 findings를 비워 두는 것은 기록 위반으로 간주된다. ⑤ 진행 가능하면 verdict를 pass, 차단성 이슈로 ⑤ 진행 불가면 verdict를 blocked(사유는 reason)로 기록해"
         LogFile = "$TaskLogPrefix-qa.log"
         ReportFile = "$TaskLogPrefix-qa-last.md"
         VerdictFile = "$TaskLogPrefix-qa-verdict.json"
@@ -3281,6 +3281,58 @@ function Invoke-StageWithLock {
     }
 }
 
+# CFG073: QA 에이전트가 stage/cycle을 누락하거나 잘못 써도 하네스가 직접 보정한다.
+# Validate-QaVerdict 호출 이전에 실행되어, 이 두 필드만 수정한다 — 다른 필드는 절대 건드리지 않는다.
+# 값이 이미 맞으면 파일을 재저장하지 않는다(mtime·treeHash 오염 방지).
+function Repair-QaVerdictStageCycle {
+    param([string]$VerdictPath, [object]$VerdictObj, [int]$ExpectedCycle)
+    $actualStage = 'qa'
+    $actualCycle = $null
+    if ($ExpectedCycle -ge 0) {
+        $actualCycle = $ExpectedCycle
+    } else {
+        $statePath = Resolve-RepoPath "$LogDir/$TaskId-stage-state.json"
+        try {
+            if (Test-Path -LiteralPath $statePath) {
+                $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ([string]$state.stage -eq 'qa') {
+                    $parsedCycle = 0
+                    if ([int]::TryParse([string]$state.cycle, [ref]$parsedCycle)) {
+                        $actualCycle = $parsedCycle
+                    }
+                }
+            }
+        } catch { }
+    }
+    $changed = $false
+    $currentStage = $null
+    if ($VerdictObj.PSObject.Properties.Name -contains 'stage') {
+        $currentStage = [string]$VerdictObj.stage
+    }
+    if ($currentStage -ne $actualStage) {
+        $VerdictObj | Add-Member -NotePropertyName 'stage' -NotePropertyValue $actualStage -Force
+        $changed = $true
+    }
+    if ($null -ne $actualCycle) {
+        $currentCycle = $null
+        if ($VerdictObj.PSObject.Properties.Name -contains 'cycle') {
+            $parsedCurrent = 0
+            if ([int]::TryParse([string]$VerdictObj.cycle, [ref]$parsedCurrent)) {
+                $currentCycle = $parsedCurrent
+            }
+        }
+        if ($null -eq $currentCycle -or $currentCycle -ne $actualCycle) {
+            $VerdictObj | Add-Member -NotePropertyName 'cycle' -NotePropertyValue $actualCycle -Force
+            $changed = $true
+        }
+    }
+    if ($changed) {
+        Write-AtomicJson -Path $VerdictPath -Value $VerdictObj -Depth 8
+        Write-Log "✅ QA verdict stage/cycle 자동 보정 (stage=$actualStage, cycle=$actualCycle)" INFO
+    }
+    return $changed
+}
+
 # CFG066 Done When 1: QA 판정 심층 검증. Test-QaVerdict가 파일 존재·시각만 보던 것을
 # doneWhen 모순·taskId/stage/cycle 일치·스키마 허용 목록·satisfied boolean·필수 ID 누락·중복·
 # Git 지문·{verdict:"pass"}만으로 된 산출물 거부까지 확장한다.
@@ -3421,6 +3473,10 @@ function Test-QaVerdict {
         Write-Log "⚠️ QA verdict JSON 파싱 실패 — 안전상 ⑤ 중단" ERROR
         return $false
     }
+    # CFG073: stage/cycle 자동 보정 — Validate-QaVerdict 호출 이전, treeHash 봉인 이전.
+    # 이 두 필드만 수정하며, 다른 필드(taskId·schemaVersion·findings 등)는 절대 건드리지 않는다.
+    Repair-QaVerdictStageCycle -VerdictPath $vf -VerdictObj $verdictObj -ExpectedCycle $ExpectedCycle | Out-Null
+    $verdictObj = Get-Content -LiteralPath $vf -Raw -Encoding UTF8 | ConvertFrom-Json
     $verdictValue = [string]$verdictObj.verdict
 
     # 현 QA 실행이 막 끝났을 때에만 하네스가 실제 작업 트리 지문을 봉인한다.
