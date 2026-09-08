@@ -24,5 +24,12 @@ sweep-orphan-browsers.ps1
 stage-thresholds.json
 harness-contracts.ps1
 harness-io.ps1
+harness-lock.ps1
+harness-ledger.ps1
+harness-verdict.ps1
+harness-stage-engine.ps1
+harness-model-chain.ps1
+harness-session-continuation.ps1
+harness-dispatch-core.ps1
 agy-models.txt
 harness-assets.txt
