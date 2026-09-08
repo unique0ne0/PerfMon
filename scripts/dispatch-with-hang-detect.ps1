@@ -2167,11 +2167,15 @@ function Test-ProtocolPollution {
     return @{ Polluted = $false }
 }
 
-function Invoke-VerifyGate {
-    param([string]$Stage)
+function Invoke-VerifyGateCore {
+    param([string]$Stage, [string]$AttemptLabel)
 
-    Write-Log "검증 게이트(scripts/verify.ps1) 실행..." INFO
-    $verifyLogRel = "$LogDir/$TaskId-verify-$Stage.log"
+    Write-Log "검증 게이트(scripts/verify.ps1) 실행${AttemptLabel}..." INFO
+    # CFG074: 재시도 시도는 별도 파일에 남긴다 — 같은 경로에 덮어쓰면 최초(스퓨리어스일 수 있는)
+    # 실패의 verify.ps1 출력이 재검증 통과와 동시에 사라져, 나중에 CFG-BL-047 근본 원인을
+    # 진단할 유일한 증거가 소실된다.
+    $verifyLogSuffix = if ($AttemptLabel) { '-retry' } else { '' }
+    $verifyLogRel = "$LogDir/$TaskId-verify-$Stage$verifyLogSuffix.log"
     $verifyLogAbs = Resolve-RepoPath $verifyLogRel
     # PS 5.1: 이 파일은 전역이 $ErrorActionPreference='Stop'인데, native 명령의 stderr를 2>&1로
     # 성공 스트림에 합치면 stderr 한 줄마다 NativeCommandError가 terminating error로 승격된다.
@@ -2192,7 +2196,7 @@ function Invoke-VerifyGate {
         if (-not $verify.WaitForExit($verifyMinutes * 60 * 1000)) {
             Stop-ProcessTree $verify.Id
             Write-Log "❌ [$Stage] verify 게이트가 ${verifyMinutes}분 안에 끝나지 않아 종료했습니다" ERROR
-            return @{ Success = $false; FailureReason = 'verify 게이트 시간 초과' }
+            return @{ Success = $false; FailureReason = 'verify 게이트 시간 초과'; Output = @() }
         }
         $verifyExit = $verify.ExitCode
         $verifyEncoding = [Console]::OutputEncoding
@@ -2211,10 +2215,34 @@ function Invoke-VerifyGate {
         Write-Log "❌ [$Stage] 검증 게이트 실패 — verify 로그: $verifyLogRel" ERROR
         Write-Log "마지막 30줄:" WARN
         $verifyOutput | Select-Object -Last 30 | ForEach-Object { Write-Host "    $_" }
-        return @{ Success = $false; FailureReason = "verify 게이트 실패 ($verifyLogRel)" }
+        return @{ Success = $false; FailureReason = "verify 게이트 실패 ($verifyLogRel)"; Output = $verifyOutput }
     }
 
-    return @{ Success = $true; FailureReason = $null }
+    return @{ Success = $true; FailureReason = $null; Output = $verifyOutput }
+}
+
+# CFG074: 에이전트 프로세스 종료 직후 디스패처가 실행하는 후속 verify.ps1 게이트가
+# 스퓨리어스 FAIL하는 현상( CFG-BL-047)의 완화책. 최초 실패 시 정확히 1회 단독 재검증 후
+# 통과하면 정상 진행, 재실패하면 진짜 실패로 확정한다. 재시도 여부는 모두 로그에 남아
+# 감사 가능해야 한다(조용히 감춰지지 않게).
+function Invoke-VerifyGate {
+    param([string]$Stage)
+
+    $firstResult = Invoke-VerifyGateCore -Stage $Stage -AttemptLabel ''
+    if ($firstResult.Success) {
+        return @{ Success = $true; FailureReason = $null; Retried = $false; RetryRecovered = $false }
+    }
+
+    Write-Log "⚠️ [$Stage] 검증 게이트 최초 실패 — 자동 단독 재검증 시작 (상한 1회, CFG074)" WARN
+    $retryResult = Invoke-VerifyGateCore -Stage $Stage -AttemptLabel ' (자동 재검증)'
+
+    if ($retryResult.Success) {
+        Write-Log "✅ [$Stage] 검증 게이트 자동 재검증 통과 — 최초 실패는 스퓨리어스로 판단, 정상 진행 (CFG074)" SUCCESS
+        return @{ Success = $true; FailureReason = $null; Retried = $true; RetryRecovered = $true }
+    }
+
+    Write-Log "❌ [$Stage] 검증 게이트 자동 재검증도 실패 — 진짜 실패로 확정 (CFG074)" ERROR
+    return @{ Success = $false; FailureReason = $retryResult.FailureReason; Retried = $true; RetryRecovered = $false }
 }
 
 # 경량 등급 선언 여부만 읽는다 — Pipeline Status ④ 체크와 별개 신호로, 둘 다 있어야 QA 스킵이 성립한다.
@@ -3055,23 +3083,29 @@ function Dispatch-Stage {
         if ($Stage -eq 'integration') {
             Write-Log '⛔ [integration] 검증 실패 — 완료 정리 금지 (⑤ 체크·router DONE·아카이브·완료 커밋 불가, 패킷 미완료 유지)' ERROR
         }
-        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $verifyResult.FailureReason -Model $model
-        Record-ChainRuntime -Stage $Stage -Model $model -Status 'failed' -Reason $verifyResult.FailureReason
-        return @{ Success = $false; FailureReason = $verifyResult.FailureReason; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
+        $failReason = $verifyResult.FailureReason
+        if ($verifyResult.Retried) { $failReason = "$failReason (auto-retry also failed)" }
+        Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $failReason -Model $model
+        Record-ChainRuntime -Stage $Stage -Model $model -Status 'failed' -Reason $failReason
+        return @{ Success = $false; FailureReason = $failReason; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
     }
 
     # CFG017: 이전 승인 대기 상태가 fresh cycle 성공 시 resolved로 해소된다 (qa는 verdict 통과 후 별도 해소).
     if ($Stage -ne 'qa') { Resolve-ApprovalRecords -Stage $Stage -ResolvingCycle $cycle.Id }
     Warn-UnchangedTree -Stage $Stage -Before $before
 
+    $successReason = 'stage succeeded and verify passed'
+    if ($verifyResult.Retried -and $verifyResult.RetryRecovered) {
+        $successReason = 'stage succeeded and verify passed (auto-retry after spurious failure)'
+    }
     Write-Log "✅ [$Stage] 성공 + 검증 통과" SUCCESS
     # CFG042 완료 정리 경계 ②: Integration이 검증 게이트를 통과한 이 지점에 이르러서야 완료 정리
     # (⑤ 체크·router DONE·아카이브 이동·완료 커밋·push)가 허용된다. 이 경계 앞에서는 할 수 없다.
     if ($Stage -eq 'integration') {
         Write-Log '✅ [integration] 검증 성공 — 완료 정리 허용 (⑤ 체크·router DONE·아카이브·완료 커밋 가능)' INFO
     }
-    Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'completed' -ProcessId $PID -EvidencePaths @($logRel) -Reason 'stage succeeded and verify passed' -Model $model
-    Record-ChainRuntime -Stage $Stage -Model $model -Status 'success' -Reason 'stage succeeded and verify passed'
+    Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'completed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $successReason -Model $model
+    Record-ChainRuntime -Stage $Stage -Model $model -Status 'success' -Reason $successReason
     return @{ Success = $true; FailureReason = $null; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
 }
 #endregion 디스패치 본체
