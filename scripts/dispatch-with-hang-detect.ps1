@@ -652,9 +652,6 @@ function Read-DispatchLock {
 function Remove-StaleDispatchLock {
     param([hashtable]$Lock)
 
-    # Serialize stale cleanup against other cleaners. Without the exclusive open,
-    # two dispatchers can both read an old lock; one replaces it and the other then
-    # deletes the newly-created live lock (read/remove TOCTOU).
     $stream = $null
     try {
         $stream = [System.IO.File]::Open($Lock.Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
@@ -665,6 +662,18 @@ function Remove-StaleDispatchLock {
         return $false
     } finally {
         if ($stream) { $stream.Dispose() }
+    }
+
+    $stream2 = $null
+    try {
+        $stream2 = [System.IO.File]::Open($Lock.Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+        $reader2 = New-Object System.IO.StreamReader($stream2, [System.Text.Encoding]::UTF8, $true, 1024, $true)
+        try { $reverifyRaw = $reader2.ReadToEnd().Trim() } finally { $reader2.Dispose() }
+        if ($reverifyRaw -ne $Lock.Raw) { return $false }
+    } catch [System.IO.IOException] {
+        return $false
+    } finally {
+        if ($stream2) { $stream2.Dispose() }
     }
 
     try {
@@ -748,10 +757,50 @@ function Find-PacketByTaskId {
     return $null
 }
 
+function Get-AdmissionMutexName {
+    $repoRoot = if ($script:RepoRoot) { $script:RepoRoot } else { '.' }
+    try {
+        $absRoot = (Resolve-Path $repoRoot -ErrorAction Stop).Path
+    } catch {
+        $absRoot = [System.IO.Path]::GetFullPath($repoRoot)
+    }
+    $hashBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($absRoot.ToLowerInvariant()))
+    $hash = [System.BitConverter]::ToString($hashBytes).Replace('-','').Substring(0, 16)
+    return "Local\dispatch-admission-$hash"
+}
+
+function Enter-AdmissionMutex {
+    $mutexName = Get-AdmissionMutexName
+    $createdNew = $false
+    $mutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$createdNew)
+    $timeoutMs = 10000
+    if (-not $mutex.WaitOne($timeoutMs)) {
+        $mutex.Dispose()
+        return $null
+    }
+    return $mutex
+}
+
+function Exit-AdmissionMutex {
+    param([System.Threading.Mutex]$Mutex)
+    if ($null -eq $Mutex) { return }
+    try { $Mutex.ReleaseMutex() } catch { }
+    try { $Mutex.Dispose() } catch { }
+}
+
 function Enter-DispatchLock {
     param([string]$Stage, [string]$PacketPath)
     $logDirAbs = Resolve-RepoPath $LogDir
     if (-not (Test-Path $logDirAbs)) { New-Item -ItemType Directory -Path $logDirAbs -Force | Out-Null }
+
+    $admissionMutex = Enter-AdmissionMutex
+    if ($null -eq $admissionMutex) {
+        $mutexName = Get-AdmissionMutexName
+        Write-Log "⛔ [$Stage] admission 뮤텍스 획득 타임아웃(10초) — 다른 프로세스가 보유 중이거나 시스템 부하가 높습니다. 재시도하세요. (name: $mutexName)" ERROR
+        Write-BlockedMarker -Stage $Stage -Reason 'Admission mutex timeout (10s)' -OwnerTaskId '-' -OwnerProcessId '-'
+        return $false
+    }
+    try {
 
     foreach ($s in @('impl','qa','integration')) {
         $lock = Read-DispatchLock $s
@@ -759,12 +808,20 @@ function Enter-DispatchLock {
         if (-not $lock.Alive) {
             if (Remove-StaleDispatchLock -Lock $lock) {
                 Write-Log "스테일 락 정리: [$s] PID $($lock.ProcId) 는 이미 종료됨" INFO
-            } else {
-                Write-Log "⛔ [$s] 락 상태가 정리 중 변경되었습니다. 새 소유자를 지우지 않도록 중단하고 재시도를 요구합니다." ERROR
-                Write-BlockedMarker -Stage $Stage -Reason '스테일 락 정리 중 상태 변경' -OwnerTaskId '-' -OwnerProcessId '-'
-                return $false
+                continue
             }
-            continue
+            $reRead = Read-DispatchLock $s
+            if ($reRead -and $reRead.Alive) {
+                $lock = $reRead
+            } else {
+                if ($s -eq $Stage) {
+                    Write-Log "⛔ [$s] 스테일 락 정리 실패 후 재확인 불가 — 자기 단계이므로 차단" ERROR
+                    Write-BlockedMarker -Stage $Stage -Reason '스테일 락 정리 실패 (자기 단계)' -OwnerTaskId '-' -OwnerProcessId '-'
+                    return $false
+                }
+                Write-Log "⚠️ [$s] 스테일 락 정리 실패 — 무관한 단계이므로 계속 진행" WARN
+                continue
+            }
         }
         if ($s -eq $Stage) {
             Write-Log "⛔ [$Stage]가 이 저장소에서 이미 실행 중 — 작업 $($lock.TaskId), PID $($lock.ProcId), 시작 $($lock.StartedAt)" ERROR
@@ -858,6 +915,10 @@ function Enter-DispatchLock {
         Write-Log "⛔ [$Stage] 락 파일 생성 경합 후 상태를 확정할 수 없습니다. 재시도하세요." ERROR
         Write-BlockedMarker -Stage $Stage -Reason '락 파일 생성 경합 후 점유자 상태를 확정할 수 없음' -OwnerTaskId '-' -OwnerProcessId '-'
         return $false
+    }
+
+    } finally {
+        Exit-AdmissionMutex -Mutex $admissionMutex
     }
 }
 
@@ -2358,9 +2419,12 @@ function Set-QaVerdictStageHarnessFlag {
     $verdictAbs = Resolve-RepoPath $verdictRel
     if (Test-Path -LiteralPath $verdictAbs) {
         try {
-            $obj = Get-Content -LiteralPath $verdictAbs -Raw -Encoding UTF8 | ConvertFrom-Json
-            $obj | Add-Member -NotePropertyName stageCheckedByHarness -NotePropertyValue $true -Force
-            Write-AtomicJson -Path $verdictAbs -Value $obj -Depth 8
+            Write-AtomicRMW -Path $verdictAbs -Transform {
+                param($obj)
+                if ($null -eq $obj) { $obj = [ordered]@{} }
+                $obj | Add-Member -NotePropertyName stageCheckedByHarness -NotePropertyValue $true -Force
+                return $obj
+            } -Depth 8
             Write-Log "⚠️ [qa] verdict에 stageCheckedByHarness=true 기록 — 하네스가 ④를 대신 체크했습니다" WARN
         } catch {
             Write-Log "[qa] stageCheckedByHarness 기록 실패($verdictAbs): $($_.Exception.Message)" WARN

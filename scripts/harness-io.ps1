@@ -17,6 +17,39 @@ function Write-AtomicJson {
     Move-Item -LiteralPath $temporary -Destination $Path -Force
 }
 
+function Write-AtomicRMW {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][scriptblock]$Transform,
+        [int]$Depth = 6,
+        [int]$TimeoutMs = 5000
+    )
+    $absPath = $Path
+    if (-not [System.IO.Path]::IsPathRooted($absPath)) {
+        $absPath = [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $absPath))
+    }
+    $hashBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($absPath.ToLowerInvariant()))
+    $hash = [System.BitConverter]::ToString($hashBytes).Replace('-','').Substring(0, 16)
+    $mutexName = "Local\harness-rmw-$hash"
+    $createdNew = $false
+    $rmwMutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$createdNew)
+    try {
+        if (-not $rmwMutex.WaitOne($TimeoutMs)) {
+            throw "RMW mutex timeout (${TimeoutMs}ms) for $absPath (name: $mutexName)"
+        }
+        $current = $null
+        if (Test-Path -LiteralPath $absPath) {
+            try { $current = Get-Content -LiteralPath $absPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $current = $null }
+        }
+        $newValue = & $Transform $current
+        if ($null -eq $newValue) { return }
+        Write-AtomicJson -Path $absPath -Value $newValue -Depth $Depth
+    } finally {
+        try { $rmwMutex.ReleaseMutex() } catch { }
+        try { $rmwMutex.Dispose() } catch { }
+    }
+}
+
 function Write-HarnessStageState {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -31,46 +64,46 @@ function Write-HarnessStageState {
         [string]$Owner = 'dispatcher',
         [switch]$ManualIntervention
     )
-    # A producer may not yet know its final model at the first state transition.
-    # The shared schema still requires an explicit, non-empty value for dashboards
-    # and downstream tooling, so encode that fact rather than serializing $null.
     if ([string]::IsNullOrWhiteSpace($Model)) { $Model = 'unknown' }
-    $previous = $null
-    try { if (Test-Path -LiteralPath $Path) { $previous = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json } } catch { }
-    # 사이클은 단계마다 독립적으로 증가하므로 비교를 같은 단계로 한정한다. 같은 단계의 늦은
-    # 과거 사이클 기록만 거부하고, 새 단계(impl→qa→integration)는 이전 단계 lease를 대체한다.
-    # CFG020: impl cycle 5 완료 후 qa cycle 1이 이전 단계 cycle에 막혀 'starting'을 쓰지 못하면
-    # 대시보드가 실제 진행 중인 qa를 이전 단계 상태로 계속 보여주는 오탐이 생긴다.
-    $sameStage = $previous -and ([string]$previous.stage -eq $Stage)
-    $previousCycle = 0
-    $cycleInt = 0
-    if ($sameStage -and [int]::TryParse([string]$previous.cycle, [ref]$previousCycle) -and [int]::TryParse([string]$Cycle, [ref]$cycleInt) -and $previousCycle -gt $cycleInt) { return }
-    $sequence = if ($previous -and $previous.sequence) { [int]$previous.sequence + 1 } else { 1 }
-    $now = [datetime]::UtcNow.ToString('o')
-    $sameCycle = $sameStage -and ($previous -and [string]$previous.cycle -eq [string]$Cycle)
-    $wasRunning = $previous -and ([string]$previous.state -match '^(starting|running)$')
-    $startedAt = if ($sameCycle -and $wasRunning -and $previous.startedAt) { [string]$previous.startedAt } else { $now }
-    $value = [ordered]@{
-        schemaVersion = 1
-        taskId = $TaskId
-        stage = $Stage
-        cycle = $Cycle
-        sequence = $sequence
-        state = $State
-        owner = $Owner
-        pid = $ProcessId
-        model = $Model
-        startedAt = $startedAt
-        heartbeatAt = $now
-        eventAt = $now
-        evidencePaths = @($EvidencePaths)
-        reason = $Reason
-        # stage-state는 작업당 최신 상태 하나만 보관한다. 이전 단계에서 수동으로
-        # 종결한 뒤 다음 단계가 자동으로 기록되더라도, 작업 단위 수동 개입률이
-        # 사라지지 않도록 이력 플래그를 단조롭게 보존한다.
-        manualIntervention = ([bool]$ManualIntervention -or ($previous -and [bool]$previous.manualIntervention))
-    }
-    Write-AtomicJson -Path $Path -Value $value -Depth 6
+    $capturedTaskId = $TaskId
+    $capturedStage = $Stage
+    $capturedCycle = $Cycle
+    $capturedState = $State
+    $capturedProcessId = $ProcessId
+    $capturedEvidencePaths = @($EvidencePaths)
+    $capturedReason = $Reason
+    $capturedModel = $Model
+    $capturedOwner = $Owner
+    $capturedManualIntervention = [bool]$ManualIntervention
+    Write-AtomicRMW -Path $Path -Transform {
+        param($previous)
+        $sameStage = $previous -and ([string]$previous.stage -eq $capturedStage)
+        $previousCycle = 0
+        $cycleInt = 0
+        if ($sameStage -and [int]::TryParse([string]$previous.cycle, [ref]$previousCycle) -and [int]::TryParse([string]$capturedCycle, [ref]$cycleInt) -and $previousCycle -gt $cycleInt) { return $null }
+        $sequence = if ($previous -and $previous.sequence) { [int]$previous.sequence + 1 } else { 1 }
+        $now = [datetime]::UtcNow.ToString('o')
+        $sameCycle = $sameStage -and ($previous -and [string]$previous.cycle -eq [string]$capturedCycle)
+        $wasRunning = $previous -and ([string]$previous.state -match '^(starting|running)$')
+        $startedAt = if ($sameCycle -and $wasRunning -and $previous.startedAt) { [string]$previous.startedAt } else { $now }
+        return [ordered]@{
+            schemaVersion = 1
+            taskId = $capturedTaskId
+            stage = $capturedStage
+            cycle = $capturedCycle
+            sequence = $sequence
+            state = $capturedState
+            owner = $capturedOwner
+            pid = $capturedProcessId
+            model = $capturedModel
+            startedAt = $startedAt
+            heartbeatAt = $now
+            eventAt = $now
+            evidencePaths = $capturedEvidencePaths
+            reason = $capturedReason
+            manualIntervention = ($capturedManualIntervention -or ($previous -and [bool]$previous.manualIntervention))
+        }
+    } -Depth 6
 }
 
 
