@@ -139,3 +139,20 @@ function Get-RuntimeRoleBinding {
     return [pscustomobject]$result
 }
 
+function Get-PacketScopePaths {
+    param([string]$PacketPath)
+    if (-not $PacketPath -or -not (Test-Path -LiteralPath $PacketPath)) { return $null }
+    foreach ($line in Get-Content -LiteralPath $PacketPath -Encoding UTF8) {
+        if ($line -match '^\s*-\s*Scope paths:\s*(.+)$') {
+            $pathsStr = $Matches[1]
+            $paths = @()
+            $regex = [regex]'`([^`]+)`'
+            foreach ($m in $regex.Matches($pathsStr)) {
+                $paths += $m.Groups[1].Value
+            }
+            return $paths
+        }
+    }
+    return $null
+}
+

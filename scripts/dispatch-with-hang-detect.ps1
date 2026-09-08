@@ -675,8 +675,81 @@ function Remove-StaleDispatchLock {
     }
 }
 
+function Get-ChangedFileSnapshot {
+    $snapshot = @{ Head = $null; Files = @{} }
+    try {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $snapshot.Head = (git -C (Resolve-RepoPath '.') rev-parse HEAD 2>$null | Out-String).Trim()
+            $files = @(
+                git -C (Resolve-RepoPath '.') diff --name-only HEAD 2>$null
+                git -C (Resolve-RepoPath '.') ls-files --others --exclude-standard 2>$null
+            ) | Where-Object { $_ }
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+        foreach ($file in ($files | Sort-Object -Unique)) {
+            $path = Join-Path (Resolve-RepoPath '.') $file
+            $snapshot.Files[$file -replace '\\', '/'] = if (Test-Path -LiteralPath $path -PathType Leaf) { (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash } else { $null }
+        }
+    } catch { }
+    return $snapshot
+}
+
+function Get-ScopeDriftWarnings {
+    param([string]$PacketPath, [hashtable]$BeforeSnapshot)
+    if (-not $PacketPath) { return @() }
+    $scopePaths = Get-PacketScopePaths -PacketPath $PacketPath
+    if ($null -eq $scopePaths -or $scopePaths.Count -eq 0) { return @() }
+    $changedFiles = @()
+    try {
+        $afterSnapshot = Get-ChangedFileSnapshot
+        if ($BeforeSnapshot) {
+            $candidateFiles = @($BeforeSnapshot.Files.Keys + $afterSnapshot.Files.Keys | Sort-Object -Unique)
+            foreach ($file in $candidateFiles) {
+                $beforeHash = if ($BeforeSnapshot.Files.ContainsKey($file)) { $BeforeSnapshot.Files[$file] } else { $null }
+                $afterHash = if ($afterSnapshot.Files.ContainsKey($file)) { $afterSnapshot.Files[$file] } else { $null }
+                if ($beforeHash -ne $afterHash) { $changedFiles += $file }
+            }
+            if ($BeforeSnapshot.Head -and $afterSnapshot.Head -and $BeforeSnapshot.Head -ne $afterSnapshot.Head) {
+                $changedFiles += @(git -C (Resolve-RepoPath '.') diff --name-only $BeforeSnapshot.Head $afterSnapshot.Head 2>$null)
+            }
+        } else {
+            $changedFiles = @($afterSnapshot.Files.Keys)
+        }
+    } catch { $changedFiles = @() }
+    if ($changedFiles.Count -eq 0) { return @() }
+    $drift = @()
+    foreach ($f in $changedFiles) {
+        $normalized = $f -replace '\\', '/'
+        $inScope = $false
+        foreach ($sp in $scopePaths) {
+            $spNorm = $sp -replace '\\', '/'
+            if ($normalized -eq $spNorm -or $normalized.StartsWith("$spNorm/") -or $spNorm.StartsWith("$normalized/")) {
+                $inScope = $true
+                break
+            }
+        }
+        if (-not $inScope) { $drift += $normalized }
+    }
+    return $drift
+}
+
+function Find-PacketByTaskId {
+    param([string]$SearchTaskId, [string]$ProjectPath)
+    if (-not $SearchTaskId) { return $null }
+    foreach ($dir in @('packets', 'archive')) {
+        $fullDir = Join-Path $ProjectPath ".agents\briefs\$dir"
+        if (-not (Test-Path -LiteralPath $fullDir)) { continue }
+        $matched = @(Get-ChildItem -Path $fullDir -Filter "$SearchTaskId-*.md" -File -ErrorAction SilentlyContinue)
+        if ($matched.Count -gt 0) { return $matched[0].FullName }
+    }
+    return $null
+}
+
 function Enter-DispatchLock {
-    param([string]$Stage)
+    param([string]$Stage, [string]$PacketPath)
     $logDirAbs = Resolve-RepoPath $LogDir
     if (-not (Test-Path $logDirAbs)) { New-Item -ItemType Directory -Path $logDirAbs -Force | Out-Null }
 
@@ -707,6 +780,57 @@ function Enter-DispatchLock {
         }
         Write-Log "⚠️ 같은 저장소에서 [$s](작업 $($lock.TaskId))가 병행 중 — §3.9 상한표상 N=2 조건부 구간" WARN
         Write-Log "⚠️ 무변경 감지·기준점 롤백이 무력화되고, verify가 남의 중간 상태 때문에 실패할 수 있습니다." WARN
+    }
+
+    # ── Scope paths 겹침 차단 (CFG072) ──────────────────────────────────────
+    # 서로 다른 패킷이 같은 파일을 건드리는 것을 admission 단계에서 방지한다.
+    # 기존 락 체크는 같은 스테이지·integration 배타만 보았으나, 서로 다른 스테이지라도
+    # Scope paths가 겹치면 병합 충돌 위험이 있다(CFG069+CFG071 사례).
+    try {
+        $myScopePaths = $null
+        if ($PacketPath) {
+            $myScopePaths = Get-PacketScopePaths -PacketPath $PacketPath
+        }
+        if ($null -ne $myScopePaths -and $myScopePaths.Count -gt 0) {
+            $repoRoot = Resolve-RepoPath '.'
+            foreach ($s in @('impl','qa','integration')) {
+                $existingLock = Read-DispatchLock $s
+                if ($null -eq $existingLock -or -not $existingLock.Alive) { continue }
+                if ($existingLock.TaskId -eq $TaskId) { continue }
+                $otherPacket = Find-PacketByTaskId -SearchTaskId $existingLock.TaskId -ProjectPath $repoRoot
+                if (-not $otherPacket) {
+                    Write-Log "⚠️ [$s] 작업 $($existingLock.TaskId)의 패킷을 찾을 수 없음 — Scope 비교 건너뜀" WARN
+                    continue
+                }
+                $otherScopePaths = $null
+                try {
+                    $otherScopePaths = Get-PacketScopePaths -PacketPath $otherPacket
+                } catch {
+                    Write-Log "⚠️ [$s] 작업 $($existingLock.TaskId) Scope paths 파싱 예외 — 허용 쪽으로 fail: $($_.Exception.Message)" WARN
+                    continue
+                }
+                if ($null -eq $otherScopePaths -or $otherScopePaths.Count -eq 0) {
+                    Write-Log "⚠️ [$s] 작업 $($existingLock.TaskId)에 Scope paths 선언 없음 — 차단하지 않음" WARN
+                    continue
+                }
+                $overlap = @($myScopePaths | Where-Object {
+                    $mine = $_ -replace '\\', '/'
+                    @($otherScopePaths | Where-Object {
+                        $theirs = $_ -replace '\\', '/'
+                        $mine -eq $theirs -or $mine.StartsWith("$theirs/") -or $theirs.StartsWith("$mine/")
+                    }).Count -gt 0
+                })
+                if ($overlap.Count -gt 0) {
+                    $overlapList = $overlap -join ', '
+                    Write-Log "⛔ [$Stage] Scope paths 겹침 — 작업 $($existingLock.TaskId)와 [$overlapList] 공유" ERROR
+                    Write-Log "§3.9: 서로 다른 패킷이 같은 파일을 건드리면 병합 충돌이 난다. 먼저 끝난 뒤 실행하세요." ERROR
+                    Write-BlockedMarker -Stage $Stage -Reason "Scope paths 겹침: 작업 $($existingLock.TaskId) — [$overlapList]" -OwnerTaskId $existingLock.TaskId -OwnerProcessId $existingLock.ProcId
+                    return $false
+                }
+            }
+        }
+    } catch {
+        Write-Log "⚠️ Scope overlap 검사 중 예외 — 허용 쪽으로 fail: $($_.Exception.Message)" WARN
     }
 
     # 재실행은 이전 실패 판정을 무효화한다 — 대시보드가 RUNNING 옆에 낡은 FAILED를 같이 들고 있지 않도록.
@@ -3061,8 +3185,9 @@ function Invoke-StageWithLock {
     param([string]$Stage, [string]$PromptOverride, [bool]$CheckPipelineBefore, [string]$CheckPipelinePacket)
     if ($DryRun) { return (Dispatch-Stage -Stage $Stage -PromptOverride $PromptOverride) }
     # 락 획득 실패는 이 작업의 실패가 아니라 "지금은 때가 아님"이므로 마커를 남기지 않는다.
-    if (-not (Enter-DispatchLock -Stage $Stage)) { return $false }
+    if (-not (Enter-DispatchLock -Stage $Stage -PacketPath $CheckPipelinePacket)) { return $false }
     try {
+        $scopeSnapshot = Get-ChangedFileSnapshot
         if ($CheckPipelineBefore) { Test-RequestedPipelineStage -Stage $Stage -PacketPath $CheckPipelinePacket }
         # 성공/실패 어느 쪽이든 마커 상태를 확정한다 — 실패는 다음 실행까지 눈에 남고, 성공은 즉시 지운다.
         $result = Dispatch-Stage -Stage $Stage -PromptOverride $PromptOverride
@@ -3071,6 +3196,12 @@ function Invoke-StageWithLock {
         Ensure-QaLedger -Stage $Stage -Result $result
         if ($result.Success) { Test-PipelineStageUpdated -Stage $Stage -PacketPath $CheckPipelinePacket }
         if ($result.Success) { Clear-FailureMarker -Stage $Stage }
+        if ($result.Success) {
+            $drift = Get-ScopeDriftWarnings -PacketPath $CheckPipelinePacket -BeforeSnapshot $scopeSnapshot
+            if ($drift.Count -gt 0) {
+                Write-Log "⚠️ [$Stage] Scope 범위 이탈 감지 — 선언된 Scope paths 밖 파일 변경: $($drift -join ', ')" WARN
+            }
+        }
         elseif ($result.Outcome -eq 'approval_required') {
             # CFG017: 승인 대기는 failure 마커를 남기지 않는다 — 승인 기록 파일 자체가 상태·감사 증거다.
             # 자동 재시도 계기가 될 만한 "실패" 흔적을 남기지 않기 위함이다.
@@ -3709,6 +3840,17 @@ function Invoke-DispatchChain {
         $effectiveStage = Get-EffectivePipelineStage -PipelineStatus $chainPipelineBefore
         $allStages = @('impl','qa','integration')
         $effectiveIndex = [array]::IndexOf($allStages, $effectiveStage)
+        foreach ($fs in $allStages) {
+            $fsIdx = [array]::IndexOf($allStages, $fs)
+            if ($effectiveIndex -ge 0 -and $fsIdx -ge $effectiveIndex) { break }
+            $failedMarkerPath = Resolve-RepoPath "$LogDir/.dispatch-failed-$TaskId-$fs"
+            if (Test-Path -LiteralPath $failedMarkerPath) {
+                Write-Log "⚠️ [$fs] 체크박스는 완료로 표시되었으나 실패 마커가 해소되지 않음 — 이 단계부터 재개" WARN
+                $effectiveStage = $fs
+                $effectiveIndex = $fsIdx
+                break
+            }
+        }
         if ($effectiveIndex -lt 0) {
             Write-ChainSummary -State 'completed' -Stages @() -Warnings @('packet has no incomplete executable stage') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter $chainPipelineBefore -TreeBefore $chainTreeBefore -TreeAfter $chainTreeBefore -QaVerdict $chainQaVerdict | Out-Null
             Write-Log '✅ 패킷에 미완료 실행 단계가 없습니다 — 재디스패치 없이 종료' SUCCESS

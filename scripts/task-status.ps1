@@ -71,7 +71,9 @@ function Test-HarnessOverrideState {
     $entries = @($OverrideLookup[$key])
     if ($entries.Count -ne 1 -or $entries[0].localOverride -ne $true -or [string]::IsNullOrWhiteSpace([string]$entries[0].lastSyncedHash)) { return $false }
     $copy = Join-Path $Target "scripts\$Asset"
-    return (Test-Path -LiteralPath $copy) -and ((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne $Master)
+    if (-not (Test-Path -LiteralPath $copy)) { return $false }
+    try { return (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne $Master }
+    catch { return $false }
 }
 $harnessIoModule = $null
 if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $harnessIoModule = Join-Path $PSScriptRoot 'harness-io.ps1' }
@@ -109,10 +111,16 @@ function Get-HarnessSyncSummary {
     foreach ($proj in $harnessProjects) {
         foreach ($asset in $assets) {
             $master = Join-Path $masterDir $asset
-            $masterHash = (Get-FileHash -LiteralPath $master -Algorithm SHA256).Hash
+            # 대시보드는 읽기 전용 모니터라 활성 git/디스패치가 이 파일을 쥐고 있는 순간과 겹치는 건
+            # 정상 상황이다. 예외를 삼키고 이번 틱은 건너뛴다 — 5초 뒤 다음 틱에서 락이 풀려 있으면
+            # 정상 판정된다. 여기서 죽으면 WinForms Timer.Tick 핸들러까지 예외가 올라가 앱 전체가
+            # 크래시한다(2026-09-08 실제 크래시 덤프로 확인: file in use → ActionPreferenceStopException).
+            try { $masterHash = (Get-FileHash -LiteralPath $master -Algorithm SHA256).Hash }
+            catch { continue }
             $copy = Join-Path $proj "scripts\$asset"
             if (-not (Test-Path -LiteralPath $copy)) { $drifts += "$proj|$asset (missing)"; continue }
-            $copyHash = (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash
+            try { $copyHash = (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash }
+            catch { continue }
             if ($copyHash -eq $masterHash) { $checked++; continue }
             if (Test-HarnessOverrideState -OverrideLookup $overrideLookup -Target $proj -Asset $asset -Master $masterHash) {
                 $overrides += "$proj|$asset"
@@ -584,7 +592,11 @@ function Get-RawTaskStates {
             # 락이 살아 있으면 상태와 무관하게 보여준다 — 실행 중인 프로세스를 숨기는 것이 더 위험하고,
             # 장기보류·DONE 패킷에서 도는 디스패치는 그 자체가 규칙 위반이라 오히려 눈에 띄어야 한다.
             # 대신 라우터가 뭐라고 말하는지를 활동 칸에 적어 정상 진행과 구분되게 한다.
-            $note = if ($routerStatus) { "⚠ 라우터 상태 $routerStatus — ACTIVE 아님" } else { '⚠ 라우터에 행 없음' }
+            $orphanLock = $locks[$orphanId]
+            $isStaleDone = $routerStatus -eq 'DONE' -and $orphanLock -and -not $orphanLock.Alive
+            $note = if ($isStaleDone) { 'ℹ️ 정리 대기 — 다음 디스패치 시 자동 정리됨' }
+                    elseif ($routerStatus) { "⚠ 라우터 상태 $routerStatus — ACTIVE 아님" }
+                    else { '⚠ 라우터에 행 없음' }
             $known += $orphanNorm
             $tasks += [pscustomobject]@{
                 TaskId = $orphanId
