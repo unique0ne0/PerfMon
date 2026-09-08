@@ -3429,8 +3429,20 @@ function Test-QaVerdict {
         ($verdictObj.PSObject.Properties.Name -notcontains 'treeHash' -or [string]::IsNullOrWhiteSpace([string]$verdictObj.treeHash))) {
         $treeState = Get-TreeState
         if ($treeState -and $treeState.FingerprintOk) {
-            $verdictObj | Add-Member -NotePropertyName treeHash -NotePropertyValue ([string]$treeState.Fingerprint) -Force
-            Write-AtomicJson -Path $vf -Value $verdictObj -Depth 8
+            # 다른 하네스 경로(Set-QaVerdictStageHarnessFlag 등)가 verdict를 동시에 보강할 수
+            # 있으므로, treeHash 봉인도 반드시 동일한 path 단위 RMW mutex 안에서 수행한다.
+            # 여기서 일반 원자 쓰기를 쓰면, 이미 읽어 둔 $verdictObj가 동시 갱신 필드를 덮어쓸 수 있다.
+            Write-AtomicRMW -Path $vf -Transform {
+                param($current)
+                if ($null -eq $current) { return $null }
+                if ([string]$current.verdict -ne 'pass') { return $current }
+                if ($current.PSObject.Properties.Name -contains 'treeHash' -and -not [string]::IsNullOrWhiteSpace([string]$current.treeHash)) { return $current }
+                $current | Add-Member -NotePropertyName treeHash -NotePropertyValue ([string]$treeState.Fingerprint) -Force
+                return $current
+            } -Depth 8
+            # RMW 중 병행 보강된 필드까지 반영한 실제 파일을 이후 verdict 검증에 사용한다.
+            $verdictObj = Get-Content -LiteralPath $vf -Raw -Encoding UTF8 | ConvertFrom-Json
+            $verdictValue = [string]$verdictObj.verdict
         }
     }
 
