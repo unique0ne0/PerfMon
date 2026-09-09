@@ -957,6 +957,15 @@ function Get-TaskStatuses {
     }
     return $rows
 }
+# claude-zen-fallback/lib/routing-plan.mjs의 tierCoolingDown()과 동일 판정 — 실제 프록시가 라우팅에
+# 쓰는 기준을 그대로 이식한다. status가 'exhausted'여도 resetTime이 이미 지났으면 더 이상 쿨다운
+# 중이 아니라고 본다(단, 그 이후 실제 재시도로 갱신된 건 아니므로 '확정 정상'과는 구분해 표시한다).
+function Test-ZenTierCoolingDown {
+    param($Tier)
+    if (-not $Tier -or $Tier.status -ne 'exhausted') { return $false }
+    if (-not $Tier.resetTime) { return $false }
+    try { return ([datetime]$Tier.resetTime).ToLocalTime() -gt (Get-Date) } catch { return $false }
+}
 # 방어체계 및 시스템 건강 요약 — OpenCode 쿼터/티어 상태, 세션 연속 활동 시간, 승인 대기 집계.
 function Get-DefenseHealthSummary {
     param([string[]]$Projects)
@@ -968,29 +977,35 @@ function Get-DefenseHealthSummary {
         try {
             $zen = Get-Content -LiteralPath $zenStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
             $parts = @()
+            $estimatedNotes = @()
             if ($zen.tiers) {
                 if ($zen.tiers.go) {
-                    $goStatus = if ($zen.tiers.go.status -eq 'exhausted') {
-                        $resetMsg = if ($zen.resetTime) {
-                            try {
-                                $dt = [datetime]$zen.resetTime
-                                $diff = $dt.ToLocalTime() - (Get-Date)
-                                if ($diff.TotalMinutes -gt 0) {
-                                    $d = [math]::Floor($diff.TotalDays)
-                                    $h = $diff.Hours
-                                    if ($d -gt 0) { " (리셋: ${d}일 ${h}시간)" } else { " (리셋: ${h}시간)" }
-                                } else { " (리셋 대기)" }
-                            } catch { " (리셋: $([string]$zen.resetTime))" }
-                        } else { '' }
+                    $goTier = $zen.tiers.go
+                    $goStatus = if (Test-ZenTierCoolingDown -Tier $goTier) {
+                        $dt = ([datetime]$goTier.resetTime).ToLocalTime()
+                        $diff = $dt - (Get-Date)
+                        $d = [math]::Floor($diff.TotalDays)
+                        $h = $diff.Hours
+                        $resetMsg = if ($d -gt 0) { " (리셋: ${d}일 ${h}시간)" } else { " (리셋: ${h}시간)" }
                         "Go: 소진$resetMsg"
+                    } elseif ($goTier.status -eq 'exhausted') {
+                        $estimatedNotes += 'Go'
+                        "Go: 정상(추정)"
                     } else { "Go: 정상" }
                     $parts += $goStatus
                 }
                 if ($zen.tiers.free) {
-                    $freeStatus = if ($zen.tiers.free.status -eq 'exhausted') { "Free: 소진" } else { "Free: 정상" }
+                    $freeTier = $zen.tiers.free
+                    $freeStatus = if (Test-ZenTierCoolingDown -Tier $freeTier) {
+                        "Free: 소진"
+                    } elseif ($freeTier.status -eq 'exhausted') {
+                        $estimatedNotes += 'Free'
+                        "Free: 정상(추정)"
+                    } else { "Free: 정상" }
                     $parts += $freeStatus
                 }
                 if ($zen.tiers.paid) {
+                    # paid는 잔액 소진이라 시간 기반 리셋 개념이 없다 — resetTime 재해석 대상에서 제외.
                     $paidStatus = if ($zen.tiers.paid.status -eq 'exhausted') { "Paid: 잔액소진" } else { "Paid: 정상" }
                     $parts += $paidStatus
                 }
@@ -1001,6 +1016,9 @@ function Get-DefenseHealthSummary {
                 $tierStatus = "OpenCode: $($zen.status) ($($zen.model))"
             }
             $tierToolTip = "OpenCode 쿼터 상태: $($zenStatePath)`n마지막 시도: $($zen.lastAttemptAt)`n카테고리: $($zen.category)"
+            if ($estimatedNotes.Count -gt 0) {
+                $tierToolTip += "`n(추정) " + ($estimatedNotes -join ', ') + ": 리셋 예정 시각은 지났으나 그 이후 실제 재시도가 없어 확정 갱신은 안 됨"
+            }
             if ($zen.lastError) { $tierToolTip += "`n오류: $($zen.lastError)" }
         } catch { }
     }
