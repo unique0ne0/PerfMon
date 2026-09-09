@@ -236,6 +236,37 @@ function Test-StageDeadlineElapsed {
     return @{ Action = 'die'; Message = "⛔ 하드 상한 초과 [$Stage] — $why; 경과 ${spent}분, 로그 ${LogSize} B, 트리 CPU +$([math]::Round($CpuNow.TotalSeconds, 2))s; 프로세스 트리 종료" }
 }
 
+# CFG077 (CFG-BL-047): 에이전트 단계 종료 직후 하네스가 호출하는 post-hoc verify
+# 게이트의 스퓨리어스 FAIL을 막는다. $proc.WaitForExit()는 직계 자식(에이전트 셸)만
+# 기다린다 — 에이전트가 자기 턴 안에서 스폰한 손자 프로세스(테스트 러너·브라우저·
+# python 등)는 부모가 종료돼도 잠시 살아남아, 하네스가 그 직후 곧바로 verify.ps1을
+# 호출하면 파일 핸들·포트·CPU를 놓고 경합해 게이트가 일시 실패한다(CFG077 재현으로
+# 확정). 여기서는 루트 종료 시점의 자손 PID 집합을 캡처해 그들이 완전히 정리될
+# 때까지 짧은 상한(기본 수 초) 안에서 기다린다 — 경계 확정·비차단이며, 정리되지
+# 않아도 파이프라인을 멈추지 않고 진행한다(진짜 실패는 Invoke-VerifyGate의 재시도
+# 후에도 여전히 잡힌다).
+function Wait-AgentTreeDrained {
+    param([int]$RootProcessId, [string]$Stage, [int]$MaxWaitMs = 5000)
+    $capture = Get-ProcessTreeMetrics -RootProcessId $RootProcessId
+    $lingering = @($capture.ChildProcessIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+    if ($lingering.Count -eq 0) { return }
+    Write-Log "⏳ [$Stage] 에이전트 종료 후 잔존 자식 프로세스 $($lingering.Count)개 정리 대기 (PID: $($lingering -join ','))..." INFO
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($MaxWaitMs)
+    $pending = @($lingering)
+    while ($pending.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline) {
+        $stillAlive = @($pending | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+        if ($stillAlive.Count -eq 0) { break }
+        $pending = $stillAlive
+        Start-Sleep -Milliseconds 200
+    }
+    $remaining = @($pending | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+    if ($remaining.Count -gt 0) {
+        Write-Log "⚠️ [$Stage] 잔존 자식 프로세스 $($remaining.Count)개가 상한 내 정리되지 않음 (PID: $($remaining -join ',')) — 경계 후 진행 (비차단)" WARN
+    } else {
+        Write-Log "✅ [$Stage] 잔존 자식 프로세스 트리 정리 확인" SUCCESS
+    }
+}
+
 function Invoke-StageProcess {
     param([string]$Stage, [hashtable]$Config, [string]$ToolCmd, [int]$Cycle, [ref]$ExitCode, [ref]$ElapsedSeconds, [string]$Model)
 
@@ -320,6 +351,10 @@ function Invoke-StageProcess {
         $proc.WaitForExit()
         $ExitCode.Value = $proc.ExitCode
         Write-Log "진행 완료 [$Stage] (PID: $($proc.Id), Exit Code: $($proc.ExitCode), 경과 $([math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1))초)" INFO
+        # CFG077 (CFG-BL-047): 정상 종료 뒤에도 잔존할 수 있는 손자 프로세스가 post-hoc
+        # verify 게이트와 경합하지 않도록, 루트 종료 시점의 자손 트리가 완전히 정리될
+        # 때까지 짧은 상한 안에서 대기한다(비차단·경계 확정).
+        Wait-AgentTreeDrained -RootProcessId $proc.Id -Stage $Stage
         return 'ok'
     } finally {
         if ($null -ne $startedAt) {

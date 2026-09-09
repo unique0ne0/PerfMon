@@ -215,6 +215,39 @@ function Repair-QaVerdictStageCycle {
     return $changed
 }
 
+# CFG077: taskId 자동 보정 — Validate-QaVerdict 호출 이전, Repair-QaVerdictStageCycle 직후.
+# taskId가 없으면 디스패처가 이미 알고 있는 실제 값으로 채운다. taskId가 존재하지만 값이
+# 다르면 보정하지 않는다(명백히 잘못된 값은 fail-closed로 거부 — CFG066 원칙 유지).
+
+function Repair-QaVerdictTaskId {
+    param([string]$VerdictPath, [string]$ExpectedTaskId)
+    if ([string]::IsNullOrWhiteSpace($ExpectedTaskId)) { return $false }
+    $currentObj = $null
+    try {
+        $currentObj = Get-Content -LiteralPath $VerdictPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        return $false
+    }
+    if ($null -eq $currentObj) { return $false }
+    $hasTaskId = $currentObj.PSObject.Properties.Name -contains 'taskId'
+    if ($hasTaskId) { return $false }
+    $script:cfg077RepairTaskIdChanged = $false
+    Write-AtomicRMW -Path $VerdictPath -Transform {
+        param($current)
+        if ($null -eq $current) { return $null }
+        if ($current.PSObject.Properties.Name -contains 'taskId') { return $current }
+        $current | Add-Member -NotePropertyName 'taskId' -NotePropertyValue $ExpectedTaskId -Force
+        $script:cfg077RepairTaskIdChanged = $true
+        return $current
+    } -Depth 8
+    $changed = [bool]$script:cfg077RepairTaskIdChanged
+    Remove-Variable -Name cfg077RepairTaskIdChanged -Scope Script -ErrorAction SilentlyContinue
+    if ($changed) {
+        Write-Log "✅ QA verdict taskId 자동 보정 (taskId=$ExpectedTaskId)" INFO
+    }
+    return $changed
+}
+
 # CFG066 Done When 1: QA 판정 심층 검증. Test-QaVerdict가 파일 존재·시각만 보던 것을
 # doneWhen 모순·taskId/stage/cycle 일치·스키마 허용 목록·satisfied boolean·필수 ID 누락·중복·
 # Git 지문·{verdict:"pass"}만으로 된 산출물 거부까지 확장한다.
@@ -360,6 +393,8 @@ function Test-QaVerdict {
     # CFG073: stage/cycle 자동 보정 — Validate-QaVerdict 호출 이전, treeHash 봉인 이전.
     # 이 두 필드만 수정하며, 다른 필드(taskId·schemaVersion·findings 등)는 절대 건드리지 않는다.
     Repair-QaVerdictStageCycle -VerdictPath $vf -VerdictObj $verdictObj -ExpectedCycle $ExpectedCycle | Out-Null
+    # CFG077: taskId 자동 보정 — 누락만 채운다. 존재하지만 값이 다르면 보정하지 않는다(fail-closed).
+    Repair-QaVerdictTaskId -VerdictPath $vf -ExpectedTaskId $TaskId | Out-Null
     $verdictObj = Get-Content -LiteralPath $vf -Raw -Encoding UTF8 | ConvertFrom-Json
     $verdictValue = [string]$verdictObj.verdict
 
