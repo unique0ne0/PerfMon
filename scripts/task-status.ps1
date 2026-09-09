@@ -437,54 +437,65 @@ function Get-StageRuntimeIdentity {
     return [pscustomobject]@{ Owner = $RouterOwner; Model = if ($LeaseModel) { $LeaseModel } else { '-' } }
 }
 # .agents/briefs/backlog.md 파서. 이 저장소에 한정된 로컬 파일이라 멀티 프로젝트 순회 불필요.
-# 표 행은 '| ID | 내용 | 심각도 | 최초 발견 | 상태 |' 단일 라인 형태. 내용 셀에 '|'가
-# 들어가는 행이 있다(CFG-BL-012·CFG-BL-031이 실측 예) — 그래서 끝 4셀을 메타데이터로 보고
-# 그 앞 전체를 내용으로 합친다. 헤더/푸터는 '|'로 시작하지 않거나 ID 패턴이 없어서 자연 스킵.
+# 800ac06(2026-09-09) 재설계로 표가 둘로 나뉘었고 컬럼도 서로 다르다 — '## 미해결' 표(5열:
+# ID/내용/우선순위/최초 발견/관찰 조건)만 읽는다. '## 해결·승격 완료' 표(4열)는 이미 종결된
+# 항목이라 대시보드에 노출할 필요가 없고, 표 자체가 곧 open/closed 판정이라(미해결 표에 있으면
+# open) 예전처럼 상태 문구를 정규식으로 추측할 필요도 없다.
 function Get-BacklogTasks {
     param([string]$ProjectPath)
     if ([string]::IsNullOrWhiteSpace($ProjectPath)) { return @() }
     $path = Join-Path $ProjectPath '.agents\briefs\backlog.md'
     if (-not (Test-Path -LiteralPath $path)) { return @() }
     $items = @()
+    $inOpenSection = $false
     foreach ($line in @(Get-Content -LiteralPath $path -Encoding UTF8)) {
+        if ($line -match '^##\s') { $inOpenSection = ($line -match '미해결'); continue }
+        if (-not $inOpenSection) { continue }
         if ($line -notmatch '^\|\s*(CFG-BL-\d+)\s*\|') { continue }
         $parts = $line.Trim() -split '\|'
-        # [0]/[-1]은 선두/말미 빈 셀. 끝 4셀이 [심각도, 최초발견, 상태, 빈]이다.
-        # 끝에서 5번째(=cells[-5])부터 두번째 셀(=cells[2])까지 전부 내용 셀로 본다.
+        # [0]/[-1]은 선두/말미 빈 셀. 끝 4셀이 [우선순위, 최초발견, 관찰 조건, 빈]이다.
+        # 내용 셀에 '|'가 섞인 행에 대비해 끝에서 5번째부터 두번째 셀까지 전부 내용으로 합친다.
         if ($parts.Count -lt 7) { continue }
         $contentCells = if ($parts.Count -gt 7) { $parts[2..($parts.Count - 5)] } else { @($parts[2]) }
         $items += [pscustomobject]@{
             Id = $parts[1].Trim()
             Content = ($contentCells -join '|').Trim()
-            Severity = $parts[-4].Trim()
+            Priority = $parts[-4].Trim()
             FirstFound = $parts[-3].Trim()
-            StatusText = $parts[-2].Trim()
+            ObserveCondition = $parts[-2].Trim()
         }
     }
     return $items
 }
-# 미해결 백로그 판정. '상태' 칸은 자유 텍스트라 완벽한 파싱은 불가능하지만 이 파일의 작성 관행
-# (append-only 서술, '해결/해소 완료' 또는 단순 '해결 (날짜)'이 최종 확정 문구)을 이용해 최선 근사치를 낸다.
-# 불확실하면 OPEN 쪽으로 기운다 — 조용한 누락보다 과다 노출이 이 하네스 전반의 안전 방향.
-# '미착수/잔여/남은/보류/판단 대기/아직/재오픈' 같은 꼬리표가 마지막 종료 마커 뒤에 붙어
-# 있으면 부분 해결 상태로 보고 다시 OPEN으로 본다(예: CFG-BL-030 '1단계 해결 완료... 남은 과제 아직 미착수').
-# 첫머리의 '대기 —'처럼 추후 종료 마커로 대체된 케이스는 마지막 종료 마커 기준으로 판정한다.
-# '승격'(다른 작업 ID로 이관)·'폐기'(재논의 전까지 재등록 안 함)도 실질적 종결 마커로 인정한다
-# (CFG-BL-033 발견 — '해결'이라는 단어를 쓰지 않고 승격/폐기로만 마무리되는 경우가 흔함).
-# 단, 마지막 마커가 '부분 승격'이면 잔여분이 아직 처리되지 않았다는 뜻이므로 그 자체로 OPEN 유지.
-function Test-BacklogItemOpen {
-    param([string]$StatusText)
-    if ([string]::IsNullOrWhiteSpace($StatusText)) { return $true }
-    # 마지막 종료 마커를 찾는다 — '해결/해소 완료', '**해결 (', '승격', '폐기'.
-    $matches = [regex]::Matches($StatusText, '((해결|해소)\s*완료|\*\*해결\s*\(|승격|폐기)')
-    if ($matches.Count -eq 0) { return $true }
-    $last = $matches[$matches.Count - 1]
-    $trailing = $StatusText.Substring($last.Index + $last.Length)
-    if ($trailing -match '(미착수|잔여|남은|보류|판단\s*대기|아직|재오픈)') { return $true }
-    $prefixStart = [Math]::Max(0, $last.Index - 6)
-    $prefixWindow = $StatusText.Substring($prefixStart, $last.Index - $prefixStart)
-    if ($prefixWindow -match '부분\s*$') { return $true }
-    return $false
+# '최초 발견' 칸은 자유 텍스트(예: '기획팀 CFG062 ⑤ Integration 독립 검증 (2026-09-06)')다.
+# 그 안의 날짜만 뽑아 관찰 시작일로 삼고 오늘까지 경과 일수를 보여준다 — 날짜가 없으면 '-'.
+function Format-BacklogElapsedDays {
+    param([string]$FirstFoundText)
+    if ($FirstFoundText -notmatch '(\d{4}-\d{2}-\d{2})') { return '-' }
+    try { $started = [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd', $null) } catch { return '-' }
+    $days = [math]::Floor(((Get-Date).Date - $started.Date).TotalDays)
+    if ($days -lt 0) { return '-' }
+    if ($days -eq 0) { return '오늘부터' }
+    return "${days}일째"
+}
+# 대시보드 LastActivity 칸(그리드 셀, 폭 제한)에는 관찰 조건의 굵은 요지 문장만, 툴팁에는
+# 원문 전체를 보여준다 — backlog.md 해결 표의 '요약/원문' 분리 관행과 동일한 방식.
+function Get-BacklogObserveSummary {
+    param([string]$ObserveCondition)
+    if ([string]::IsNullOrWhiteSpace($ObserveCondition)) { return '-' }
+    if ($ObserveCondition -match '\*\*(.+?)\*\*') { return $Matches[1].Trim() }
+    if ($ObserveCondition.Length -gt 80) { return $ObserveCondition.Substring(0, 80) + '…' }
+    return $ObserveCondition
+}
+# 백로그 항목이 어느 작업(패킷)과 관련 있는지 관찰 조건/내용에서 뽑는다(예: '작업 CFG064' → 'CFG064').
+# 백로그 ID(CFG-BL-042)는 하이픈으로 문자·숫자가 분리돼 있어 이 패턴(문자 바로 뒤 숫자)에 걸리지 않는다.
+function Get-BacklogRelatedTask {
+    param([string]$ObserveCondition, [string]$Content)
+    foreach ($text in @($ObserveCondition, $Content)) {
+        if ([string]::IsNullOrWhiteSpace($text)) { continue }
+        if ($text -match '\b([A-Z]{2,6}\d{3,})\b') { return $Matches[1] }
+    }
+    return $null
 }
 function Get-DashboardStageKey {
     param([string]$Stage)
@@ -720,12 +731,11 @@ function Get-RawTaskStates {
             if (Test-Path -LiteralPath (Join-Path $root '.agents\briefs\backlog.md')) { $backlogHost = $root }
         }
         if ($backlogHost) {
+            # Get-BacklogTasks가 이미 '미해결' 표만 읽으므로(표 자체가 open 판정) 별도 필터 불필요.
             foreach ($bl in @(Get-BacklogTasks -ProjectPath $backlogHost)) {
-                if (Test-BacklogItemOpen -StatusText $bl.StatusText) {
-                    $backlogItems += [pscustomobject]@{
-                        HostPath = $backlogHost
-                        Item = $bl
-                    }
+                $backlogItems += [pscustomobject]@{
+                    HostPath = $backlogHost
+                    Item = $bl
                 }
             }
         }
@@ -928,19 +938,20 @@ function Get-TaskStatuses {
     foreach ($bl in $raw.BacklogItems) {
         $hostPath = $bl.HostPath
         $task = $bl.Item
+        $relatedTask = Get-BacklogRelatedTask -ObserveCondition $task.ObserveCondition -Content $task.Content
         $rows += [pscustomobject]@{
             Project = Split-Path -Leaf $hostPath
             ProjectPath = $hostPath
             Task = $task.Id
             Stage = '백로그'
             StageKey = 'backlog'
-            Status = '백로그'
+            Status = '장기보류'
             PID = '-'
-            Elapsed = '-'
-            LastActivity = $task.FirstFound
-            LastActivityFull = $task.StatusText
+            Elapsed = Format-BacklogElapsedDays -FirstFoundText $task.FirstFound
+            LastActivity = Get-BacklogObserveSummary -ObserveCondition $task.ObserveCondition
+            LastActivityFull = $task.ObserveCondition
             StageFull = $task.Content
-            Owner = "심각도:$($task.Severity)"
+            Owner = if ($relatedTask) { "→ $relatedTask" } else { '-' }
             Model = '-'
         }
     }
