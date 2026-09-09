@@ -240,11 +240,11 @@ function Test-StageDeadlineElapsed {
 # 게이트의 스퓨리어스 FAIL을 막는다. $proc.WaitForExit()는 직계 자식(에이전트 셸)만
 # 기다린다 — 에이전트가 자기 턴 안에서 스폰한 손자 프로세스(테스트 러너·브라우저·
 # python 등)는 부모가 종료돼도 잠시 살아남아, 하네스가 그 직후 곧바로 verify.ps1을
-# 호출하면 파일 핸들·포트·CPU를 놓고 경합해 게이트가 일시 실패한다(CFG077 재현으로
-# 확정). 여기서는 루트 종료 시점의 자손 PID 집합을 캡처해 그들이 완전히 정리될
-# 때까지 짧은 상한(기본 수 초) 안에서 기다린다 — 경계 확정·비차단이며, 정리되지
-# 않아도 파이프라인을 멈추지 않고 진행한다(진짜 실패는 Invoke-VerifyGate의 재시도
-# 후에도 여전히 잡힌다).
+# 호출하면 파일 핸들·포트·CPU를 놓고 경합해 게이트가 일시 실패할 수 있다(CFG-BL-047
+# 관측 기반 가설 — 격리 재현 스크립트로는 확정 실패). 여기서는 루트 종료 시점의 자손
+# PID 집합을 캡처해 그들이 완전히 정리될 때까지 짧은 상한(기본 5초) 안에서 기다린다 —
+# 비차단 완화이며, 정리되지 않아도 파이프라인을 멈추지 않고 진행한다(진짜 실패는
+# Invoke-VerifyGate의 재시도 후에도 여전히 잡힌다).
 function Wait-AgentTreeDrained {
     param([int]$RootProcessId, [string]$Stage, [int]$MaxWaitMs = 5000)
     $capture = Get-ProcessTreeMetrics -RootProcessId $RootProcessId
