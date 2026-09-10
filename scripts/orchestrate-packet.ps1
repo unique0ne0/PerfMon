@@ -25,6 +25,20 @@ if (-not (Test-Path -LiteralPath $HarnessIoModule)) {
 }
 . $HarnessIoModule
 
+# CFG078: 체인 완료 판정 Reducer가 QA verdict를 검증할 때 harness-verdict.ps1의 기존
+# Validate-QaVerdict(CFG066 anti-fabrication·fail-closed 로직)를 재사용한다 — verdict JSON을
+# 자체 재파싱하지 않는다. 이 모듈은 로드 시 함수 정의만 하며, Validate-QaVerdict는
+# -SkipWorktreeFingerprint를 주면 디스패처 컨텍스트($StageConfig/Resolve-RepoPath/Write-Log/
+# Get-TreeState)에 전혀 의존하지 않으므로 이 런처에서 안전하게 호출할 수 있다.
+$HarnessVerdictModule = Join-Path $PSScriptRoot 'harness-verdict.ps1'
+if (-not (Test-Path -LiteralPath $HarnessVerdictModule)) {
+    $HarnessVerdictModule = Join-Path $repoRoot 'global\harness\harness-verdict.ps1'
+}
+if (-not (Test-Path -LiteralPath $HarnessVerdictModule)) {
+    throw "Required harness verdict module not found: $HarnessVerdictModule"
+}
+. $HarnessVerdictModule
+
 function Write-OrchestrationEscalation {
     param([string]$ReasonCode, [string]$Summary, [string[]]$EvidencePaths, [object[]]$Attempts, [string]$DecisionNeeded)
     $path = Join-Path $logs "$TaskId-orchestration-escalation.json"
@@ -39,6 +53,12 @@ function Write-StartingStageState {
 }
 
 
+# CFG078: 체인 완료 판정 Reducer. 세 소스 — (a) stage-state.json(프로세스 수명주기),
+# (b) QA verdict(도메인 판정 — harness-verdict.ps1의 기존 Validate-QaVerdict로 검증·재사용),
+# (c) orchestration-escalation.json(judgment_required 등 상위 예외) — 를 종합해 disposition을
+# 반환한다. 오케스트레이터 세션 식별은 chain-summary.json의 driverCycleId(GUID)로만 하며,
+# stage-state.json의 cycle(정수형 단계 사이클)은 식별자로 쓰지 않는다(Finding 2 불변 조건).
+# 라우터/패킷 체크박스(Get-PacketPipelineStatus)·ledger/chain-runtime 쓰기 함수는 입력에 넣지 않는다.
 function Get-ChainDispositionState {
     param(
         [Parameter(Mandatory=$true)][string]$TaskId,
@@ -50,8 +70,12 @@ function Get-ChainDispositionState {
         Disposition = 'inconclusive'
         StageState = $null
         QaVerdict = $null
+        QaVerdictPresent = $false
         QaVerdictValue = $null
         QaVerdictSynthetic = $false
+        QaVerdictValid = $false
+        QaVerdictReasons = @()
+        QaVerdictReadError = $null
         Escalation = $null
         ChainSummary = $null
         Reason = 'no_data'
@@ -61,23 +85,46 @@ function Get-ChainDispositionState {
         try { $result.StageState = Get-Content -LiteralPath $stageStatePath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
     }
     $verdictPath = Join-Path $LogsDir "$TaskId-qa-verdict.json"
-    if (Test-Path -LiteralPath $verdictPath) {
+    $result.QaVerdictPresent = Test-Path -LiteralPath $verdictPath
+    if ($result.QaVerdictPresent) {
         try {
-            $result.QaVerdict = Get-Content -LiteralPath $verdictPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            $result.QaVerdictValue = [string]$result.QaVerdict.verdict
-            $result.QaVerdictSynthetic = [bool]$result.QaVerdict.synthetic
-        } catch { }
+            $verdictObj = Get-Content -LiteralPath $verdictPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $result.QaVerdict = $verdictObj
+            $result.QaVerdictValue = [string]$verdictObj.verdict
+            $result.QaVerdictSynthetic = [bool]$verdictObj.synthetic
+            # ExpectedCycle은 verdict 자신이 기록한 QA cycle을 쓴다. stage-state.json의 cycle은
+            # 오케스트레이터 세션 식별자가 아니므로(정수형 단계 사이클) 여기서도 참조하지 않는다.
+            $selfCycle = 0
+            if ($verdictObj.PSObject.Properties.Name -contains 'cycle') { [void][int]::TryParse([string]$verdictObj.cycle, [ref]$selfCycle) }
+            $validation = Validate-QaVerdict -VerdictObj $verdictObj -ExpectedTaskId $TaskId -ExpectedStage 'qa' -ExpectedCycle $selfCycle -SkipWorktreeFingerprint
+            $result.QaVerdictValid = [bool]$validation.Valid
+            if (-not $validation.Valid) { $result.QaVerdictReasons = @($validation.Reasons) }
+        } catch {
+            # 파일은 있는데 파싱·검증할 수 없으면 성공으로 넘기지 않는다(fail-closed).
+            $result.QaVerdictReadError = $_.Exception.Message
+        }
     }
     $escalationPath = Join-Path $LogsDir "$TaskId-orchestration-escalation.json"
     if (Test-Path -LiteralPath $escalationPath) {
         try { $result.Escalation = Get-Content -LiteralPath $escalationPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
     }
+    $chainSummaryReadError = $null
     if ($ChainSummaryPath -and (Test-Path -LiteralPath $ChainSummaryPath)) {
-        try { $result.ChainSummary = Get-Content -LiteralPath $ChainSummaryPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+        try { $result.ChainSummary = Get-Content -LiteralPath $ChainSummaryPath -Raw -Encoding UTF8 | ConvertFrom-Json }
+        catch { $chainSummaryReadError = $_.Exception.Message }
+    }
+    # An explicit judgment-required escalation is authoritative even when the
+    # coordinator timed out before it could write a chain summary (or wrote a
+    # non-completed one).  Checking it after the summary would hide exactly the
+    # operator decision the escalation was created to request.
+    if ($result.Escalation -and [string]$result.Escalation.state -eq 'judgment_required') {
+        $result.Disposition = 'escalation_required'
+        $result.Reason = "judgment_required:$($result.Escalation.reasonCode)"
+        return [pscustomobject]$result
     }
     if ($null -eq $result.ChainSummary) {
         $result.Disposition = 'inconclusive'
-        $result.Reason = 'chain_summary_missing'
+        $result.Reason = $(if ($chainSummaryReadError) { 'chain_summary_invalid' } else { 'chain_summary_missing' })
         return [pscustomobject]$result
     }
     if ($result.ChainSummary.taskId -ne $TaskId -or $result.ChainSummary.driverCycleId -ne $DriverCycleId) {
@@ -90,15 +137,20 @@ function Get-ChainDispositionState {
         $result.Reason = "chain_summary_$($result.ChainSummary.state)"
         return [pscustomobject]$result
     }
-    if ($result.Escalation -and [string]$result.Escalation.state -eq 'judgment_required') {
-        $result.Disposition = 'escalation_required'
-        $result.Reason = "judgment_required:$($result.Escalation.reasonCode)"
-        return [pscustomobject]$result
-    }
-    if ($null -ne $result.QaVerdict) {
+    if ($result.QaVerdictPresent) {
+        if ($result.QaVerdictReadError) {
+            $result.Disposition = 'non_success'
+            $result.Reason = 'qa_verdict_unreadable'
+            return [pscustomobject]$result
+        }
         if ($result.QaVerdictSynthetic -and $result.QaVerdictValue -eq 'pass') {
             $result.Disposition = 'non_success'
             $result.Reason = 'qa_verdict_synthetic_pass'
+            return [pscustomobject]$result
+        }
+        if (-not $result.QaVerdictValid) {
+            $result.Disposition = 'non_success'
+            $result.Reason = 'qa_verdict_invalid'
             return [pscustomobject]$result
         }
         if ($result.QaVerdictValue -ne 'pass') {
@@ -122,8 +174,10 @@ function Get-DriverFailureReason {
     $disposition = Get-ChainDispositionState -TaskId $TaskId -DriverCycleId $driverCycleId -LogsDir $logs -ChainSummaryPath (Join-Path $logs "$TaskId-chain-summary.json")
     if ($disposition.Disposition -eq 'escalation_required') { return 'judgment_required' }
     if ($disposition.Disposition -eq 'non_success') {
+        if ($disposition.QaVerdictReadError) { return 'qa_verdict_unreadable' }
+        if ($disposition.QaVerdictSynthetic -and $disposition.QaVerdictValue -eq 'pass') { return 'qa_synthetic_pass' }
         if ($disposition.QaVerdictValue -and $disposition.QaVerdictValue -ne 'pass') { return "qa_$($disposition.QaVerdictValue)" }
-        if ($disposition.QaVerdictSynthetic) { return 'qa_synthetic_pass' }
+        if ($disposition.QaVerdictPresent -and -not $disposition.QaVerdictValid) { return 'qa_verdict_invalid' }
         if ($disposition.Reason -like 'stage_state_*') { return $disposition.Reason }
     }
     $approvalSummary = Join-Path $logs "$TaskId-chain-summary.json"

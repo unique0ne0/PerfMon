@@ -253,7 +253,7 @@ function Repair-QaVerdictTaskId {
 # Git 지문·{verdict:"pass"}만으로 된 산출물 거부까지 확장한다.
 
 function Validate-QaVerdict {
-    param([object]$VerdictObj, [string]$ExpectedTaskId, [string]$ExpectedStage, [int]$ExpectedCycle)
+    param([object]$VerdictObj, [string]$ExpectedTaskId, [string]$ExpectedStage, [int]$ExpectedCycle, [switch]$SkipWorktreeFingerprint)
     $reasons = @()
     if ($null -eq $VerdictObj) { return @{ Valid = $false; Reasons = @('verdict object is null') } }
 
@@ -350,14 +350,19 @@ function Validate-QaVerdict {
 
     # QA가 검토한 작업 트리 지문을 반드시 묶는다. HEAD만 비교하면 같은 커밋에서
     # uncommitted 변경 후 오래된 pass가 재사용될 수 있으므로 Get-TreeState의 내용 지문을 쓴다.
-    if ($VerdictObj.PSObject.Properties.Name -notcontains 'treeHash' -or [string]::IsNullOrWhiteSpace([string]$VerdictObj.treeHash)) {
-        $reasons += 'treeHash field missing'
-    } else {
-        $treeState = Get-TreeState
-        if ($null -eq $treeState -or -not $treeState.FingerprintOk) {
-            $reasons += 'current worktree fingerprint could not be computed'
-        } elseif ([string]$VerdictObj.treeHash -ne [string]$treeState.Fingerprint) {
-            $reasons += "treeHash mismatch: verdict=$($VerdictObj.treeHash) current=$($treeState.Fingerprint)"
+    # CFG078: 체인 완료 판정(Get-ChainDispositionState)처럼 QA 시점 이후 Integration이 작업 트리를
+    # 커밋해 지문이 당연히 달라지는 소비자는 -SkipWorktreeFingerprint로 이 최신성 검사만 건너뛴다.
+    # 판정 내용의 무결성(schema·taskId·stage·cycle·doneWhen·findings)은 그대로 검증한다.
+    if (-not $SkipWorktreeFingerprint) {
+        if ($VerdictObj.PSObject.Properties.Name -notcontains 'treeHash' -or [string]::IsNullOrWhiteSpace([string]$VerdictObj.treeHash)) {
+            $reasons += 'treeHash field missing'
+        } else {
+            $treeState = Get-TreeState
+            if ($null -eq $treeState -or -not $treeState.FingerprintOk) {
+                $reasons += 'current worktree fingerprint could not be computed'
+            } elseif ([string]$VerdictObj.treeHash -ne [string]$treeState.Fingerprint) {
+                $reasons += "treeHash mismatch: verdict=$($VerdictObj.treeHash) current=$($treeState.Fingerprint)"
+            }
         }
     }
 
