@@ -39,10 +39,93 @@ function Write-StartingStageState {
 }
 
 
+function Get-ChainDispositionState {
+    param(
+        [Parameter(Mandatory=$true)][string]$TaskId,
+        [Parameter(Mandatory=$true)][string]$DriverCycleId,
+        [Parameter(Mandatory=$true)][string]$LogsDir,
+        [string]$ChainSummaryPath
+    )
+    $result = [ordered]@{
+        Disposition = 'inconclusive'
+        StageState = $null
+        QaVerdict = $null
+        QaVerdictValue = $null
+        QaVerdictSynthetic = $false
+        Escalation = $null
+        ChainSummary = $null
+        Reason = 'no_data'
+    }
+    $stageStatePath = Join-Path $LogsDir "$TaskId-stage-state.json"
+    if (Test-Path -LiteralPath $stageStatePath) {
+        try { $result.StageState = Get-Content -LiteralPath $stageStatePath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+    }
+    $verdictPath = Join-Path $LogsDir "$TaskId-qa-verdict.json"
+    if (Test-Path -LiteralPath $verdictPath) {
+        try {
+            $result.QaVerdict = Get-Content -LiteralPath $verdictPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $result.QaVerdictValue = [string]$result.QaVerdict.verdict
+            $result.QaVerdictSynthetic = [bool]$result.QaVerdict.synthetic
+        } catch { }
+    }
+    $escalationPath = Join-Path $LogsDir "$TaskId-orchestration-escalation.json"
+    if (Test-Path -LiteralPath $escalationPath) {
+        try { $result.Escalation = Get-Content -LiteralPath $escalationPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+    }
+    if ($ChainSummaryPath -and (Test-Path -LiteralPath $ChainSummaryPath)) {
+        try { $result.ChainSummary = Get-Content -LiteralPath $ChainSummaryPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+    }
+    if ($null -eq $result.ChainSummary) {
+        $result.Disposition = 'inconclusive'
+        $result.Reason = 'chain_summary_missing'
+        return [pscustomobject]$result
+    }
+    if ($result.ChainSummary.taskId -ne $TaskId -or $result.ChainSummary.driverCycleId -ne $DriverCycleId) {
+        $result.Disposition = 'inconclusive'
+        $result.Reason = 'chain_summary_identity_mismatch'
+        return [pscustomobject]$result
+    }
+    if ([string]$result.ChainSummary.state -ne 'completed') {
+        $result.Disposition = 'inconclusive'
+        $result.Reason = "chain_summary_$($result.ChainSummary.state)"
+        return [pscustomobject]$result
+    }
+    if ($result.Escalation -and [string]$result.Escalation.state -eq 'judgment_required') {
+        $result.Disposition = 'escalation_required'
+        $result.Reason = "judgment_required:$($result.Escalation.reasonCode)"
+        return [pscustomobject]$result
+    }
+    if ($null -ne $result.QaVerdict) {
+        if ($result.QaVerdictSynthetic -and $result.QaVerdictValue -eq 'pass') {
+            $result.Disposition = 'non_success'
+            $result.Reason = 'qa_verdict_synthetic_pass'
+            return [pscustomobject]$result
+        }
+        if ($result.QaVerdictValue -ne 'pass') {
+            $result.Disposition = 'non_success'
+            $result.Reason = "qa_verdict_$($result.QaVerdictValue)"
+            return [pscustomobject]$result
+        }
+    }
+    if ($null -ne $result.StageState -and [string]$result.StageState.state -ne 'completed') {
+        $result.Disposition = 'non_success'
+        $result.Reason = "stage_state_$($result.StageState.state)"
+        return [pscustomobject]$result
+    }
+    $result.Disposition = 'success'
+    $result.Reason = 'all_sources_agree'
+    return [pscustomobject]$result
+}
+
 function Get-DriverFailureReason {
     param([string]$LogPath)
-    # CFG017: 구조화 승인 상태가 정규식 분류보다 우선한다. dispatcher가 chain-summary를
-    # 'approval_required'로 끝냈으면 권한 요청을 driver_failed·provider 문제로 오분류하지 않는다.
+    $disposition = Get-ChainDispositionState -TaskId $TaskId -DriverCycleId $driverCycleId -LogsDir $logs -ChainSummaryPath (Join-Path $logs "$TaskId-chain-summary.json")
+    if ($disposition.Disposition -eq 'escalation_required') { return 'judgment_required' }
+    if ($disposition.Disposition -eq 'non_success') {
+        if ($disposition.QaVerdictValue -and $disposition.QaVerdictValue -ne 'pass') { return "qa_$($disposition.QaVerdictValue)" }
+        if ($disposition.QaVerdictSynthetic) { return 'qa_synthetic_pass' }
+        if ($disposition.Reason -like 'stage_state_*') { return $disposition.Reason }
+    }
     $approvalSummary = Join-Path $logs "$TaskId-chain-summary.json"
     if (Test-Path -LiteralPath $approvalSummary) {
         try {
@@ -77,12 +160,8 @@ function Stop-DriverProcessTree {
 
 function Test-CompletedChainSummary {
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return @{ Valid = $false; Reason = 'chain_summary_missing' } }
-    try { $summary = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json }
-    catch { return @{ Valid = $false; Reason = 'chain_summary_invalid' } }
-    if ($summary.taskId -ne $TaskId -or $summary.driverCycleId -ne $driverCycleId) { return @{ Valid = $false; Reason = 'chain_summary_identity_mismatch' } }
-    if ($summary.state -ne 'completed') { return @{ Valid = $false; Reason = "chain_summary_$($summary.state)" } }
-    return @{ Valid = $true; Reason = $null }
+    $disposition = Get-ChainDispositionState -TaskId $TaskId -DriverCycleId $driverCycleId -LogsDir $logs -ChainSummaryPath $Path
+    return @{ Valid = ($disposition.Disposition -eq 'success'); Reason = $(if ($disposition.Disposition -eq 'success') { $null } else { $disposition.Reason }) }
 }
 
 function Get-PacketSectionText {
