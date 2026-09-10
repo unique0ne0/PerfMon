@@ -53,6 +53,18 @@ if ($state -and $state.issuedWarnings) {
     }
 }
 
+# Project-scoped (not session-scoped) counter: how many distinct sessions have
+# hit the context-70 threshold since the last tool/MCP review suggestion was
+# emitted. Mirrors the orchestration-runbook §7 idiom — observe, then only
+# propose after 5 cumulative occurrences, never auto-apply. (5, not §7's 2:
+# context-70 crossings have many innocent causes — long sessions, large file
+# reads — so this needs a higher bar than the concurrency-observation idiom
+# it borrows the cadence pattern from.)
+$toolReviewOccurrences = 0
+if ($state -and $state.toolReviewOccurrences) {
+    try { $toolReviewOccurrences = [int]$state.toolReviewOccurrences } catch { $toolReviewOccurrences = 0 }
+}
+
 $sessionKey = "hook-$sessionId"
 $firstTimestamp = $null
 if ($hookSessions.ContainsKey($sessionKey)) {
@@ -123,10 +135,13 @@ foreach ($threshold in @(4, 6, 8)) {
     }
 }
 
+$toolReviewSuggestion = $null
+
 if ($null -ne $lastContextTokens -and $ContextWindowSize -gt 0) {
     $usedPercentage = [math]::Round(($lastContextTokens / $ContextWindowSize) * 100, 1)
     if ($usedPercentage -ge 70) {
         $key = "${sessionKey}-context-70"
+        $isFirstThisSession = -not $issued.ContainsKey($key)
         $lastIssued = $null
         if ($issued.ContainsKey($key)) {
             [datetime]$parsedLast = [datetime]::MinValue
@@ -135,6 +150,23 @@ if ($null -ne $lastContextTokens -and $ContextWindowSize -gt 0) {
         if ($null -eq $lastIssued -or ($now - $lastIssued.ToUniversalTime()).TotalMinutes -ge 60) {
             [void]$warnings.Add("Context usage is at ${usedPercentage}% ($lastContextTokens / $ContextWindowSize tokens). Consider /compact or starting a new session.")
             $issued[$key] = $now.ToString('o')
+        }
+        if ($isFirstThisSession) {
+            $toolReviewOccurrences += 1
+            if ($toolReviewOccurrences -ge 5) {
+                $toolReviewSuggestion = @'
+=== Tool/MCP Review Suggested ===
+이 프로젝트에서 컨텍스트 사용률이 여러 세션에 걸쳐 반복적으로 70%를 넘었습니다.
+다음 세션 유휴 시점에:
+1. 이 프로젝트의 .claude/settings.local.json permissions.deny와 현재 로드된 MCP/내장 도구 목록을 대조한다.
+2. deny되지 않은 도구 중 이 프로젝트의 실제 코드/문서/패킷에서 사용 근거가 없는 것을 grep으로 확인한다
+   (판단 기준은 프로젝트 스택에 따라 다르다 -- 고정 목록을 적용하지 말 것).
+3. 근거가 있으면 .agents/briefs/backlog.md의 "## 미해결 (관찰 중)" 표에 CFG-BL-NNN 행을 추가해 건의한다.
+   settings.local.json은 직접 수정하지 않는다 -- 건의만 하고 사용자 승인 후 반영한다.
+4. 건의 행에는 재활성화 방법(해당 도구를 permissions.deny 배열에서 제거)을 명시한다.
+'@
+                $toolReviewOccurrences = 0
+            }
         }
     }
 }
@@ -146,10 +178,10 @@ foreach ($k in $hookSessions.Keys) { $updatedHookSessions[$k] = $hookSessions[$k
 $updatedIssued = [ordered]@{}
 foreach ($k in $issued.Keys) { $updatedIssued[$k] = $issued[$k] }
 
-$stateObj = [ordered]@{ schemaVersion = 3; hookSessions = $updatedHookSessions; issuedWarnings = $updatedIssued }
+$stateObj = [ordered]@{ schemaVersion = 4; hookSessions = $updatedHookSessions; issuedWarnings = $updatedIssued; toolReviewOccurrences = $toolReviewOccurrences }
 if ($state) {
     foreach ($prop in @($state.psobject.Properties)) {
-        if ($prop.Name -notin @('schemaVersion', 'hookSessions', 'issuedWarnings')) {
+        if ($prop.Name -notin @('schemaVersion', 'hookSessions', 'issuedWarnings', 'toolReviewOccurrences')) {
             if (-not $stateObj.Contains($prop.Name)) { $stateObj[$prop.Name] = $prop.Value }
         }
     }
@@ -163,6 +195,10 @@ if ($warnings.Count -gt 0) {
     $output = "=== Session Health Warning ==="
     foreach ($w in $warnings) { $output += "`n$w" }
     Write-Output $output
+}
+
+if ($toolReviewSuggestion) {
+    Write-Output $toolReviewSuggestion
 }
 
 exit 0
