@@ -413,7 +413,7 @@ function Complete-StageFailure {
         if (Test-Path $logAbs) { Get-Content $logAbs -Tail 15 | ForEach-Object { Write-Host "    $_" } }
     }
     Write-StageState -Stage $Stage -Cycle $Cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($LogRel) -Reason $failureReason -Model $Model
-    Record-ChainRuntime -Stage $Stage -Model $Model -Status 'failed' -Reason $failureReason
+    Record-ChainRuntime -Stage $Stage -Model $Model -Status 'failed' -Reason $failureReason -Adapter $config.Adapter
     return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $qaDispatchedAt }
 }
 
@@ -432,7 +432,7 @@ function Complete-StageExitFailure {
     $logAbs = Resolve-RepoPath $LogRel
     if (Test-Path $logAbs) { Get-Content $logAbs -Tail 15 | ForEach-Object { Write-Host "    $_" } }
     Write-StageState -Stage $Stage -Cycle $Cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($LogRel) -Reason $failureReason -Model $Model
-    Record-ChainRuntime -Stage $Stage -Model $Model -Status 'failed' -Reason $failureReason
+    Record-ChainRuntime -Stage $Stage -Model $Model -Status 'failed' -Reason $failureReason -Adapter $config.Adapter
     return @{ Success = $false; FailureReason = $failureReason; QaDispatchedAt = $qaDispatchedAt }
 }
 
@@ -503,7 +503,7 @@ function Dispatch-Stage {
             $firstModel = ''
             if ($config.ModelFallback) { $firstModel = @($config.ModelFallback)[0] }
             elseif ($config.ModelChain) { $firstModel = @($config.ModelChain)[0] }
-            Record-ChainRuntime -Stage $Stage -Model $firstModel -Status 'quota_exhausted' -Reason $failureReason
+            Record-ChainRuntime -Stage $Stage -Model $firstModel -Status 'quota_exhausted' -Reason $failureReason -Adapter $config.Adapter
             $blockedPath = Resolve-RepoPath "$LogDir/$TaskId-blocked.json"
             $blockedValue = [ordered]@{
                 schemaVersion = 1
@@ -650,7 +650,7 @@ function Dispatch-Stage {
         $failReason = $verifyResult.FailureReason
         if ($verifyResult.Retried) { $failReason = "$failReason (auto-retry also failed)" }
         Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'failed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $failReason -Model $model
-        Record-ChainRuntime -Stage $Stage -Model $model -Status 'failed' -Reason $failReason
+        Record-ChainRuntime -Stage $Stage -Model $model -Status 'failed' -Reason $failReason -Adapter $config.Adapter
         return @{ Success = $false; FailureReason = $failReason; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
     }
 
@@ -669,7 +669,7 @@ function Dispatch-Stage {
         Write-Log '✅ [integration] 검증 성공 — 완료 정리 허용 (⑤ 체크·router DONE·아카이브·완료 커밋 가능)' INFO
     }
     Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'completed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $successReason -Model $model
-    Record-ChainRuntime -Stage $Stage -Model $model -Status 'success' -Reason $successReason
+    Record-ChainRuntime -Stage $Stage -Model $model -Status 'success' -Reason $successReason -Adapter $config.Adapter
     return @{ Success = $true; FailureReason = $null; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
 }
 
@@ -764,6 +764,8 @@ function Invoke-StageWithLock {
         Write-SyntheticQaVerdict -Stage $Stage -Result $result -CycleNumber $cycleId
         Ensure-QaLedger -Stage $Stage -Result $result
         if ($result.Success) { Test-PipelineStageUpdated -Stage $Stage -PacketPath $CheckPipelinePacket }
+        # CFG079: 단계 성공 시 라우터 행의 "다음 단계"·갱신일을 하네스가 직접 갱신 — 에이전트 기탁 누락 방지.
+        if ($result.Success) { Update-RouterRowAfterStage -Stage $Stage -PacketPath $CheckPipelinePacket }
         if ($result.Success) { Clear-FailureMarker -Stage $Stage }
         if ($result.Success) {
             $drift = Get-ScopeDriftWarnings -PacketPath $CheckPipelinePacket -BeforeSnapshot $scopeSnapshot

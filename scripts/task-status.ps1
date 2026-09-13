@@ -412,6 +412,38 @@ function Get-StageRuntimeIdentity {
     # "대행"을 붙여 조정 사실 자체를 화면에서 알 수 있게 한다.
     $teamByAdapter = @{ opencode = '개발1팀'; codex = 'QA팀'; claude = '기획팀'; gemini = '개발2팀' }
     if (-not $defaultTeam) { return [pscustomobject]@{ Owner = $RouterOwner; Model = '-' } }
+    # CFG079: 하네스가 기록한 chain-runtime.json(단계별 실제 실행 model/adapter)이 최우선 근거다.
+    # host 로그 라인 파싱보다 정확하고, 라우터 산문보다 항상 최신이다 — 라우터 갱신이 늦어도
+    # 화면이 stale 라벨("기획팀/Claude")로 되돌아가지 않는다.
+    $runtimePath = Join-Path $ProjectPath ('.agents\briefs\logs\' + $TaskId + '-chain-runtime.json')
+    if (-not (Test-Path -LiteralPath $runtimePath)) {
+        $norm = Get-NormalizedTaskId -TaskId $TaskId
+        if ($norm) { $runtimePath = Join-Path $ProjectPath ('.agents\briefs\logs\' + $norm + '-chain-runtime.json') }
+    }
+    if (Test-Path -LiteralPath $runtimePath) {
+        try {
+            $runtime = Get-Content -LiteralPath $runtimePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $entry = $runtime.stages.$Stage
+            # adapter가 비어 있으면 principal에서 파생한다(opencode-go → opencode). modelCatalog에
+            # adapter 필드가 없는 항목은 Record-ChainRuntime가 adapter를 빈 값으로 남기므로 폴백이 필요하다.
+            $adapter = if ($entry -and [string]$entry.adapter) { ([string]$entry.adapter).ToLowerInvariant() }
+                       elseif ($entry -and [string]$entry.principal) {
+                           $p = ([string]$entry.principal).ToLowerInvariant()
+                           foreach ($known in @('antigravity','codex','claude','gemini','opencode')) {
+                               if ($p -match "^$known") { $known; break }
+                           }
+                       } else { $null }
+            if ($adapter) {
+                $cli = @{ antigravity = 'Antigravity CLI'; codex = 'Codex CLI'; claude = 'Claude CLI'; gemini = 'Gemini CLI'; opencode = 'OpenCode CLI' }[$adapter]
+                if ($cli) {
+                    $actualTeam = if ($teamByAdapter.ContainsKey($adapter)) { $teamByAdapter[$adapter] } else { $defaultTeam }
+                    $owner = if ($actualTeam -ne $defaultTeam) { "$actualTeam 대행($defaultTeam) / $cli" } else { "$actualTeam / $cli" }
+                    $model = if ($LeaseModel) { $LeaseModel } elseif ([string]$entry.model) { [string]$entry.model } else { '-' }
+                    return [pscustomobject]@{ Owner = $owner; Model = $model }
+                }
+            }
+        } catch { }
+    }
     # The dispatcher emits its routing line near the start of the host log.  A binding
     # warning may precede it, so inspect the short header rather than assuming line one.
     # Use this evidence instead of a historical router label such as "기획팀/Claude".

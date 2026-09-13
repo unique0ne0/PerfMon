@@ -86,7 +86,7 @@ function Reset-ChainRuntime {
 
 
 function Record-ChainRuntime {
-    param([string]$Stage, [string]$Model, [string]$Status, [string]$Reason, [string]$ProfileName)
+    param([string]$Stage, [string]$Model, [string]$Status, [string]$Reason, [string]$ProfileName, [string]$Adapter)
     $runtime = Read-ChainRuntime
     $family = ''; $adapter = ''; $principal = ''
     $catalog = $null
@@ -106,6 +106,10 @@ function Record-ChainRuntime {
         $principal = [string]$catalog.principal
         if ($catalog.adapter) { $adapter = [string]$catalog.adapter }
     }
+    # CFG079: 호출자가 슬롯 어댑터를 직접 주면 catalog 부재(adapter 빈 값)와 무관하게 채운다 —
+    # qa/integration 모델(gpt-5.6-terra, sonnet 등)은 modelCatalog에 없어 adapter가 빠지던 결함.
+    if (-not $adapter -and $Adapter) { $adapter = [string]$Adapter }
+    if (-not $principal -and $Adapter) { $principal = [string]$Adapter }
     # Planning is not spawned by this dispatcher, so its identity comes from the
     # packet's Runtime Role Binding rather than modelCatalog's route slots.
     if ($ProfileName -and $script:ProfileConfig -and $script:ProfileConfig.profiles) {
@@ -214,6 +218,64 @@ function Write-ChainBlockedMarker {
     }
     Write-AtomicJson -Path $path -Value $value -Depth 6
     Write-Log "중단 마커 기록: $path" WARN
+}
+
+# CFG079: 단계 완료 시 라우터 행의 "다음 단계"·갱신일 칸을 하네스가 직접 갱신한다.
+# 라우터 행 갱신을 에이전트 기탁에 두면 갱신이 늦어지거나 누락되고, 대시보드의 Owner 칸이
+# 오래된 산문("다음: ⑤(기획팀)")을 그대로 보여준다. 하네스는 단계 성공(verify 통과)을
+# 기계적으로 확정하므로 그 시점의 다음 단계·담당을 SSOT에서 파생해 쓴다.
+# 원칙: 자기 작업 행만 고친다(타 작업 행 변조는 Test-ProtocolPollution이 이미 차단).
+# 갱신 칸 외의 다른 칸(상태·Blocked by 등)은 절대 손대지 않는다 — 상태 전환 권한은 기획팀에 남는다.
+
+function Get-RouterNextStageLabel {
+    param([string]$Stage)
+    switch ($Stage) {
+        'impl'        { return '③ 자체 리뷰(개발1팀)' }
+        'qa'          { return '⑤ 최종 리뷰 및 Integration(기획팀)' }
+        'integration' { return $null }
+    }
+    return $null
+}
+
+function Update-RouterRowAfterStage {
+    param([string]$Stage, [string]$PacketPath)
+    if (-not (Test-Path -LiteralPath (Resolve-RepoPath '.agents/briefs/handoff-log.md'))) { return $false }
+    $next = Get-RouterNextStageLabel -Stage $Stage
+    if (-not $next) { return $false }
+    $routerPath = Resolve-RepoPath '.agents/briefs/handoff-log.md'
+    $lines = @(Get-Content -LiteralPath $routerPath -Encoding UTF8)
+    $changed = $false
+    $normSelf = Get-NormalizedTaskId -TaskId $TaskId
+    $stamp = [datetime]::Now.ToString('yyyy-MM-dd')
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -notmatch '^\s*\|') { continue }
+        $cells = @($lines[$i].Trim().Trim('|').Split('|') | ForEach-Object { $_.Trim() })
+        if ($cells.Count -lt 3) { continue }
+        if ((Get-NormalizedTaskId -TaskId $cells[0]) -ne $normSelf) { continue }
+        # "다음 단계" 칸(3번째 이후)과 갱신 칸(마지막)을 찾는다 — 7컬럼/6컬럼 방언 모두 지원.
+        $stageIdx = -1
+        for ($c = 2; $c -lt $cells.Count; $c++) {
+            if ($cells[$c] -match '다음\s*:|다음 단계') { $stageIdx = $c; break }
+        }
+        if ($stageIdx -lt 0) { $stageIdx = 3 }
+        if ($stageIdx -ge $cells.Count) { continue }
+        $newStage = "작업 $TaskId $Stage 단계 완료 — 다음: $next"
+        if ($cells[$stageIdx] -eq $newStage) { return $false }
+        $cells[$stageIdx] = $newStage
+        # 갱신 칸은 마지막 칸(날짜만 있거나 비어 있음). 다른 칸과 구분되도록 날짜만 교체.
+        $lastIdx = $cells.Count - 1
+        if ($lastIdx -gt $stageIdx -and $cells[$lastIdx] -match '^\d{4}-\d{2}-\d{2}$') {
+            $cells[$lastIdx] = $stamp
+        }
+        $lines[$i] = '| ' + ($cells -join ' | ') + ' |'
+        $changed = $true
+        break
+    }
+    if ($changed) {
+        [System.IO.File]::WriteAllLines($routerPath, $lines, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Log "✅ 라우터 행 자동 갱신 [$TaskId] — $newStage" SUCCESS
+    }
+    return $changed
 }
 
 #endregion 승인·continuation·시도 판정·스테이지 원장
