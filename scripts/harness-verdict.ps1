@@ -405,7 +405,11 @@ function Test-QaVerdict {
 
     # 현 QA 실행이 막 끝났을 때에만 하네스가 실제 작업 트리 지문을 봉인한다.
     # 기존 산출물(Integration 단독 실행 등)은 절대 보완하지 않아, 오래된 pass를 새 상태에 재사용할 수 없다.
-    if ($verdictValue -eq 'pass' -and $null -ne $QaDispatchedAt -and
+    # CFG082(CFG-BL-054): 봉인 대상은 pass에 한정하지 않는다. Validate-QaVerdict는 verdict 값과 무관하게
+    # treeHash를 요구하므로 blocked 등 다른 판정도 봉인해야 심층 검증이 "treeHash field missing"으로
+    # 추가 실패하지 않고, blocked 판정 시점의 실제 작업 트리 상태가 남아 stale 여부를 구조적으로
+    # 판별할 수 있다. 봉인은 메타데이터 보강일 뿐 verdict 판정 내용은 바꾸지 않는다.
+    if ($null -ne $QaDispatchedAt -and
         ($verdictObj.PSObject.Properties.Name -notcontains 'treeHash' -or [string]::IsNullOrWhiteSpace([string]$verdictObj.treeHash))) {
         $treeState = Get-TreeState
         if ($treeState -and $treeState.FingerprintOk) {
@@ -415,7 +419,6 @@ function Test-QaVerdict {
             Write-AtomicRMW -Path $vf -Transform {
                 param($current)
                 if ($null -eq $current) { return $null }
-                if ([string]$current.verdict -ne 'pass') { return $current }
                 if ($current.PSObject.Properties.Name -contains 'treeHash' -and -not [string]::IsNullOrWhiteSpace([string]$current.treeHash)) { return $current }
                 $current | Add-Member -NotePropertyName treeHash -NotePropertyValue ([string]$treeState.Fingerprint) -Force
                 return $current
