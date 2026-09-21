@@ -253,7 +253,7 @@ function Repair-QaVerdictTaskId {
 # Git 지문·{verdict:"pass"}만으로 된 산출물 거부까지 확장한다.
 
 function Validate-QaVerdict {
-    param([object]$VerdictObj, [string]$ExpectedTaskId, [string]$ExpectedStage, [int]$ExpectedCycle, [switch]$SkipWorktreeFingerprint)
+    param([object]$VerdictObj, [string]$ExpectedTaskId, [string]$ExpectedStage, [int]$ExpectedCycle, [switch]$SkipWorktreeFingerprint, [object]$PrecomputedTreeState = $null)
     $reasons = @()
     if ($null -eq $VerdictObj) { return @{ Valid = $false; Reasons = @('verdict object is null') } }
 
@@ -357,7 +357,10 @@ function Validate-QaVerdict {
         if ($VerdictObj.PSObject.Properties.Name -notcontains 'treeHash' -or [string]::IsNullOrWhiteSpace([string]$VerdictObj.treeHash)) {
             $reasons += 'treeHash field missing'
         } else {
-            $treeState = Get-TreeState
+            # CFG-BL-055: 방금 봉인한 값과 비교할 때는 그 봉인에 쓴 지문을 그대로 재사용한다.
+            # 여기서 Get-TreeState를 다시 부르면, 봉인~검증 사이에 하네스 자신의 로그·체크박스
+            # 기록만으로도 지문이 바뀌어 최초 봉인 시점부터 항상 mismatch가 뜨는 경쟁 조건이 된다.
+            $treeState = if ($null -ne $PrecomputedTreeState) { $PrecomputedTreeState } else { Get-TreeState }
             if ($null -eq $treeState -or -not $treeState.FingerprintOk) {
                 $reasons += 'current worktree fingerprint could not be computed'
             } elseif ([string]$VerdictObj.treeHash -ne [string]$treeState.Fingerprint) {
@@ -409,6 +412,9 @@ function Test-QaVerdict {
     # treeHash를 요구하므로 blocked 등 다른 판정도 봉인해야 심층 검증이 "treeHash field missing"으로
     # 추가 실패하지 않고, blocked 판정 시점의 실제 작업 트리 상태가 남아 stale 여부를 구조적으로
     # 판별할 수 있다. 봉인은 메타데이터 보강일 뿐 verdict 판정 내용은 바꾸지 않는다.
+    # CFG-BL-055: 이번 호출에서 직접 봉인했다면 그 스냅샷을 아래 Validate-QaVerdict에 그대로
+    # 넘겨, 봉인과 검증이 서로 다른 시점의 Get-TreeState를 비교하는 경쟁 조건을 없앤다.
+    $sealedTreeState = $null
     if ($null -ne $QaDispatchedAt -and
         ($verdictObj.PSObject.Properties.Name -notcontains 'treeHash' -or [string]::IsNullOrWhiteSpace([string]$verdictObj.treeHash))) {
         $treeState = Get-TreeState
@@ -426,6 +432,12 @@ function Test-QaVerdict {
             # RMW 중 병행 보강된 필드까지 반영한 실제 파일을 이후 verdict 검증에 사용한다.
             $verdictObj = Get-Content -LiteralPath $vf -Raw -Encoding UTF8 | ConvertFrom-Json
             $verdictValue = [string]$verdictObj.verdict
+            # 실제로 봉인된 값이 우리가 방금 계산한 스냅샷과 같을 때만 재사용한다 — 동시에 다른
+            # 경로가 먼저 봉인했다면(skip-if-present) 그 값은 우리 $treeState와 다를 수 있으므로
+            # Validate-QaVerdict가 다시 신선하게 계산하도록 둔다.
+            if ([string]$verdictObj.treeHash -eq [string]$treeState.Fingerprint) {
+                $sealedTreeState = $treeState
+            }
         }
     }
 
@@ -464,7 +476,7 @@ function Test-QaVerdict {
     }
 
     # CFG066 Done When 1: 심층 검증
-    $validation = Validate-QaVerdict -VerdictObj $verdictObj -ExpectedTaskId $TaskId -ExpectedStage 'qa' -ExpectedCycle $ExpectedCycle
+    $validation = Validate-QaVerdict -VerdictObj $verdictObj -ExpectedTaskId $TaskId -ExpectedStage 'qa' -ExpectedCycle $ExpectedCycle -PrecomputedTreeState $sealedTreeState
     if (-not $validation.Valid) {
         foreach ($r in $validation.Reasons) { Write-Log "⚠️ QA verdict 검증 실패: $r" ERROR }
         Write-Log "⚠️ QA verdict 심층 검증 실패($($validation.Reasons.Count)건) — 안전상 ⑤ 중단" ERROR

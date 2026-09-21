@@ -488,8 +488,20 @@ function Get-TreeState {
         # 로그 디렉터리는 제외한다 — 디스패치 자체가 로그를 쓰므로, 프로젝트가 이 경로를
         # gitignore 하지 않으면 "무엇도 바꾸지 않은 실행"이 항상 변경으로 보여 경고가 죽는다.
         $logPrefix = ($LogDir.Trim('/')) + '/'
+        # CFG-BL-051: codebase-memory-mcp 같은 백그라운드 로컬 인덱서가 프로젝트 .gitignore와
+        # 무관하게 계속 재기록하는 휘발성 산출물 디렉터리. 프로젝트가 gitignore에 등재하지
+        # 않아도 치명 지문에서 원천 제외한다. 실증된 패턴만 추가한다(ai0072, 2026-09-13).
+        $script:VolatileTreeStatePrefixes = @('.codebase-memory/')
         $dirty = (@(& git status --porcelain 2>$null |
-            Where-Object { $_.Length -le 3 -or -not $_.Substring(3).Trim('"').StartsWith($logPrefix) }) -join "`n").Trim()
+            Where-Object {
+                if ($_.Length -le 3) { return $true }
+                $statusPath = $_.Substring(3).Trim('"').Replace('\','/')
+                if ($statusPath.StartsWith($logPrefix)) { return $false }
+                foreach ($volatilePrefix in $script:VolatileTreeStatePrefixes) {
+                    if ($statusPath.StartsWith($volatilePrefix)) { return $false }
+                }
+                return $true
+            }) -join "`n").Trim()
         if ($LASTEXITCODE -ne 0) { throw 'git status failed' }
 
         # status 문자열은 "이미 수정된 파일을 더 수정한 경우"에도 그대로다. noop 폴백이 실제 편집을
@@ -507,7 +519,14 @@ function Get-TreeState {
         & git diff --binary HEAD -- . 2>$null | ForEach-Object { & $hashText ($_ + "`n") }
         if ($LASTEXITCODE -ne 0) { throw 'git diff failed' }
         $untracked = @(& git ls-files --others --exclude-standard 2>$null |
-            Where-Object { -not $_.Replace('\','/').StartsWith($logPrefix) } |
+            Where-Object {
+                $untrackedPath = $_.Replace('\','/')
+                if ($untrackedPath.StartsWith($logPrefix)) { return $false }
+                foreach ($volatilePrefix in $script:VolatileTreeStatePrefixes) {
+                    if ($untrackedPath.StartsWith($volatilePrefix)) { return $false }
+                }
+                return $true
+            } |
             Sort-Object)
         if ($LASTEXITCODE -ne 0) { throw 'git ls-files failed' }
         foreach ($rel in $untracked) {

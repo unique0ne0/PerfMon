@@ -87,6 +87,9 @@ function Reset-ChainRuntime {
 
 function Record-ChainRuntime {
     param([string]$Stage, [string]$Model, [string]$Status, [string]$Reason, [string]$ProfileName, [string]$Adapter)
+    # PowerShell 변수명은 대소문자를 구분하지 않는다 — 아래 `$adapter = ''` 초기화가 파라미터
+    # `$Adapter`를 그대로 덮어쓰므로, 폴백에 쓰기 전에 다른 이름으로 값을 보존한다.
+    $adapterHint = [string]$Adapter
     $runtime = Read-ChainRuntime
     $family = ''; $adapter = ''; $principal = ''
     $catalog = $null
@@ -108,8 +111,8 @@ function Record-ChainRuntime {
     }
     # CFG079: 호출자가 슬롯 어댑터를 직접 주면 catalog 부재(adapter 빈 값)와 무관하게 채운다 —
     # qa/integration 모델(gpt-5.6-terra, sonnet 등)은 modelCatalog에 없어 adapter가 빠지던 결함.
-    if (-not $adapter -and $Adapter) { $adapter = [string]$Adapter }
-    if (-not $principal -and $Adapter) { $principal = [string]$Adapter }
+    if (-not $adapter -and $adapterHint) { $adapter = $adapterHint }
+    if (-not $principal -and $adapterHint) { $principal = $adapterHint }
     # Planning is not spawned by this dispatcher, so its identity comes from the
     # packet's Runtime Role Binding rather than modelCatalog's route slots.
     if ($ProfileName -and $script:ProfileConfig -and $script:ProfileConfig.profiles) {
@@ -262,10 +265,16 @@ function Update-RouterRowAfterStage {
         $newStage = "작업 $TaskId $Stage 단계 완료 — 다음: $next"
         if ($cells[$stageIdx] -eq $newStage) { return $false }
         $cells[$stageIdx] = $newStage
-        # 갱신 칸은 마지막 칸(날짜만 있거나 비어 있음). 다른 칸과 구분되도록 날짜만 교체.
+        # 갱신 칸은 마지막 칸이다. 기존 이력이 날짜 뒤에 붙어 있으면 이력은 보존하고
+        # 날짜 접두사만 교체한다. 빈 셀도 이번 갱신일로 채운다.
         $lastIdx = $cells.Count - 1
-        if ($lastIdx -gt $stageIdx -and $cells[$lastIdx] -match '^\d{4}-\d{2}-\d{2}$') {
-            $cells[$lastIdx] = $stamp
+        if ($lastIdx -gt $stageIdx) {
+            $priorUpdated = [string]$cells[$lastIdx]
+            if ($priorUpdated -match '^\d{4}-\d{2}-\d{2}(.*)$') {
+                $cells[$lastIdx] = $stamp + $Matches[1]
+            } else {
+                $cells[$lastIdx] = $stamp
+            }
         }
         $lines[$i] = '| ' + ($cells -join ' | ') + ' |'
         $changed = $true

@@ -172,6 +172,26 @@ function Write-StageHeartbeat {
     $Monitor.LastHeartbeatAt = Get-Date; $Monitor.LastHeartbeatSize = $LogSize; $Monitor.LastHeartbeatCpu = $CpuNow
 }
 
+function Test-StageArtifactFreshlyWritten {
+    param([hashtable]$Config, [datetime]$Since)
+
+    # CFG-BL-052: KillOnHang=$false 스테이지에서 "결론(findings/보고서/verdict)을 이미 새로 써놓고
+    # 프로세스 종료만 느린 상태"를 "진짜 멈춘 상태"와 구분한다. 특정 스테이지 이름을 하드코딩하지
+    # 않는다 — $Config에 값이 정의된 종결 산출물 키를 동적으로 순회해 모든 스테이지에 일반 적용한다.
+    # 기준 시각($Since)은 로그가 마지막으로 갱신된 시각이므로, 그보다 훨씬 이전에 쓰인 오래된
+    # 산출물은 "새로 쓰임"으로 오판되지 않는다.
+    foreach ($key in @('FindingsFile', 'ReportFile', 'VerdictFile')) {
+        if (-not $Config.ContainsKey($key)) { continue }
+        $value = [string]$Config[$key]
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        $abs = Resolve-RepoPath $value
+        try {
+            if ((Get-Item -LiteralPath $abs -ErrorAction Stop).LastWriteTime -gt $Since) { return $true }
+        } catch { }
+    }
+    return $false
+}
+
 function Test-StageHangProgress {
     param([string]$Stage, [hashtable]$Monitor, $metricsNow, [double]$noChange, [double]$noChangeText, [hashtable]$Config)
 
@@ -205,8 +225,11 @@ function Test-StageHangProgress {
         if ($gitInFlight) {
             Write-Log "⚠️ hang 후보 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 점유 자원: WS ${wsMb}MB, 핸들 ${handles}개, 자식 PID: [$childPids]; git 작업 중이라 하드 상한까지 대기" WARN
             $Monitor.HangReported = $true
+        } elseif (Test-StageArtifactFreshlyWritten -Config $Config -Since $Monitor.LastLogChangedAt) {
+            Write-Log "⚠️ hang 후보 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 점유 자원: WS ${wsMb}MB, 핸들 ${handles}개, 자식 PID: [$childPids]; 종결 산출물이 이미 새로 쓰여 종료 지연으로 보고 하드 상한까지 대기" WARN
+            $Monitor.HangReported = $true
         } else {
-            Write-Log "⚠️ hang 감지 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 진행 중인 git 커밋/푸시 없음(index.lock 없음, git 자식 프로세스 없음) — 프로세스 트리 종료" WARN
+            Write-Log "⚠️ hang 감지 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 진행 중인 git 커밋/푸시 없음(index.lock 없음, git 자식 프로세스 없음), 종결 산출물도 새로 쓰이지 않음 — 프로세스 트리 종료" WARN
             $decision = @{ Action = 'kill-git' }
         }
     }
