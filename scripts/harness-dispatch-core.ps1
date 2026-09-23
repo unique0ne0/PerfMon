@@ -802,6 +802,7 @@ function Resolve-DispatchPlan {
         [Parameter(Mandatory=$false)][string]$ResetReason,
         [Parameter(Mandatory=$false)][switch]$ManualComplete,
         [Parameter(Mandatory=$false)][switch]$ManualAbort,
+        [Parameter(Mandatory=$false)][switch]$ResealQaVerdict,
         [Parameter(Mandatory=$false)][string]$Reason,
         [Parameter(Mandatory=$false)][hashtable]$StageConfig,
         [Parameter(Mandatory=$false)][string]$RepoRoot,
@@ -833,6 +834,23 @@ function Resolve-DispatchPlan {
     }
     if ($ManualAbort) {
         return [pscustomobject]@{ EarlyExit = $true; ExitCode = 0; Reason = 'ManualAbort requested'; Action = 'manualStageTermination'; ActionStage = $Stage; ActionComplete = $false; ActionReason = $Reason }
+    }
+
+    # ── CFG083(CFG-BL-056): QA verdict treeHash 재봉인 (실행 대신 관리자 액션) ──
+    if ($ResealQaVerdict) {
+        if ($Chain) {
+            Write-Log '오류: -ResealQaVerdict는 -Chain과 함께 사용할 수 없습니다 — -Stage qa 단일 실행으로만 재봉인합니다.' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'ResealQaVerdict cannot be combined with Chain' }
+        }
+        if ($Stage -ne 'qa') {
+            Write-Log '오류: -ResealQaVerdict는 -Stage qa 와 함께 사용하세요.' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'ResealQaVerdict requires Stage qa' }
+        }
+        if ([string]::IsNullOrWhiteSpace($Reason)) {
+            Write-Log '오류: -ResealQaVerdict는 -Reason으로 재봉인 사유를 반드시 남기세요 (예: "④-1 마이그레이션 원격 적용 커밋 반영").' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'ResealQaVerdict requires Reason' }
+        }
+        return [pscustomobject]@{ EarlyExit = $true; ExitCode = 0; Reason = 'ResealQaVerdict requested'; Action = 'resealQaVerdict'; ActionStage = $Stage; ActionReason = $Reason }
     }
 
     if ($Chain -and $Stage) {
@@ -1044,6 +1062,7 @@ function Resolve-DispatchPlan {
         Chain = [bool]$Chain
         DryRun = [bool]$DryRun
         SkipVerdictGate = [bool]$SkipVerdictGate
+        ResealQaVerdict = [bool]$ResealQaVerdict
         CheckPipelinePacket = $checkPipelinePacket
         ProfileConfig = $profileConfig
         RuntimeRoleBinding = $runtimeRoleBinding
@@ -1069,6 +1088,9 @@ function Invoke-DispatchChain {
         }
         if ($Plan.Action -eq 'manualStageTermination') {
             return (Invoke-ManualStageTermination -Stage $Plan.ActionStage -Complete:$Plan.ActionComplete -ReasonText $Plan.ActionReason)
+        }
+        if ($Plan.Action -eq 'resealQaVerdict') {
+            return (Invoke-QaVerdictReseal -Stage $Plan.ActionStage -ReasonText $Plan.ActionReason)
         }
         return [int]$Plan.ExitCode
     }

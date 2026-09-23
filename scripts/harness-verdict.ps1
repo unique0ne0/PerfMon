@@ -488,6 +488,159 @@ function Test-QaVerdict {
     return $false
 }
 
+# CFG083(CFG-BL-056): ④-1(수동 마이그레이션 원격 적용 등 QA 봉인 이후·⑤ 이전에 사람이 만드는 커밋)
+# 이후에도 ⑤ 게이트가 오차단되지 않도록, 사람이 명시적으로 호출하는 treeHash 재봉인 관리자 액션.
+# Validate-QaVerdict/Test-QaVerdict의 자동 비교 로직은 한 글자도 바꾸지 않는다 — 여기서는
+# verdict의 판정 내용(verdict/doneWhen/findings)에 손대지 않고 treeHash 메타데이터 3필드만 갱신한다.
+# 재봉인은 "최초 봉인 우회" 통로가 될 수 없으므로 아래 전제를 전부 만족할 때만 수행한다.
+
+function Invoke-QaVerdictReseal {
+    param([string]$Stage, [string]$ReasonText)
+    if (-not $Stage -or $Stage -ne 'qa') {
+        Write-Log '오류: QA verdict 재봉인은 -Stage qa 와 함께 사용하세요.' ERROR
+        return 1
+    }
+    # 사유 없는 재봉인은 감사 로그의 의미를 없앤다 — -ResetStageLedger의 -ResetReason과 같은 계약.
+    if ([string]::IsNullOrWhiteSpace($ReasonText)) {
+        Write-Log '오류: -ResealQaVerdict는 -Reason으로 재봉인 사유를 반드시 남기세요 (예: "④-1 마이그레이션 원격 적용 커밋 반영").' ERROR
+        return 1
+    }
+    $verdictRel = $StageConfig['qa'].VerdictFile
+    $verdictAbs = Resolve-RepoPath $verdictRel
+    if (-not (Test-Path -LiteralPath $verdictAbs)) {
+        Write-Log "오류: QA verdict 파일이 없습니다($verdictRel) — 재봉인 대상이 아닙니다." ERROR
+        return 1
+    }
+    $verdictObj = $null
+    try {
+        $verdictObj = Get-Content -LiteralPath $verdictAbs -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        Write-Log "오류: QA verdict JSON 파싱 실패($verdictRel) — 재봉인을 거부합니다: $($_.Exception.Message)" ERROR
+        return 1
+    }
+    if ($null -eq $verdictObj) {
+        Write-Log "오류: QA verdict가 비어 있습니다($verdictRel) — 재봉인을 거부합니다." ERROR
+        return 1
+    }
+    # 한 번도 정상 봉인된 적 없는 verdict는 재봉인 대상이 아니다. 이 조건이 없으면 재봉인이
+    # "최초 봉인 우회" 통로가 되어 QA 시점 트리 정보를 아예 남기지 않고 pass를 밀어 넣을 수 있다.
+    if ($verdictObj.PSObject.Properties.Name -notcontains 'treeHash' -or [string]::IsNullOrWhiteSpace([string]$verdictObj.treeHash)) {
+        Write-Log '오류: verdict에 기존 treeHash가 없습니다 — 한 번도 봉인된 적 없는 verdict는 재봉인 대상이 아닙니다.' ERROR
+        return 1
+    }
+    # treeHash를 제외한 무결성(schema·taskId·stage·cycle·doneWhen·findings)을 먼저 확인한다.
+    # 재봉인으로 "깨진/조작된 verdict"를 세탁할 수 없게 막는 핵심 전제다.
+    $selfCycle = 0
+    $hasCycle = $verdictObj.PSObject.Properties.Name -contains 'cycle'
+    if (-not $hasCycle -or -not [int]::TryParse([string]$verdictObj.cycle, [ref]$selfCycle)) {
+        Write-Log '오류: verdict의 cycle을 읽을 수 없습니다 — 무결성 사전검증을 수행할 수 없어 재봉인을 거부합니다.' ERROR
+        return 1
+    }
+    $validation = Validate-QaVerdict -VerdictObj $verdictObj -ExpectedTaskId $TaskId -ExpectedStage 'qa' -ExpectedCycle $selfCycle -SkipWorktreeFingerprint
+    if (-not $validation.Valid) {
+        foreach ($r in $validation.Reasons) { Write-Log "⚠️ QA verdict 재봉인 거부 — 무결성 검증 실패: $r" ERROR }
+        Write-Log "오류: treeHash 이외 무결성이 깨진 verdict는 재봉인하지 않습니다($($validation.Reasons.Count)건)." ERROR
+        return 1
+    }
+    $treeState = Get-TreeState
+    if ($null -eq $treeState -or -not $treeState.FingerprintOk -or [string]::IsNullOrWhiteSpace([string]$treeState.Fingerprint)) {
+        Write-Log '오류: 현재 작업 트리 지문을 계산할 수 없습니다(FingerprintOk=false) — 재봉인을 거부합니다.' ERROR
+        return 1
+    }
+    # 살아 있는 실행과 경합하지 않는다 — impl/qa/integration 어느 단계든 진행 중이면 재봉인하지 않는다.
+    $live = Test-LiveStageActivity
+    if ($live) {
+        Write-Log "⛔ [재봉인] 살아 있는 실행이 있어 QA verdict를 재봉인하지 않습니다: $live" ERROR
+        return 1
+    }
+    $previousTreeHash = [string]$verdictObj.treeHash
+    $newTreeHash = [string]$treeState.Fingerprint
+    # 실질적 변경이 없으면 파일을 쓰지 않는다 — 카운트·감사 로그를 부풀리지 않는다(no-op).
+    if ($previousTreeHash -eq $newTreeHash) {
+        Write-Log "ℹ️ [qa] QA verdict 재봉인 no-op — 트리 지문이 기존 treeHash와 동일합니다($newTreeHash)." INFO
+        return 0
+    }
+    # 동시 재봉인·다른 하네스 경로의 verdict 보강을 덮어쓰지 않도록 반드시 path 단위 RMW mutex 안에서
+    # 수행한다. 갱신 대상은 treeHash·resealCount·lastResealAt 3필드뿐이며 판정 내용은 건드리지 않는다.
+    $resealAt = [datetime]::UtcNow.ToString('o')
+    $script:cfg083ResealApplied = $false
+    $script:cfg083ResealPrevious = $null
+    $script:cfg083ResealRejected = $null
+    Write-AtomicRMW -Path $verdictAbs -Transform {
+        param($current)
+        if ($null -eq $current) {
+            $script:cfg083ResealRejected = 'QA verdict가 RMW 잠금 획득 전에 사라졌거나 JSON 파싱에 실패했습니다.'
+            return $null
+        }
+        $currentCycle = 0
+        if ($current.PSObject.Properties.Name -notcontains 'cycle' -or
+            -not [int]::TryParse([string]$current.cycle, [ref]$currentCycle)) {
+            $script:cfg083ResealRejected = 'RMW 잠금 안에서 다시 읽은 verdict의 cycle이 유효하지 않습니다.'
+            return $null
+        }
+        $currentValidation = Validate-QaVerdict -VerdictObj $current -ExpectedTaskId $TaskId -ExpectedStage 'qa' -ExpectedCycle $currentCycle -SkipWorktreeFingerprint
+        if (-not $currentValidation.Valid) {
+            $script:cfg083ResealRejected = "RMW 잠금 안에서 다시 읽은 verdict 무결성 검증 실패: $($currentValidation.Reasons -join '; ')"
+            return $null
+        }
+        # 다시 읽은 시점에 treeHash가 이미 새 지문이면(동시 재봉인) 중복 계수하지 않는다.
+        if ([string]::IsNullOrWhiteSpace([string]$current.treeHash)) {
+            $script:cfg083ResealRejected = 'RMW 잠금 안에서 다시 읽은 verdict에 기존 treeHash가 없습니다.'
+            return $null
+        }
+        if ([string]$current.treeHash -eq $newTreeHash) { return $current }
+        $script:cfg083ResealPrevious = [string]$current.treeHash
+        $current | Add-Member -NotePropertyName treeHash -NotePropertyValue $newTreeHash -Force
+        $resealCount = 1
+        if ($current.PSObject.Properties.Name -contains 'resealCount') {
+            $parsedCount = 0
+            if ([int]::TryParse([string]$current.resealCount, [ref]$parsedCount) -and $parsedCount -ge 1) { $resealCount = $parsedCount + 1 }
+        }
+        $current | Add-Member -NotePropertyName resealCount -NotePropertyValue $resealCount -Force
+        $current | Add-Member -NotePropertyName lastResealAt -NotePropertyValue $resealAt -Force
+        $script:cfg083ResealApplied = $true
+        return $current
+    } -Depth 8
+    $applied = [bool]$script:cfg083ResealApplied
+    Remove-Variable -Name cfg083ResealApplied -Scope Script -ErrorAction SilentlyContinue
+    $rejected = [string]$script:cfg083ResealRejected
+    Remove-Variable -Name cfg083ResealRejected -Scope Script -ErrorAction SilentlyContinue
+    if (-not [string]::IsNullOrWhiteSpace($rejected)) {
+        Remove-Variable -Name cfg083ResealPrevious -Scope Script -ErrorAction SilentlyContinue
+        Write-Log "오류: QA verdict 재봉인을 거부합니다 — $rejected" ERROR
+        return 1
+    }
+    if (-not $applied) {
+        Remove-Variable -Name cfg083ResealPrevious -Scope Script -ErrorAction SilentlyContinue
+        Write-Log "ℹ️ [qa] QA verdict 재봉인 no-op — 병행 경로가 먼저 갱신했습니다($newTreeHash)." INFO
+        return 0
+    }
+    $auditPrevious = if ($script:cfg083ResealPrevious) { [string]$script:cfg083ResealPrevious } else { $previousTreeHash }
+    Remove-Variable -Name cfg083ResealPrevious -Scope Script -ErrorAction SilentlyContinue
+    # 실제로 treeHash가 바뀐 경우에만 append-only 감사 로그를 남긴다 — 누가·언제·왜 재봉인했는지.
+    $auditRel = "$LogDir/$TaskId-qa-reseal-audit.log"
+    $auditAbs = Resolve-RepoPath $auditRel
+    try {
+        $auditParent = Split-Path -Parent $auditAbs
+        if (-not [string]::IsNullOrWhiteSpace($auditParent) -and -not (Test-Path -LiteralPath $auditParent)) {
+            New-Item -ItemType Directory -Path $auditParent -Force | Out-Null
+        }
+        $auditEntry = [ordered]@{
+            at = $resealAt
+            taskId = $TaskId
+            reason = $ReasonText
+            previousTreeHash = $auditPrevious
+            newTreeHash = $newTreeHash
+        } | ConvertTo-Json -Compress -Depth 4
+        [System.IO.File]::AppendAllText($auditAbs, $auditEntry + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        Write-Log "오류: QA verdict는 재봉인됐지만 감사 로그 기록에 실패했습니다($auditRel): $($_.Exception.Message)" ERROR
+        return 1
+    }
+    Write-Log "✅ [qa] QA verdict treeHash 재봉인 — $auditPrevious → $newTreeHash (사유: $ReasonText, 감사: $auditRel)" SUCCESS
+    return 0
+}
+
 # ── CFG043: 수동 완료·안전 재개 ─────────────────────────────────────────────
 # 실행 중('running'/'starting') lease가 아직 만료되지 않았거나 살아 있는 락이 있는지 판정한다.
 # 자동 재개(-Chain)가 이들을 "건드리지 않고" 멈추기 위한 가드다. stale(만료) lease나 종결

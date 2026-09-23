@@ -66,6 +66,10 @@ param(
     # 종결된 이전 단계 뒤 첫 미완료 단계부터 안전하게 자동 재개(-Chain)할 수 있게 한다.
     [Parameter(Mandatory=$false)][switch]$ManualComplete,
     [Parameter(Mandatory=$false)][switch]$ManualAbort,
+    # CFG083(CFG-BL-056): ④-1(QA 봉인 이후·⑤ 이전에 사람이 만드는 커밋, 예: 마이그레이션 원격 적용)
+    # 이후 ⑤ 게이트가 "treeHash mismatch"로 오차단되는 것을 해소하는 관리자 액션. verdict 판정 내용은
+    # 건드리지 않고 treeHash 메타데이터만 명시적으로 갱신하며, -Reason을 필수 사유로 남긴다(감사 로그).
+    [Parameter(Mandatory=$false)][switch]$ResealQaVerdict,
     [Parameter(Mandatory=$false)][string]$Reason
 )
 
@@ -750,6 +754,7 @@ if ($MyInvocation.InvocationName -ne '.' -and ($MyInvocation.Line -notmatch '^\s
         -Chain:$Chain -DryRun:$DryRun -SkipVerdictGate:$SkipVerdictGate -ForceFreeModel:$ForceFreeModel `
         -ResetStageLedger:$ResetStageLedger -ResetReason $ResetReason `
         -ManualComplete:$ManualComplete -ManualAbort:$ManualAbort -Reason $Reason `
+        -ResealQaVerdict:$ResealQaVerdict `
         -StageConfig $StageConfig -RepoRoot $RepoRoot -ProfileModule $ProfileModule -ProfileConfigPath $ProfileConfigPath
 
     if ($dispatchPlan.EarlyExit) {
