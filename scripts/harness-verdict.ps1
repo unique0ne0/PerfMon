@@ -477,15 +477,191 @@ function Test-QaVerdict {
 
     # CFG066 Done When 1: 심층 검증
     $validation = Validate-QaVerdict -VerdictObj $verdictObj -ExpectedTaskId $TaskId -ExpectedStage 'qa' -ExpectedCycle $ExpectedCycle -PrecomputedTreeState $sealedTreeState
+    $autoHealed = $false
     if (-not $validation.Valid) {
-        foreach ($r in $validation.Reasons) { Write-Log "⚠️ QA verdict 검증 실패: $r" ERROR }
-        Write-Log "⚠️ QA verdict 심층 검증 실패($($validation.Reasons.Count)건) — 안전상 ⑤ 중단" ERROR
-        return $false
+        # CFG085(CFG-BL-059): 실패 사유가 정확히 treeHash mismatch 1건뿐일 때만, 그리고 실제 변경 파일이
+        # 허용목록(하네스 자신의 라우터 자동 갱신)의 부분집합일 때만 그 자리에서 좁게 자동 재봉인한다.
+        # 다른 사유가 하나라도 섞여 있으면 이 분기에 절대 들어가지 않는다.
+        $autoHealReasons = @($validation.Reasons)
+        if ($autoHealReasons.Count -eq 1 -and $autoHealReasons[0] -match '^treeHash mismatch:') {
+            $healed = $false
+            try {
+                $healed = [bool](Invoke-QaVerdictScopedAutoHeal -VerdictPath $vf -ExpectedTaskId $TaskId -ExpectedCycle $ExpectedCycle)
+            } catch {
+                Write-Log "⚠️ QA verdict 자동 재봉인 중 예외 — 정규 fail-closed 경로로 폴백: $($_.Exception.Message)" WARN
+                $healed = $false
+            }
+            if ($healed) {
+                Clear-FailureMarker -Stage 'qa'
+                $revalidatedObj = $null
+                try { $revalidatedObj = Get-Content -LiteralPath $vf -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $revalidatedObj = $null }
+                $revalidation = Validate-QaVerdict -VerdictObj $revalidatedObj -ExpectedTaskId $TaskId -ExpectedStage 'qa' -ExpectedCycle $ExpectedCycle
+                if ($revalidation.Valid) {
+                    $verdictObj = $revalidatedObj
+                    $verdictValue = [string]$revalidatedObj.verdict
+                    $autoHealed = $true
+                } else {
+                    $validation = $revalidation
+                }
+            }
+        }
+        if (-not $autoHealed) {
+            foreach ($r in $validation.Reasons) { Write-Log "⚠️ QA verdict 검증 실패: $r" ERROR }
+            Write-Log "⚠️ QA verdict 심층 검증 실패($($validation.Reasons.Count)건) — 안전상 ⑤ 중단" ERROR
+            return $false
+        }
     }
 
     if ($verdictValue -eq 'pass') { Write-Log "✅ QA verdict=pass → ⑤ 진행" SUCCESS; return $true }
     Write-Log "❌ QA verdict=$verdictValue → ⑤ 진행 중단 (QA 보고: $($StageConfig['qa'].ReportFile))" ERROR
     return $false
+}
+
+# CFG085(CFG-BL-059): ④→⑤ 전환 중 하네스 자신의 라우터 자동 갱신(Update-RouterRowAfterStage)만으로
+# verdict의 treeHash가 어긋날 때, 그 좁은 경우에 한해 그 자리에서 자동 재봉인한다. 실제 변조나
+# 허용목록 밖 드리프트는 지금과 동일하게 fail-closed로 차단한다. Invoke-QaVerdictReseal(수동)과
+# 동일한 전제(기존 treeHash 존재 + treeHash 이외 무결성 통과)를 요구하며 판정 내용 필드는 건드리지 않는다.
+# 반환값: $true(치유 성공 또는 이미 일치·no-op) / $false(치유 불가 — 호출자는 기존 fail-closed 경로 진행).
+
+function Invoke-QaVerdictScopedAutoHeal {
+    param([string]$VerdictPath, [string]$ExpectedTaskId, [int]$ExpectedCycle)
+    if ([string]::IsNullOrWhiteSpace($VerdictPath) -or -not (Test-Path -LiteralPath $VerdictPath)) { return $false }
+    if ([string]::IsNullOrWhiteSpace($ExpectedTaskId)) { return $false }
+
+    # (1) 레포 루트의 실제 uncommitted 변경 목록을 확인한다 — 추측이 아니라 코드가 강제한다.
+    #     Get-TreeState의 파싱 관례(4번째 문자부터, 따옴표 제거, 백슬래시→슬래시)와 동일하게 처리한다.
+    $porcelain = @()
+    $changedPaths = @()
+    $gitOk = $false
+    Push-Location $RepoRoot
+    try {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $porcelain = @(git status --porcelain 2>$null)
+            $gitOk = ($LASTEXITCODE -eq 0)
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+    } catch {
+        $gitOk = $false
+    } finally {
+        Pop-Location
+    }
+    if (-not $gitOk) { return $false }
+    foreach ($line in $porcelain) {
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.Length -le 3) { continue }
+        $changedPaths += $line.Substring(3).Trim('"').Replace('\','/')
+    }
+
+    # (2) 변경이 전혀 없으면(설명되는 diff가 없는 원인 불명 드리프트) 자동 치유하지 않는다.
+    if ($changedPaths.Count -eq 0) { return $false }
+
+    # (3) 허용목록(하네스 자신의 라우터 자동 갱신 경로) 밖 변경이 하나라도 섞이면 무조건 거부한다.
+    $script:QaVerdictAutoHealAllowlist = @('.agents/briefs/handoff-log.md')
+    foreach ($changedPath in $changedPaths) {
+        if ($script:QaVerdictAutoHealAllowlist -notcontains $changedPath) { return $false }
+    }
+
+    # (4) 현재 지문을 계산한다.
+    $treeState = Get-TreeState
+    if ($null -eq $treeState -or -not $treeState.FingerprintOk -or [string]::IsNullOrWhiteSpace([string]$treeState.Fingerprint)) {
+        return $false
+    }
+    $newTreeHash = [string]$treeState.Fingerprint
+
+    # (5) verdict를 다시 읽어 기존 treeHash 존재(최초 봉인 우회 차단)와 이미 일치(경합 해소)를 확인한다.
+    $verdictObj = $null
+    try {
+        $verdictObj = Get-Content -LiteralPath $VerdictPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        return $false
+    }
+    if ($null -eq $verdictObj) { return $false }
+    if ($verdictObj.PSObject.Properties.Name -notcontains 'treeHash' -or [string]::IsNullOrWhiteSpace([string]$verdictObj.treeHash)) {
+        return $false
+    }
+    $previousTreeHash = [string]$verdictObj.treeHash
+    if ($previousTreeHash -eq $newTreeHash) { return $true }
+
+    # (6) treeHash 이외 무결성(schema·taskId·stage·cycle·doneWhen·findings)을 먼저 확인한다 —
+    #     깨진 verdict를 자동 치유로 통과시키지 않는다(Invoke-QaVerdictReseal과 동일 전제).
+    $validation = Validate-QaVerdict -VerdictObj $verdictObj -ExpectedTaskId $ExpectedTaskId -ExpectedStage 'qa' -ExpectedCycle $ExpectedCycle -SkipWorktreeFingerprint
+    if (-not $validation.Valid) { return $false }
+
+    # (7) treeHash·resealCount·lastResealAt 3필드만 RMW로 갱신한다. 판정 내용 필드는 건드리지 않는다.
+    $resealAt = [datetime]::UtcNow.ToString('o')
+    $script:cfg085AutoHealApplied = $false
+    $script:cfg085AutoHealPrevious = $null
+    $script:cfg085AutoHealRejected = $null
+    Write-AtomicRMW -Path $VerdictPath -Transform {
+        param($current)
+        if ($null -eq $current) {
+            $script:cfg085AutoHealRejected = 'RMW 잠금 안에서 verdict를 다시 읽지 못했습니다.'
+            return $null
+        }
+        if ($current.PSObject.Properties.Name -notcontains 'treeHash' -or [string]::IsNullOrWhiteSpace([string]$current.treeHash)) {
+            $script:cfg085AutoHealRejected = 'RMW 잠금 안의 최신 verdict에 기존 treeHash가 없습니다.'
+            return $null
+        }
+        # 초기 검증과 RMW 잠금 획득 사이에 verdict가 바뀔 수 있으므로 최신 객체를 다시 검증한다.
+        # 이 검증 없이는 손상된 verdict에 treeHash를 써서 "깨진 verdict는 쓰지 않는다" 계약을 위반한다.
+        $lockedValidation = Validate-QaVerdict -VerdictObj $current -ExpectedTaskId $ExpectedTaskId -ExpectedStage 'qa' -ExpectedCycle $ExpectedCycle -SkipWorktreeFingerprint
+        if (-not $lockedValidation.Valid) {
+            $script:cfg085AutoHealRejected = "RMW 잠금 안의 최신 verdict 무결성 검증 실패: $($lockedValidation.Reasons -join '; ')"
+            return $null
+        }
+        # 병행 경로가 먼저 갱신했으면 중복 계수하지 않는다.
+        if ([string]$current.treeHash -eq $newTreeHash) { return $current }
+        $script:cfg085AutoHealPrevious = [string]$current.treeHash
+        $current | Add-Member -NotePropertyName treeHash -NotePropertyValue $newTreeHash -Force
+        $resealCount = 1
+        if ($current.PSObject.Properties.Name -contains 'resealCount') {
+            $parsedCount = 0
+            if ([int]::TryParse([string]$current.resealCount, [ref]$parsedCount) -and $parsedCount -ge 1) { $resealCount = $parsedCount + 1 }
+        }
+        $current | Add-Member -NotePropertyName resealCount -NotePropertyValue $resealCount -Force
+        $current | Add-Member -NotePropertyName lastResealAt -NotePropertyValue $resealAt -Force
+        $script:cfg085AutoHealApplied = $true
+        return $current
+    } -Depth 8
+    $applied = [bool]$script:cfg085AutoHealApplied
+    $auditPrevious = if ($script:cfg085AutoHealPrevious) { [string]$script:cfg085AutoHealPrevious } else { $previousTreeHash }
+    $rejected = [string]$script:cfg085AutoHealRejected
+    Remove-Variable -Name cfg085AutoHealApplied -Scope Script -ErrorAction SilentlyContinue
+    Remove-Variable -Name cfg085AutoHealPrevious -Scope Script -ErrorAction SilentlyContinue
+    Remove-Variable -Name cfg085AutoHealRejected -Scope Script -ErrorAction SilentlyContinue
+    if (-not [string]::IsNullOrWhiteSpace($rejected)) {
+        Write-Log "⚠️ [qa] QA verdict 자동 재봉인을 거부합니다 — $rejected" WARN
+        return $false
+    }
+    # 병행 경로가 먼저 갱신했으면 감사 로그 없이 성공 처리한다.
+    if (-not $applied) { return $true }
+
+    # (8) 실제로 갱신됐으면 append-only 감사 로그를 남긴다 — 수동 재봉인(trigger=manual)과 대조 가능하게.
+    $auditRel = ".agents/briefs/logs/$ExpectedTaskId-qa-reseal-audit.log"
+    $auditAbs = Resolve-RepoPath $auditRel
+    try {
+        $auditParent = Split-Path -Parent $auditAbs
+        if (-not [string]::IsNullOrWhiteSpace($auditParent) -and -not (Test-Path -LiteralPath $auditParent)) {
+            New-Item -ItemType Directory -Path $auditParent -Force | Out-Null
+        }
+        $auditEntry = [ordered]@{
+            at = $resealAt
+            taskId = $ExpectedTaskId
+            reason = 'auto: scoped bookkeeping-only drift (CFG-BL-059)'
+            trigger = 'auto'
+            changedPaths = @($changedPaths)
+            previousTreeHash = $auditPrevious
+            newTreeHash = $newTreeHash
+        } | ConvertTo-Json -Compress -Depth 4
+        [System.IO.File]::AppendAllText($auditAbs, $auditEntry + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        Write-Log "⚠️ [qa] 자동 재봉인은 적용됐지만 감사 로그 기록에 실패했습니다($auditRel): $($_.Exception.Message)" WARN
+        return $false
+    }
+    Write-Log "⚠️ [qa] QA verdict treeHash 자동 재봉인(허용목록 범위 확인됨) — $auditPrevious → $newTreeHash" WARN
+    return $true
 }
 
 # CFG083(CFG-BL-056): ④-1(수동 마이그레이션 원격 적용 등 QA 봉인 이후·⑤ 이전에 사람이 만드는 커밋)
@@ -629,6 +805,7 @@ function Invoke-QaVerdictReseal {
             at = $resealAt
             taskId = $TaskId
             reason = $ReasonText
+            trigger = 'manual'
             previousTreeHash = $auditPrevious
             newTreeHash = $newTreeHash
         } | ConvertTo-Json -Compress -Depth 4
@@ -637,6 +814,9 @@ function Invoke-QaVerdictReseal {
         Write-Log "오류: QA verdict는 재봉인됐지만 감사 로그 기록에 실패했습니다($auditRel): $($_.Exception.Message)" ERROR
         return 1
     }
+    # CFG085(CFG-BL-059) Fix A: 수동 재봉인 성공 시 qa 실패 마커도 함께 해소한다 — 재봉인만으로
+    # 이미 성공한 qa 단계가 실패 마커 때문에 체인 재개되지 못하던 2단 원인의 두 번째 고리를 끊는다.
+    Clear-FailureMarker -Stage 'qa'
     Write-Log "✅ [qa] QA verdict treeHash 재봉인 — $auditPrevious → $newTreeHash (사유: $ReasonText, 감사: $auditRel)" SUCCESS
     return 0
 }
