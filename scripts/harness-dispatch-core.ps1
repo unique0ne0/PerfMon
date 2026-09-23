@@ -51,6 +51,74 @@ function Get-RouterTableSnapshot {
     return $rows
 }
 
+function Get-ProtocolPollutionAllowlist {
+    # CFG084: impl 단계 실행 창 동안의 동시 작업(후속 패킷 준비, 타 작업 라우터 행 갱신)을
+    # 구현자의 권한 초과로 오귀속하지 않도록, 사전에 명시 등록된 만료 시간부 예외만 반환한다.
+    # 파일 부재·파싱 실패는 fail-safe("예외 없음")로 처리한다 — 읽지 못한 화이트리스트가
+    # 전부 면제로 새면 안 되므로, 못 읽으면 기존과 동일하게 전부 오염 탐지 대상이 된다.
+    $path = Resolve-RepoPath '.agents/briefs/logs/.protocol-pollution-allowlist.json'
+    if (-not (Test-Path -LiteralPath $path)) { return @() }
+    try {
+        $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+        $parsed = $raw | ConvertFrom-Json
+    } catch {
+        return @()
+    }
+    $now = [datetime]::UtcNow
+    $active = @()
+    foreach ($entry in @($parsed.entries)) {
+        if ($null -eq $entry) { continue }
+        $expires = [datetime]::MinValue
+        if (-not [datetime]::TryParse([string]$entry.expiresAt, [ref]$expires)) { continue }
+        # 'o' 포맷의 Z 접미사를 TryParse 하면 Kind=Local 로 변환돼 Ticks 가 로컬 벽시계가 된다.
+        # UtcNow 와 Ticks 를 직접 비교하면 오프셋만큼 어긋나므로 UTC 로 정규화해 비교한다.
+        if ($expires.ToUniversalTime() -gt $now) { $active += $entry }
+    }
+    return $active
+}
+
+function Register-ProtocolPollutionException {
+    # CFG084: 화이트리스트 항목 등록. -Reason 필수(무기한·무사유 예외 금지), 만료 시간 필수.
+    # 등록과 동시에 같은 트랜잭션 안에서 이미 만료된 기존 항목을 prune 한다.
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('packet', 'router')][string]$Kind,
+        [Parameter(Mandatory = $true)][string]$Key,
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [int]$TtlMinutes = 240
+    )
+    if ([string]::IsNullOrWhiteSpace($Reason)) {
+        Write-Log "프로토콜 오염 예외 등록 거부: -Reason 이 비어 있습니다" ERROR
+        return $null
+    }
+    if ([string]::IsNullOrWhiteSpace($Key)) {
+        Write-Log "프로토콜 오염 예외 등록 거부: -Key 가 비어 있습니다" ERROR
+        return $null
+    }
+    $path = Resolve-RepoPath '.agents/briefs/logs/.protocol-pollution-allowlist.json'
+    $registeredAt = [datetime]::UtcNow
+    $capturedRecord = [ordered]@{
+        kind = $Kind
+        key = $Key.Trim()
+        reason = $Reason.Trim()
+        registeredAt = $registeredAt.ToString('o')
+        expiresAt = $registeredAt.AddMinutes($TtlMinutes).ToString('o')
+    }
+    Write-AtomicRMW -Path $path -Transform {
+        param($previous)
+        $now = [datetime]::UtcNow
+        $kept = @()
+        foreach ($entry in @($previous.entries)) {
+            if ($null -eq $entry) { continue }
+            $expires = [datetime]::MinValue
+            if ([datetime]::TryParse([string]$entry.expiresAt, [ref]$expires) -and $expires.ToUniversalTime() -gt $now) { $kept += $entry }
+        }
+        $kept += $capturedRecord
+        return [ordered]@{ schemaVersion = 1; entries = $kept }
+    } -Depth 6
+    return $capturedRecord
+}
+
 function Test-ProtocolPollution {
     param(
         [string]$Stage,
@@ -58,8 +126,15 @@ function Test-ProtocolPollution {
         [hashtable]$RouterBefore
     )
     if ($Stage -ne 'impl') { return @{ Polluted = $false } }
+    # CFG084: 사전 등록된 만료 시간부 예외만 오염 후보에서 제외한다. 등록되지 않은 변경은
+    # 기존과 완전히 동일하게 오염으로 판정한다(기본 탐지 강도 무변경).
+    $allowlist = @(Get-ProtocolPollutionAllowlist)
     $packetsAfter = Get-PacketFileSnapshot
     $newPackets = @($packetsAfter | Where-Object { $_ -notin $PacketsBefore })
+    $newPackets = @($newPackets | Where-Object {
+        $candidate = $_
+        -not (@($allowlist | Where-Object { $_.kind -eq 'packet' -and $_.key -eq $candidate }).Count -gt 0)
+    })
     if ($newPackets.Count -gt 0) {
         $msg = "신규 패킷 파일 생성 감지 ($($newPackets -join ', ')) — 구현 단계 권한 초과"
         Write-Log "❌ [$Stage] $msg" ERROR
@@ -69,6 +144,7 @@ function Test-ProtocolPollution {
     foreach ($k in $RouterBefore.Keys) {
         if ($k -eq $TaskId -or $k -eq (Get-NormalizedTaskId $TaskId)) { continue }
         if ($routerAfter.ContainsKey($k) -and $routerAfter[$k] -ne $RouterBefore[$k]) {
+            if (@($allowlist | Where-Object { $_.kind -eq 'router' -and $_.key -eq $k }).Count -gt 0) { continue }
             $msg = "타 작업($k) 라우터 행 임의 변경 감지 — 구현 단계 권한 초과"
             Write-Log "❌ [$Stage] $msg" ERROR
             return @{ Polluted = $true; Reason = $msg }

@@ -12,6 +12,7 @@
 # promotion-notes.md)는 프로젝트에 배포하지 않으므로 이 목록에 넣지 않는다.
 dispatch-with-hang-detect.ps1
 check-packet-archive.ps1
+allow-concurrent-packet-work.ps1
 model-profiles.json
 model-profile.ps1
 orchestrate-packet.ps1
