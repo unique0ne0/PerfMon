@@ -1,14 +1,26 @@
 ﻿# BEGIN harness-generated (managed-by: ai-agents-config sync-configs.ps1 — do not edit by hand)
 scripts/dispatch-with-hang-detect.ps1 linguist-generated=true
 scripts/check-packet-archive.ps1 linguist-generated=true
+scripts/allow-concurrent-packet-work.ps1 linguist-generated=true
 scripts/model-profiles.json linguist-generated=true
 scripts/model-profile.ps1 linguist-generated=true
 scripts/orchestrate-packet.ps1 linguist-generated=true
 scripts/session-health.ps1 linguist-generated=true
+scripts/session-health-hook.ps1 linguist-generated=true
 scripts/gy-orchestrator-prompt.md linguist-generated=true
 scripts/commit-harness-sync.ps1 linguist-generated=true
 scripts/task-status.ps1 linguist-generated=true
 scripts/sweep-orphan-browsers.ps1 linguist-generated=true
 scripts/stage-thresholds.json linguist-generated=true
+scripts/harness-contracts.ps1 linguist-generated=true
+scripts/harness-io.ps1 linguist-generated=true
+scripts/harness-lock.ps1 linguist-generated=true
+scripts/harness-ledger.ps1 linguist-generated=true
+scripts/harness-verdict.ps1 linguist-generated=true
+scripts/harness-stage-engine.ps1 linguist-generated=true
+scripts/harness-model-chain.ps1 linguist-generated=true
+scripts/harness-session-continuation.ps1 linguist-generated=true
+scripts/harness-dispatch-core.ps1 linguist-generated=true
+scripts/agy-models.txt linguist-generated=true
 scripts/harness-assets.txt linguist-generated=true
 # END harness-generated
