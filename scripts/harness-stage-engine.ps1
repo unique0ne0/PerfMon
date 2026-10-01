@@ -290,6 +290,19 @@ function Wait-AgentTreeDrained {
     }
 }
 
+# CFG087(063): 워처 heartbeat 갱신은 순수 관측이다 — 상태 파일이 일시적으로 잠겨 쓰기에
+# 실패해도 그 실패로 디스패처가 죽으면 안 된다. 실패는 WARN만 남기고 계속 진행한다.
+# 반면 단계 시작·완료·실패 같은 전이 기록은 지금처럼 실패를 상위로 전파한다
+# (상태 전이 유실을 조용히 넘기지 않는다). 이 비치명성은 heartbeat 한 지점에만 한정한다.
+function Write-StageHeartbeatState {
+    param([string]$Stage, [int]$Cycle, [int]$ProcessId, [string]$LogRel, [string]$Model)
+    try {
+        Write-StageState -Stage $Stage -Cycle $Cycle -State 'running' -ProcessId $ProcessId -EvidencePaths @($LogRel) -Reason 'watcher heartbeat' -Model $Model
+    } catch {
+        Write-Log "⚠️ [$Stage] heartbeat 상태 기록 실패(무시하고 계속): $($_.Exception.Message)" WARN
+    }
+}
+
 function Invoke-StageProcess {
     param([string]$Stage, [hashtable]$Config, [string]$ToolCmd, [int]$Cycle, [ref]$ExitCode, [ref]$ElapsedSeconds, [string]$Model)
 
@@ -327,7 +340,7 @@ function Invoke-StageProcess {
             # 이미 끝난 정상 프로세스를 'hang'으로 반환할 수 있다.
             $proc.Refresh()
             if ($proc.HasExited) { break }
-            Write-StageState -Stage $Stage -Cycle $Cycle -State 'running' -ProcessId $proc.Id -EvidencePaths @($logRel) -Reason 'watcher heartbeat' -Model $Model
+            Write-StageHeartbeatState -Stage $Stage -Cycle $Cycle -ProcessId $proc.Id -LogRel $logRel -Model $Model
             $sz = if (Test-Path $logAbs) { (Get-Item $logAbs).Length } else { 0 }
             $logChanged = $sz -ne $monitor.LastSize
             if ($logChanged) { $monitor.LastLogChangedAt = Get-Date; $monitor.LastSize = $sz; $monitor.HangReported = $false }

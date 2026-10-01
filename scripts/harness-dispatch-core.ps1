@@ -153,6 +153,41 @@ function Test-ProtocolPollution {
     return @{ Polluted = $false }
 }
 
+# CFG087: verify 캡처 파일은 verify의 손자 프로세스(Gradle --no-daemon JVM 등)가 아직 stdout
+# 핸들을 쥐고 있으면 잠겨 있을 수 있다. FileShare.ReadWrite|Delete로 열고, 실패하면 최대
+# 5회 × 1초 백오프로 재시도한다. 끝내 실패하면 예외가 아니라 Success=$false를 돌려준다 —
+# 호출부(Invoke-VerifyGateCore)가 그 결과를 실패로 반환해 CFG074 재검증 경로를 타게 하며,
+# 캡처 읽기 실패를 성공으로 승격하지 않는다.
+function Read-CaptureFileText {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [System.Text.Encoding]$Encoding,
+        [int]$MaxAttempts = 5,
+        [int]$RetryDelayMs = 1000
+    )
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            $share = ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+            $stream = New-Object System.IO.FileStream -ArgumentList @($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+            try {
+                $reader = New-Object System.IO.StreamReader -ArgumentList @($stream, $Encoding)
+                try {
+                    return [pscustomobject]@{ Success = $true; Text = $reader.ReadToEnd() }
+                } finally { $reader.Dispose() }
+            } finally { $stream.Dispose() }
+        } catch {
+            $readException = $_.Exception
+            while ($readException.InnerException) { $readException = $readException.InnerException }
+            if (-not ($readException -is [System.IO.IOException])) { throw }
+            if ($attempt -ge $MaxAttempts) {
+                return [pscustomobject]@{ Success = $false; Text = $null }
+            }
+            Start-Sleep -Milliseconds $RetryDelayMs
+        }
+    }
+    return [pscustomobject]@{ Success = $false; Text = $null }
+}
+
 function Invoke-VerifyGateCore {
     param([string]$Stage, [string]$AttemptLabel)
 
@@ -187,14 +222,33 @@ function Invoke-VerifyGateCore {
         $verifyExit = $verify.ExitCode
         $verifyEncoding = [Console]::OutputEncoding
         $verifyOutput = @()
+        # CFG087: 캡처 읽기는 Read-CaptureFileText가 FileShare.ReadWrite|Delete + 5×1초 재시도로
+        # 처리한다. 끝내 실패해도 예외를 던지지 않고 실패 결과를 반환해 Invoke-VerifyGate의
+        # CFG074 자동 재검증 경로를 타게 한다.
+        $captureReadFailed = $false
         foreach ($capture in @($verifyOut, $verifyErr)) {
             if (-not (Test-Path $capture)) { continue }
-            $captureText = [System.IO.File]::ReadAllText($capture, $verifyEncoding)
+            $captureResult = Read-CaptureFileText -Path $capture -Encoding $verifyEncoding
+            if (-not $captureResult.Success) { $captureReadFailed = $true; break }
+            $captureText = $captureResult.Text
             if ($captureText.Length -gt 0) { $verifyOutput += ($captureText.TrimEnd("`r", "`n") -split "`r?`n") }
+        }
+        if ($captureReadFailed) {
+            Write-Log "❌ [$Stage] verify 캡처 파일 읽기 실패(잠금) — verify 종료 코드: $verifyExit" ERROR
+            return @{ Success = $false; FailureReason = 'verify 캡처 파일 읽기 실패(잠금)'; Output = @() }
         }
     } finally {
         $ErrorActionPreference = $prevEap
-        Remove-Item $verifyOut, $verifyErr -ErrorAction SilentlyContinue
+        # CFG087: 잠금 때문에 정리가 실패해도 조용히 삼키지 않는다 — 잔존 경로를 WARN으로 남긴다.
+        foreach ($capturePath in @($verifyOut, $verifyErr)) {
+            try {
+                Remove-Item -LiteralPath $capturePath -Force -ErrorAction Stop
+            } catch {
+                if (Test-Path -LiteralPath $capturePath) {
+                    Write-Log "⚠️ [$Stage] verify 캡처 임시 파일 정리 실패 — 잔존: $capturePath ($($_.Exception.Message))" WARN
+                }
+            }
+        }
     }
     $verifyOutput | Out-File $verifyLogAbs -Encoding UTF8
     if ($verifyExit -ne 0) {
@@ -611,6 +665,8 @@ function Dispatch-Stage {
     if ($Stage -eq 'qa' -and [string]::IsNullOrWhiteSpace($PromptOverride)) {
         $PromptOverride = "$($config.DefaultPrompt) 이번 QA verdict JSON의 cycle은 $($cycle.Id)로 기록해."
     }
+    # CFG087(060c): 재시도 attempt에 맥락 안내를 덧붙일 때 기준이 되는 원본 프롬프트.
+    $basePrompt = if ([string]::IsNullOrWhiteSpace($PromptOverride)) { $config.DefaultPrompt } else { $PromptOverride }
     $qaDispatchedAt = Clear-QaArtifacts -Stage $Stage -Config $config
     Invoke-SessionHealthCheck -Stage $Stage
     $preflight = Invoke-StagePreflightGate -Stage $Stage -config $config -Cycle $cycle -LogRel $logRel -qaDispatchedAt $qaDispatchedAt
@@ -627,7 +683,7 @@ function Dispatch-Stage {
     $logicalAbsoluteDeadline = $logicalStartedAt.AddMinutes($logicalHardLimit * 3)
     $continuationCount = 0
     $exit = $null; $outcome = $null; $attemptFailures = @()
-    $modelIndex = 0; $attemptNumber = 0; $lastDeterministicSig = $null; $consecutiveDeterministicCount = 0
+    $modelIndex = 0; $attemptNumber = 0; $previousAttemptModel = $null; $lastDeterministicSig = $null; $consecutiveDeterministicCount = 0
 
     while ($modelIndex -lt $models.Count) {
         $model = $models[$modelIndex]
@@ -638,6 +694,9 @@ function Dispatch-Stage {
             continue
         }
         $toolCmd = Build-ToolCommand -Config $config -Stage $Stage -PromptOverride $PromptOverride -Model $model -BypassToolPermissions:$BypassToolPermissions
+        # CFG087: 세션 resume/continuation 명령으로 이어가는 attempt는 새 명령으로 덮어쓰지
+        # 않도록 표시한다(아래 재시도 맥락 재조립에서 제외).
+        $attemptCmdIsContinuation = $false
         $modelTag = if ($model) { " (모델 $($modelIndex + 1)/$($models.Count): $model)" } else { "" }
         Write-Log "작업 $TaskId [$Stage] 디스패치$modelTag" INFO
         Write-Log "명령: $toolCmd" INFO
@@ -645,6 +704,23 @@ function Dispatch-Stage {
         $attempt = 1
         while ($true) {
             $attemptNumber++
+            # CFG087(060c): 모델 폴백 등으로 두 번째 이후 attempt를 새로 시작할 때, 첫 attempt
+            # 시작 전보다 작업 트리에 새 미커밋 변경이 있으면 그것이 직전 attempt의 잔여물임을
+            # 프롬프트 끝에 알린다(060(c) — 이미 있던 구현으로 오인해 사실과 다른 인계를 막는다).
+            # 세션 resume/continuation 명령은 대상에서 제외한다($attemptCmdIsContinuation).
+            if ($attemptNumber -gt 1 -and $attempt -eq 1 -and -not $attemptCmdIsContinuation -and $null -ne $before) {
+                $retryTree = Get-TreeState
+                # Only uncommitted content belongs to this warning. A changed HEAD alone means
+                # the prior attempt committed work; it must not be described as uncommitted residue.
+                $treeChangedSinceFirst = $null -ne $retryTree -and (
+                    $before.Dirty -ne $retryTree.Dirty -or
+                    ($before.FingerprintOk -and $retryTree.FingerprintOk -and $before.Fingerprint -ne $retryTree.Fingerprint))
+                if ($treeChangedSinceFirst) {
+                    $contextPrompt = "$basePrompt`n`n직전 attempt($previousAttemptModel)가 중단되며 남긴 미커밋 변경이 작업 트리에 있다. 이를 이미 있던 구현으로 간주하지 말고, 검토 후 이어서 완성하거나 바로잡아라."
+                    $toolCmd = Build-ToolCommand -Config $config -Stage $Stage -PromptOverride $contextPrompt -Model $model -BypassToolPermissions:$BypassToolPermissions
+                    Write-Log "⚠️ [$Stage] 재시도 맥락 안내 추가 — 첫 attempt 이후 미커밋 변경 감지, 프롬프트에 직전 잔여물 주의를 덧붙였습니다" WARN
+                }
+            }
             $attemptLog = Get-AttemptLogPath -LogFile $logRel -CycleNumber $cycle.Id -AttemptNumber $attemptNumber
             Write-Log "시도 로그: $attemptLog (latest: $logRel)" INFO
             $attemptResult = Invoke-ModelAttempt -Stage $Stage -Config $config -ToolCmd $toolCmd -AttemptLog $attemptLog -LatestLog $logRel -Cycle $cycle.Id -Model $model
@@ -665,7 +741,7 @@ function Dispatch-Stage {
             }
             if ($outcome -eq 'provider_timeout') {
                 $resume = Resume-ProviderTimeout -Stage $Stage -config $config -Cycle $cycle -Attempt $attemptResult -AttemptNumber $attemptNumber -Model $model -AttemptLog $attemptLog -ContinuationCount $continuationCount -LogicalHardLimit $logicalHardLimit -LogicalAbsoluteDeadline $logicalAbsoluteDeadline
-                if ($resume.Continue) { $continuationCount = $resume.ContinuationCount; $toolCmd = $resume.ToolCmd; continue }
+                if ($resume.Continue) { $continuationCount = $resume.ContinuationCount; $toolCmd = $resume.ToolCmd; $attemptCmdIsContinuation = $true; continue }
             }
             $fClass = Get-FailureClass -Outcome $outcome
             if ($outcome -eq 'hang' -and $config.Retry -and $attempt -eq 1 -and $fClass -ne 'deterministic') {
@@ -673,6 +749,7 @@ function Dispatch-Stage {
                 if ($retry.ShouldRetry) {
                     $attempt = 2
                     if ($retry.ToolCmd) { $toolCmd = $retry.ToolCmd }
+                    $attemptCmdIsContinuation = $true
                     Write-Log "⚠️ 재시도는 위 상태를 정리하지 않고 그대로 이어서 실행합니다." WARN
                     continue
                 }
@@ -682,6 +759,7 @@ function Dispatch-Stage {
         if ($outcome -eq 'ok') { break }
         $reason = Resolve-OutcomeReason -Outcome $outcome
         $attemptFailures += "${model}: $reason"
+        $previousAttemptModel = $model
         $fClass = Get-FailureClass -Outcome $outcome
         $sig = Get-FailureSignature -FailureClass $fClass -Adapter $config.Adapter -Reason $reason
         $rec = Record-StageAttempt -Stage $Stage -Signature $sig -FailureClass $fClass
@@ -766,7 +844,15 @@ function Test-LiveStageActivity {
                     $heartbeat = ([datetime]$lease.heartbeatAt).ToUniversalTime()
                     $fresh = (([datetime]::UtcNow) - $heartbeat).TotalSeconds -lt 600
                 } catch { $fresh = $false }
-                if ($fresh) { $live += "[$s] 살아있는 running lease cycle $($lease.cycle) PID $($lease.pid)" }
+                if ($fresh) {
+                    # CFG087: heartbeat가 신선해도 lease PID가 죽어 있으면 살아 있다고 보지 않는다.
+                    # PID가 0이거나 없으면(구 스키마·수동 기록) 기존 heartbeat 판정을 그대로 쓴다.
+                    # PID 재사용으로 다른 프로세스가 같은 PID를 받은 경우는 heartbeat 판정과 동등하다.
+                    $leasePid = 0
+                    $leasePidKnown = [int]::TryParse([string]$lease.pid, [ref]$leasePid) -and $leasePid -gt 0
+                    $leasePidAlive = (-not $leasePidKnown) -or ($null -ne (Get-Process -Id $leasePid -ErrorAction SilentlyContinue))
+                    if ($leasePidAlive) { $live += "[$s] 살아있는 running lease cycle $($lease.cycle) PID $($lease.pid)" }
+                }
             }
         }
     }

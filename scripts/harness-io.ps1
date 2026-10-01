@@ -14,7 +14,37 @@ function Write-AtomicJson {
     $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
     $json = $Value | ConvertTo-Json -Depth $Depth
     [System.IO.File]::WriteAllText($temporary, $json, (New-Object System.Text.UTF8Encoding($true)))
-    Move-Item -LiteralPath $temporary -Destination $Path -Force
+    # CFG087: PS 5.1의 Move-Item -Force는 대상 삭제 후 이동(비원자)이라, 대상 파일을
+    # FILE_SHARE_DELETE 없이 열고 있는 reader(대시보드·lease 판정·백신 등)가 있으면
+    # ERROR_ALREADY_EXISTS로 실패한다. 대상이 있으면 File.Replace, 없으면 File.Move로
+    # 교체하고, IOException·UnauthorizedAccessException은 짧은 백오프로 재시도한다.
+    # Move 도중 대상이 경합으로 생기면 다음 시도의 Replace 분기가 처리한다.
+    # 최종 실패 시 tmp를 지우고 예외를 다시 던진다. 시그니처와 UTF-8 BOM 인코딩은 유지한다.
+    $maxAttempts = 5
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            if ([System.IO.File]::Exists($Path)) {
+                # PS 5.1은 .NET 메서드의 string 인자에 $null을 그대로 넘기지 못한다 —
+                # 백업 없음은 [NullString]::Value로 명시해야 ArgumentException이 나지 않는다.
+                [System.IO.File]::Replace($temporary, $Path, [NullString]::Value)
+            } else {
+                [System.IO.File]::Move($temporary, $Path)
+            }
+            return
+        } catch {
+            # PowerShell 5.1 wraps static .NET invocation failures in MethodInvocationException.
+            # Classify the deepest exception so IOException/UnauthorizedAccessException really
+            # take the promised retry path instead of failing immediately on the wrapper type.
+            $writeException = $_.Exception
+            while ($writeException.InnerException) { $writeException = $writeException.InnerException }
+            $retryable = ($writeException -is [System.IO.IOException]) -or ($writeException -is [System.UnauthorizedAccessException])
+            if (-not $retryable -or $attempt -ge $maxAttempts) {
+                Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+                throw
+            }
+            Start-Sleep -Milliseconds 200
+        }
+    }
 }
 
 function Write-AtomicRMW {
