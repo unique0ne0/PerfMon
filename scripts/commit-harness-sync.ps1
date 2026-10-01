@@ -11,6 +11,7 @@ commit-harness-sync.ps1 — sync-configs.ps1 -Push 로 배포된 하네스 사�
 스킵 사유:
   - skipped-no-repo: 대상 저장소에 .git 이 없거나 디렉터리가 존재하지 않음
   - skipped-locked: 살아있는 디스패치 락이 감지됨
+  - deferred-busy: sync-configs.ps1 -Push 가 실행 중 체인 때문에 이번 배포를 지연함(CFG089)
   - nothing-to-commit: 하네스 자산에 변경 없음
   - skipped-unrelated-only: 무관한 파일만 변경됨
 
@@ -22,6 +23,10 @@ Windows PowerShell 5.1 호환, UTF-8 + BOM 저장.
 param(
     [string]$RepoRoot,
     [string]$TargetList,
+    # CFG089: sync-configs.ps1 이 실행 중 체인 때문에 이번 Push에서 배포를 지연한 대상 경로 목록
+    # (한 줄에 하나). 이 대상은 배포가 없었으니 커밋할 것도 없고, 아래 Test-ActiveLock 이 같은
+    # 락을 감지해 하류 skipped-locked(오류 집계)로 오인하는 것도 막는다 — 지연은 실패가 아니다.
+    [string]$DeferredTargetList,
     [switch]$DryRun,
     [switch]$PushTargets,
     [string]$CommitMessage
@@ -243,6 +248,15 @@ function Test-ActiveLock {
 $results = @()
 $targets = Get-HarnessTargets
 
+# CFG089: 지연 대상 집합(정규화된 전체 경로). 파일이 없거나 비면 빈 배열 — 기존 동작과 동일하다.
+$deferredTargets = @()
+if (-not [string]::IsNullOrWhiteSpace($DeferredTargetList) -and (Test-Path -LiteralPath $DeferredTargetList)) {
+    $deferredTargets = @(Get-Content -LiteralPath $DeferredTargetList |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ } |
+        ForEach-Object { [System.IO.Path]::GetFullPath($_) })
+}
+
 foreach ($proj in $targets) {
     $entry = [pscustomobject]@{
         Repo     = $proj
@@ -254,6 +268,17 @@ foreach ($proj in $targets) {
     if (-not (Test-Path $proj)) {
         $entry.Status = 'skipped-no-repo'
         $entry.Detail = '대상 경로가 존재하지 않음'
+        $results += $entry
+        continue
+    }
+
+    # CFG089: 이번 Push가 실행 중 체인 때문에 지연한 저장소는 배포가 없었으므로 커밋 대상도 없다.
+    # 아래 Test-ActiveLock 이 같은 락을 감지해 하류 'skipped-locked'(오류 집계)로 오인하기 전에
+    # 여기서 먼저 걸러 'deferred-busy'(비오류)로 표시한다. git 저장소 여부보다 먼저 판정한다 —
+    # 지연은 배포 자체가 없었으므로 커밋 상태를 볼 필요가 없다.
+    if ($deferredTargets -contains [System.IO.Path]::GetFullPath($proj)) {
+        $entry.Status = 'deferred-busy'
+        $entry.Detail = '실행 중 파이프라인 체인 — 이번 Push 배포 지연(체인 종료 후 재실행)'
         $results += $entry
         continue
     }
@@ -385,6 +410,7 @@ foreach ($r in $results) {
         'nothing-to-commit'   { 'DarkGray' }
         'skipped-no-repo'     { 'Yellow' }
         'skipped-locked'      { 'Yellow' }
+        'deferred-busy'       { 'Yellow' }
         'skipped-unrelated-only' { 'Yellow' }
         'dry-run'             { 'Cyan' }
         'error'               { 'Red' }
