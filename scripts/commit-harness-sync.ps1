@@ -4,6 +4,9 @@ commit-harness-sync.ps1 — sync-configs.ps1 -Push 로 배포된 하네스 사�
 동작: harness-targets.txt 의 각 다운스트림 저장소를 순회하며, 하네스 자산 파일만
       pathspec-scoped 로 커밋한다. 무관한 staged/modified 변경이 있어도 절대 함께 커밋하지 않는다.
       -PushTargets 지정 시에만 원격에 push를 수행한다.
+      CFG088: `.gitattributes` 의 `# BEGIN/END harness-generated` 블록 변경도(그 diff의
+      추가·삭제 줄이 전부 블록 안에 있을 때만) 같은 커밋에 포함한다. 블록 밖 변경이
+      섞이면 .gitattributes만 제외하고 사유를 Detail 에 남긴다.
 
 스킵 사유:
   - skipped-no-repo: 대상 저장소에 .git 이 없거나 디렉터리가 존재하지 않음
@@ -71,6 +74,152 @@ function Invoke-GitQuiet {
     }
 }
 
+# ── CFG088: .gitattributes 하네스 블록 변경 감지 ───────────────────────────────
+# sync-configs.ps1 의 Set-HarnessGitAttributes(L195 부근)가 하류 .gitattributes 에
+# `# BEGIN/END harness-generated` 블록을 갱신하지만, 이 스크립트는 scripts/ 자산만
+# pathspec 으로 잡아 그 변경이 영원히 미커밋으로 남았다(CFG-BL-065). 아래 상수는
+# sync-configs.ps1 의 $beginMarker/$endMarker 와 반드시 같아야 한다(공유 모듈이 없어
+# 상호 참조 주석으로 묶는다 — sync-configs.ps1 도 이 위치를 주석으로 가리킨다).
+$HarnessBeginMarker = '# BEGIN harness-generated (managed-by: ai-agents-config sync-configs.ps1 — do not edit by hand)'
+$HarnessEndMarker = '# END harness-generated'
+
+# 줄바꿈·BOM을 정규화하고 EOF 뒤쪽 빈 줄을 제거한 줄 배열을 돌려준다.
+# git diff 의 줄 번호(1-based)와 배열 인덱스(0-based)를 맞추려면 블록보다 뒤에 있는
+# EOF 개행 잔여물을 없애야 한다(블록 앞쪽 인덱스는 영향받지 않는다).
+function ConvertTo-NormalizedLines {
+    param([string]$Text)
+    if ($null -eq $Text) { return ,@() }
+    $t = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+    if ($t.Length -gt 0 -and $t[0] -eq [char]0xFEFF) { $t = $t.Substring(1) }
+    $list = New-Object System.Collections.ArrayList
+    foreach ($ln in @($t -split "`n")) { [void]$list.Add($ln) }
+    while ($list.Count -gt 0 -and $list[$list.Count - 1] -eq '') { $list.RemoveAt($list.Count - 1) }
+    return ,@($list.ToArray())
+}
+
+# 하네스 블록의 줄 범위(0-based 인덱스)를 찾는다. Exact 는 새 파일용으로 마커 전문이
+# 정확히 일치해야 하고(손편집 마커를 관리 블록으로 오인하지 않기 위함), 아니면
+# `# BEGIN/END harness-generated` 접두 일치로 옛 블록 위치를 잡아 마커 변경을 탐지한다.
+function Find-HarnessBlockRange {
+    param([string[]]$Lines, [switch]$Exact)
+    $begin = -1
+    $end = -1
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $t = $Lines[$i].Trim()
+        $beginMatch = if ($Exact) { $t -eq $HarnessBeginMarker } else { $t.StartsWith('# BEGIN harness-generated') }
+        $endMatch = if ($Exact) { $t -eq $HarnessEndMarker } else { $t.StartsWith('# END harness-generated') }
+        if ($begin -lt 0) {
+            if ($beginMatch) { $begin = $i }
+        } elseif ($endMatch) {
+            $end = $i
+            break
+        }
+    }
+    if ($begin -lt 0 -or $end -lt 0) { return $null }
+    return [pscustomobject]@{ Start = $begin; End = $end }
+}
+
+# `.gitattributes` 변경이 하네스 블록 내부에만 있는지 판정한다.
+#   Changed       : .gitattributes 에 변경이 있음(status 로 확인)
+#   Include       : 같은 커밋 pathspec 에 포함해도 안전(추가·삭제 줄이 전부 블록 내부)
+#   OutsideChange : 블록 밖 변경이거나 블록 경계를 신뢰할 수 없음 → 자동 커밋 금지
+function Get-GitAttributesDecision {
+    param([Parameter(Mandatory)][string]$ProjRoot)
+
+    $decision = [pscustomobject]@{
+        Changed       = $false
+        Include       = $false
+        OutsideChange = $false
+    }
+
+    $gaName = '.gitattributes'
+    $status = @(Invoke-GitQuiet -ProjRoot $ProjRoot -GitArgs @('status', '--porcelain', '--', $gaName) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($LASTEXITCODE -ne 0) { throw "git status .gitattributes 판정 실패 (exit $LASTEXITCODE)" }
+    if ($status.Count -eq 0) { return $decision }
+    $decision.Changed = $true
+
+    $gaPath = Join-Path $ProjRoot $gaName
+    $newRaw = if (Test-Path -LiteralPath $gaPath) { [System.IO.File]::ReadAllText($gaPath) } else { '' }
+    $newLines = ConvertTo-NormalizedLines -Text $newRaw
+    $newBlock = Find-HarnessBlockRange -Lines $newLines -Exact
+    if ($null -eq $newBlock) {
+        # 새 파일에서 관리 블록을 확정할 수 없으면 자동 커밋하지 않는다(수동 확인).
+        $decision.OutsideChange = $true
+        return $decision
+    }
+
+    # HEAD에 파일이 없는 신규 추가와 `git show` 자체의 실패를 구분한다. native git은
+    # non-zero exit를 PowerShell 예외로 바꾸지 않으므로 매 호출 직후 명시적으로 검사한다.
+    $headEntry = @(Invoke-GitQuiet -ProjRoot $ProjRoot -GitArgs @('ls-tree', '--name-only', 'HEAD', '--', $gaName))
+    if ($LASTEXITCODE -ne 0) { throw "git ls-tree .gitattributes 판정 실패 (exit $LASTEXITCODE)" }
+    if ($headEntry.Count -gt 0) {
+        $oldRaw = (Invoke-GitQuiet -ProjRoot $ProjRoot -GitArgs @('show', ('HEAD:' + $gaName))) -join "`n"
+        if ($LASTEXITCODE -ne 0) { throw "git show .gitattributes 판정 실패 (exit $LASTEXITCODE)" }
+    } else {
+        $oldRaw = ''
+    }
+    $oldLines = ConvertTo-NormalizedLines -Text $oldRaw
+    $oldBlock = if ($oldLines.Count -gt 0) { Find-HarnessBlockRange -Lines $oldLines } else { $null }
+
+    # 블록 마커 줄 자체가 바뀌면 블록 경계를 신뢰할 수 없다 — 블록 밖 변경으로 본다.
+    # (아래 diff 루프에서 마커 줄이 변경분에 나타나는지로 판정한다. git show 출력은 콘솔
+    #  코드페이지로 디코드돼 비ASCII 부분이 깨질 수 있으므로 마커 텍스트 비교는 하지 않고,
+    #  인코딩에 영향받지 않는 ASCII 접두 일치로 확인한다.)
+    $isUntracked = ($status[0] -match '^\?\?')
+    $markerTouched = $false
+    $addedLines = New-Object System.Collections.ArrayList
+    $removedLines = New-Object System.Collections.ArrayList
+    if ($isUntracked) {
+        # 추적 전 새 파일: 전체 내용이 "추가"다. 블록만 있으면 전 줄이 블록 안이다.
+        for ($i = 0; $i -lt $newLines.Count; $i++) { [void]$addedLines.Add($i + 1) }
+    } else {
+        $diff = @(Invoke-GitQuiet -ProjRoot $ProjRoot -GitArgs @('diff', '-U0', 'HEAD', '--no-color', '--', $gaName))
+        if ($LASTEXITCODE -ne 0) { throw "git diff .gitattributes 판정 실패 (exit $LASTEXITCODE)" }
+        $curOld = 0
+        $curNew = 0
+        foreach ($dl in $diff) {
+            if ($dl -match '^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@') {
+                $curOld = [int]$Matches[1]
+                $curNew = [int]$Matches[2]
+                continue
+            }
+            if ($dl.StartsWith('---') -or $dl.StartsWith('+++')) { continue }
+            if ($dl.StartsWith('+') -or $dl.StartsWith('-')) {
+                $content = $dl.Substring(1).Trim()
+                # 기존 블록이 있던 파일에서 마커 줄이 추가/삭제되면 마커 자체가 바뀐 것이다.
+                if ($null -ne $oldBlock -and
+                    ($content.StartsWith('# BEGIN harness-generated') -or $content.StartsWith('# END harness-generated'))) {
+                    $markerTouched = $true
+                }
+                if ($dl.StartsWith('+')) { [void]$addedLines.Add($curNew); $curNew++ }
+                else { [void]$removedLines.Add($curOld); $curOld++ }
+            }
+        }
+    }
+
+    if ($markerTouched) {
+        $decision.OutsideChange = $true
+        return $decision
+    }
+
+    foreach ($l in $removedLines) {
+        if ($null -eq $oldBlock -or $l -lt ($oldBlock.Start + 1) -or $l -gt ($oldBlock.End + 1)) {
+            $decision.OutsideChange = $true
+            return $decision
+        }
+    }
+    foreach ($l in $addedLines) {
+        if ($l -lt ($newBlock.Start + 1) -or $l -gt ($newBlock.End + 1)) {
+            $decision.OutsideChange = $true
+            return $decision
+        }
+    }
+
+    $decision.Include = $true
+    return $decision
+}
+
 # ── CFG053: Read-HarnessLockFile 공용 함수에 위임 ─────────────────────────
 function Test-ActiveLock {
     param([string]$ProjRoot)
@@ -131,6 +280,18 @@ foreach ($proj in $targets) {
     # 하네스 자산 경로 (해당 저장소의 scripts/ 아래)
     $assetPaths = @($harnessAssets | ForEach-Object { "scripts/$_" })
 
+    # CFG088: .gitattributes 하네스 블록 변경도 scripts/ 자산과 같은 커밋에 포함한다.
+    # 블록 내부 변경일 때만 Include=true 이고, 블록 밖 변경이면 OutsideChange=true 로
+    # 자동 커밋을 막고 사유를 Detail 에 남긴다(scripts 자산 커밋은 그대로 진행).
+    # 판정 중 예외(파일 잠김 등)는 fail-safe 로 "수동 확인 필요"로 처리한다 — 잘못
+    # 자동 커밋하느니 건너뛰고 사유를 남기는 쪽이 안전하다.
+    try {
+        $gaDecision = Get-GitAttributesDecision -ProjRoot $proj
+    } catch {
+        $gaDecision = [pscustomobject]@{ Changed = $true; Include = $false; OutsideChange = $true }
+    }
+    $gaWarning = if ($gaDecision.OutsideChange) { '.gitattributes 블록 밖 변경 — 수동 확인 필요' } else { $null }
+
     # 전체 상태는 "무관한 변경만 있음"을 구분하는 데만 사용한다. 커밋 대상 판정은
     # 반드시 아래 pathspec-scoped status 결과로만 한다.
     $allStatusOutput = @(Invoke-GitQuiet -ProjRoot $proj -GitArgs @('status', '--porcelain'))
@@ -138,18 +299,6 @@ foreach ($proj in $targets) {
     # git status --porcelain -- <pathspec> 로 하네스 자산만 확인
     $statusOutput = @(Invoke-GitQuiet -ProjRoot $proj -GitArgs (@('status', '--porcelain', '--') + $assetPaths))
     $statusText = ($statusOutput -join "`n").Trim()
-
-    if ([string]::IsNullOrWhiteSpace($statusText)) {
-        if (@($allStatusOutput | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
-            $entry.Status = 'skipped-unrelated-only'
-            $entry.Detail = '무관한 파일만 변경됨'
-        } else {
-            $entry.Status = 'nothing-to-commit'
-            $entry.Detail = '하네스 자산에 변경 없음'
-        }
-        $results += $entry
-        continue
-    }
 
     # 변경된 하네스 자산 경로 추출
     $changedAssets = @()
@@ -161,24 +310,39 @@ foreach ($proj in $targets) {
         }
     }
 
-    if ($changedAssets.Count -eq 0) {
-        $entry.Status = 'skipped-unrelated-only'
-        $entry.Detail = '무관한 파일만 변경됨'
+    if ([string]::IsNullOrWhiteSpace($statusText) -and -not $gaDecision.Include) {
+        if (@($allStatusOutput | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+            $entry.Status = 'skipped-unrelated-only'
+            $entry.Detail = if ($gaWarning) { "무관한 파일만 변경됨 — $gaWarning" } else { '무관한 파일만 변경됨' }
+        } else {
+            $entry.Status = 'nothing-to-commit'
+            $entry.Detail = '하네스 자산에 변경 없음'
+        }
         $results += $entry
         continue
     }
 
-    $entry.Files = $changedAssets
+    # pathspec-scoped 커밋: 하네스 자산 + (블록 내부 변경일 때만) .gitattributes
+    $commitPaths = @($changedAssets | ForEach-Object { "scripts/$_" })
+    if ($gaDecision.Include) { $commitPaths += '.gitattributes' }
+
+    if ($commitPaths.Count -eq 0) {
+        $entry.Status = 'skipped-unrelated-only'
+        $entry.Detail = if ($gaWarning) { "무관한 파일만 변경됨 — $gaWarning" } else { '무관한 파일만 변경됨' }
+        $results += $entry
+        continue
+    }
+
+    $entry.Files = @($changedAssets)
+    if ($gaDecision.Include) { $entry.Files += '.gitattributes' }
 
     if ($DryRun) {
         $entry.Status = 'dry-run'
-        $entry.Detail = "커밋 대상: $($changedAssets -join ', ')"
+        $entry.Detail = "커밋 대상: $($commitPaths -join ', ')"
         $results += $entry
         continue
     }
 
-    # pathspec-scoped 커밋: git add + git commit 에서 하네스 자산 경로만 지정
-    $commitPaths = @($changedAssets | ForEach-Object { "scripts/$_" })
     try {
         $addArgs = @('add') + $commitPaths
         Invoke-GitQuiet -ProjRoot $proj -GitArgs $addArgs | Out-Null
@@ -187,7 +351,7 @@ foreach ($proj in $targets) {
         $commitMsg = if (-not [string]::IsNullOrWhiteSpace($CommitMessage)) {
             $CommitMessage
         } else {
-            "chore(harness): sync harness assets from ai-agents-config`n`nAssets: $($changedAssets -join ', ')"
+            "chore(harness): sync harness assets from ai-agents-config`n`nAssets: $($commitPaths -join ', ')"
         }
         $commitArgs = @('commit', '-m', $commitMsg, '--') + $commitPaths
         Invoke-GitQuiet -ProjRoot $proj -GitArgs $commitArgs | Out-Null
@@ -197,15 +361,17 @@ foreach ($proj in $targets) {
             Invoke-GitQuiet -ProjRoot $proj -GitArgs @('push') | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "git push 실패 (exit $LASTEXITCODE)" }
             $entry.Status = 'committed'
-            $entry.Detail = "커밋 및 푸시 완료: $($changedAssets -join ', ')"
+            $entry.Detail = "커밋 및 푸시 완료: $($commitPaths -join ', ')"
         } else {
             $entry.Status = 'committed'
-            $entry.Detail = "커밋 완료: $($changedAssets -join ', ')"
+            $entry.Detail = "커밋 완료: $($commitPaths -join ', ')"
         }
     } catch {
         $entry.Status = 'error'
         $entry.Detail = $_.Exception.Message
     }
+
+    if ($gaWarning -and $entry.Status -ne 'error') { $entry.Detail = "$($entry.Detail) — $gaWarning" }
 
     $results += $entry
 }

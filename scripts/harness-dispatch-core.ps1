@@ -925,14 +925,25 @@ function Invoke-StageWithLock {
         $cycleId = if ($result.CycleId) { [int]$result.CycleId } else { 0 }
         Write-SyntheticQaVerdict -Stage $Stage -Result $result -CycleNumber $cycleId
         Ensure-QaLedger -Stage $Stage -Result $result
-        if ($result.Success) { Test-PipelineStageUpdated -Stage $Stage -PacketPath $CheckPipelinePacket }
-        # CFG079: 단계 성공 시 라우터 행의 "다음 단계"·갱신일을 하네스가 직접 갱신 — 에이전트 기탁 누락 방지.
-        if ($result.Success) { Update-RouterRowAfterStage -Stage $Stage -PacketPath $CheckPipelinePacket }
-        if ($result.Success) { Clear-FailureMarker -Stage $Stage }
         if ($result.Success) {
+            Test-PipelineStageUpdated -Stage $Stage -PacketPath $CheckPipelinePacket
+            # CFG079: 단계 성공 시 라우터 행의 "다음 단계"·갱신일을 하네스가 직접 갱신 — 에이전트 기탁 누락 방지.
+            Update-RouterRowAfterStage -Stage $Stage -PacketPath $CheckPipelinePacket
+            if ($Stage -ne 'integration') {
+                Clear-FailureMarker -Stage $Stage
+            }
             $drift = Get-ScopeDriftWarnings -PacketPath $CheckPipelinePacket -BeforeSnapshot $scopeSnapshot
             if ($drift.Count -gt 0) {
                 Write-Log "⚠️ [$Stage] Scope 범위 이탈 감지 — 선언된 Scope paths 밖 파일 변경: $($drift -join ', ')" WARN
+            }
+            # CFG088: ⑤의 모든 성공 후처리까지 끝난 뒤에만 같은 TaskId의 실패 마커를 정리한다.
+            # 이보다 앞에서 지우면 scope drift 확인 등이 예외로 끝나 최종 실패가 된 경우에도
+            # impl/qa 증거가 이미 사라져 "⑤ 실패 시 미정리" 계약을 깨뜨린다.
+            if ($Stage -eq 'integration') {
+                $clearedMarkers = @(Clear-TaskFailureMarkers -Stages @('impl', 'qa', 'integration'))
+                if ($clearedMarkers.Count -gt 0) {
+                    Write-Log "🧹 [integration] 성공 — 이전 단계 실패 마커 정리: $($clearedMarkers -join ', ')" INFO
+                }
             }
         }
         elseif ($result.Outcome -eq 'approval_required') {

@@ -259,6 +259,24 @@ function Clear-FailureMarker {
     if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
 }
 
+
+# CFG088: ⑤ Integration 성공 시 같은 TaskId 의 이전 단계 실패 마커까지 정리한다.
+# Clear-FailureMarker 는 한 단계만 지우므로, ②·④가 환경 문제로 실패한 뒤 ⑤를 이어 간
+# 작업은 그 마커가 영구히 남아 대시보드에 실패로 보인다. 범위는 항상 현재 TaskId 다 —
+# 다른 TaskId 의 마커는 건드리지 않는다. 지운 단계 이름 배열을 돌려준다.
+function Clear-TaskFailureMarkers {
+    param([string[]]$Stages)
+    $cleared = @()
+    foreach ($s in @($Stages)) {
+        $p = Get-FailureMarkerPath $s
+        if (Test-Path $p) {
+            Remove-Item $p -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path $p)) { $cleared += $s }
+        }
+    }
+    return $cleared
+}
+
 function Write-FailureMarker {
     param([string]$Stage, [string]$Reason)
     $state = Get-TreeState
