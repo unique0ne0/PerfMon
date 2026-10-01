@@ -414,26 +414,48 @@ function Test-QaVerdict {
     # 판별할 수 있다. 봉인은 메타데이터 보강일 뿐 verdict 판정 내용은 바꾸지 않는다.
     # CFG-BL-055: 이번 호출에서 직접 봉인했다면 그 스냅샷을 아래 Validate-QaVerdict에 그대로
     # 넘겨, 봉인과 검증이 서로 다른 시점의 Get-TreeState를 비교하는 경쟁 조건을 없앤다.
+    # CFG086(CFG-BL-061): 봉인은 하네스 소유다. 이번 QA 실행이 막 끝난 직후(-QaDispatchedAt 제공 +
+    # 위 신선도 검사 통과)라면, QA 에이전트가 verdict에 스스로 써 넣은 treeHash가 있어도 항상 현재
+    # 작업 트리 지문으로 덮어쓴다. 에이전트가 쓴 값은 하네스가 검증할 근거가 없고, 그 값을 그대로
+    # 믿으면 에이전트가 treeHash를 쓴 뒤 추적 파일을 더 고친 경우 ⑤ 직전 mismatch로 체인이 멈춘다.
+    # $QaDispatchedAt -eq $null(⑤ preflight, 단독 조회) 경로는 절대 봉인하지 않는다 — 오래된 verdict에
+    # 새 지문을 씌우는 우회로를 만들지 않는 것이 핵심 불변 조건이다.
     $sealedTreeState = $null
-    if ($null -ne $QaDispatchedAt -and
-        ($verdictObj.PSObject.Properties.Name -notcontains 'treeHash' -or [string]::IsNullOrWhiteSpace([string]$verdictObj.treeHash))) {
+    if ($null -ne $QaDispatchedAt) {
         $treeState = Get-TreeState
         if ($treeState -and $treeState.FingerprintOk) {
             # 다른 하네스 경로(Set-QaVerdictStageHarnessFlag 등)가 verdict를 동시에 보강할 수
             # 있으므로, treeHash 봉인도 반드시 동일한 path 단위 RMW mutex 안에서 수행한다.
             # 여기서 일반 원자 쓰기를 쓰면, 이미 읽어 둔 $verdictObj가 동시 갱신 필드를 덮어쓸 수 있다.
+            $script:cfg086AgentTreeHash = $null
             Write-AtomicRMW -Path $vf -Transform {
                 param($current)
                 if ($null -eq $current) { return $null }
-                if ($current.PSObject.Properties.Name -contains 'treeHash' -and -not [string]::IsNullOrWhiteSpace([string]$current.treeHash)) { return $current }
-                $current | Add-Member -NotePropertyName treeHash -NotePropertyValue ([string]$treeState.Fingerprint) -Force
+                $fingerprint = [string]$treeState.Fingerprint
+                $hadTreeHash = ($current.PSObject.Properties.Name -contains 'treeHash' -and -not [string]::IsNullOrWhiteSpace([string]$current.treeHash))
+                # 이미 하네스 지문과 같은 값이면 그대로 둔다(no-op). 없거나 다른 값이면 덮어쓴다.
+                if ($hadTreeHash -and [string]$current.treeHash -eq $fingerprint) { return $null }
+                if ($hadTreeHash) {
+                    # 에이전트가 써 넣은 원래 값을 감사용으로 보존한다.
+                    $current | Add-Member -NotePropertyName agentTreeHash -NotePropertyValue ([string]$current.treeHash) -Force
+                    $script:cfg086AgentTreeHash = [string]$current.treeHash
+                }
+                $current | Add-Member -NotePropertyName treeHash -NotePropertyValue $fingerprint -Force
                 return $current
             } -Depth 8
+            $replacedAgentTreeHash = [string]$script:cfg086AgentTreeHash
+            Remove-Variable -Name cfg086AgentTreeHash -Scope Script -ErrorAction SilentlyContinue
+            if (-not [string]::IsNullOrWhiteSpace($replacedAgentTreeHash)) {
+                $agentPreview = $replacedAgentTreeHash.Substring(0, [Math]::Min(12, $replacedAgentTreeHash.Length))
+                $fingerprintText = [string]$treeState.Fingerprint
+                $sealedPreview = $fingerprintText.Substring(0, [Math]::Min(12, $fingerprintText.Length))
+                Write-Log "QA 에이전트가 써 넣은 treeHash($agentPreview…)를 하네스 지문($sealedPreview…)으로 교체 — 봉인은 하네스 소유" WARN
+            }
             # RMW 중 병행 보강된 필드까지 반영한 실제 파일을 이후 verdict 검증에 사용한다.
             $verdictObj = Get-Content -LiteralPath $vf -Raw -Encoding UTF8 | ConvertFrom-Json
             $verdictValue = [string]$verdictObj.verdict
             # 실제로 봉인된 값이 우리가 방금 계산한 스냅샷과 같을 때만 재사용한다 — 동시에 다른
-            # 경로가 먼저 봉인했다면(skip-if-present) 그 값은 우리 $treeState와 다를 수 있으므로
+            # 경로가 먼저 봉인했다면 그 값은 우리 $treeState와 다를 수 있으므로
             # Validate-QaVerdict가 다시 신선하게 계산하도록 둔다.
             if ([string]$verdictObj.treeHash -eq [string]$treeState.Fingerprint) {
                 $sealedTreeState = $treeState
@@ -508,6 +530,11 @@ function Test-QaVerdict {
         if (-not $autoHealed) {
             foreach ($r in $validation.Reasons) { Write-Log "⚠️ QA verdict 검증 실패: $r" ERROR }
             Write-Log "⚠️ QA verdict 심층 검증 실패($($validation.Reasons.Count)건) — 안전상 ⑤ 중단" ERROR
+            # CFG086(CFG-BL-061): 재봉인 명령은 -Stage qa와 -Reason을 함께 줘야 실행된다. ⑤ 중단
+            # 메시지가 이 조합을 안내하지 않아 1회 재호출이 필요했던 부수 증상을 없앤다.
+            if (@($validation.Reasons) -match '^treeHash mismatch:') {
+                Write-Log "💡 QA verdict treeHash 불일치 — 재봉인 명령: dispatch-with-hang-detect.ps1 -TaskId $TaskId -Stage qa -ResealQaVerdict -Reason `"<사유>`"" WARN
+            }
             return $false
         }
     }
