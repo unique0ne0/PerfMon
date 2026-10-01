@@ -376,7 +376,7 @@ function Validate-QaVerdict {
 # CFG066: Validate-QaVerdict로 판정 내용의 모순·일치성까지 검증한다.
 
 function Test-QaVerdict {
-    param([object]$QaDispatchedAt, [int]$ExpectedCycle = -1)
+    param([object]$QaDispatchedAt, [int]$ExpectedCycle = -1, [string]$SealReason, $AbnormalExitCode)
     $rel = $StageConfig['qa'].VerdictFile
     $vf = Resolve-RepoPath $rel
     if (-not (Test-Path $vf)) {
@@ -432,15 +432,33 @@ function Test-QaVerdict {
                 param($current)
                 if ($null -eq $current) { return $null }
                 $fingerprint = [string]$treeState.Fingerprint
+                $changed = $false
                 $hadTreeHash = ($current.PSObject.Properties.Name -contains 'treeHash' -and -not [string]::IsNullOrWhiteSpace([string]$current.treeHash))
-                # 이미 하네스 지문과 같은 값이면 그대로 둔다(no-op). 없거나 다른 값이면 덮어쓴다.
-                if ($hadTreeHash -and [string]$current.treeHash -eq $fingerprint) { return $null }
-                if ($hadTreeHash) {
-                    # 에이전트가 써 넣은 원래 값을 감사용으로 보존한다.
-                    $current | Add-Member -NotePropertyName agentTreeHash -NotePropertyValue ([string]$current.treeHash) -Force
-                    $script:cfg086AgentTreeHash = [string]$current.treeHash
+                # 이미 하네스 지문과 같은 값이면 treeHash는 그대로 둔다(no-op). 없거나 다른 값이면 덮어쓴다.
+                if (-not ($hadTreeHash -and [string]$current.treeHash -eq $fingerprint)) {
+                    if ($hadTreeHash) {
+                        # 에이전트가 써 넣은 원래 값을 감사용으로 보존한다.
+                        $current | Add-Member -NotePropertyName agentTreeHash -NotePropertyValue ([string]$current.treeHash) -Force
+                        $script:cfg086AgentTreeHash = [string]$current.treeHash
+                    }
+                    $current | Add-Member -NotePropertyName treeHash -NotePropertyValue $fingerprint -Force
+                    $changed = $true
                 }
-                $current | Add-Member -NotePropertyName treeHash -NotePropertyValue $fingerprint -Force
+                # CFG090 Done When 3: 비정상 종료 뒤 인정된 완결은 봉인 사유와 원래 종료 코드를
+                # 같은 RMW 안에서 남긴다. 판정 내용(verdict·findings·doneWhen·reason)은 건드리지 않는다.
+                if (-not [string]::IsNullOrWhiteSpace($SealReason)) {
+                    if ([string]$current.sealReason -ne $SealReason) {
+                        $current | Add-Member -NotePropertyName sealReason -NotePropertyValue $SealReason -Force
+                        $changed = $true
+                    }
+                }
+                if ($null -ne $AbnormalExitCode) {
+                    if ([string]$current.abnormalExitCode -ne ([string]$AbnormalExitCode)) {
+                        $current | Add-Member -NotePropertyName abnormalExitCode -NotePropertyValue $AbnormalExitCode -Force
+                        $changed = $true
+                    }
+                }
+                if (-not $changed) { return $null }
                 return $current
             } -Depth 8
             $replacedAgentTreeHash = [string]$script:cfg086AgentTreeHash

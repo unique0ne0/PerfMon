@@ -198,15 +198,26 @@ function Invoke-ModelAttempt {
     if (-not (Update-CallRate -Model $Model)) {
         return @{ Outcome = 'rate_limited'; ExitCode = $null; ElapsedSeconds = 0; LogStartBytes = $logStartBytes; Adapter = $Config.Adapter }
     }
+    # CFG090 Done When 1 (i): 종결 산출물 완결 판정의 기준 시각은 이번 attempt 시작이다.
+    # 프로세스 기동 직전 시각을 기록해 Invoke-StageProcess가 반환한 뒤에도 보존한다.
+    $attemptStartedAt = Get-Date
     $exit = $null; $elapsedSeconds = 0
     $outcome = Invoke-StageProcess -Stage $Stage -Config $attemptConfig -ToolCmd $ToolCmd -Cycle $Cycle -ExitCode ([ref]$exit) -ElapsedSeconds ([ref]$elapsedSeconds) -Model $Model
+    # CFG090 Done When 2: KillOnHang=$true 단계가 "결론을 다 쓴 뒤 종료 지연"으로 판정되면
+    # watcher가 complete-after-artifacts를 돌려준다. ExitCode는 taskkill이라 신뢰할 수 없으므로
+    # 별도 표시(CompletedAfterArtifacts)로 전달하고, outcome은 성공과 동일하게 정규화한다.
+    $completedAfterArtifacts = ($outcome -eq 'complete-after-artifacts')
+    if ($completedAfterArtifacts) { $outcome = 'ok' }
     Update-LatestAttemptLog -AttemptLog $AttemptLog -LatestLog $LatestLog
-    return @{ Outcome = $outcome; ExitCode = $exit; ElapsedSeconds = $elapsedSeconds; LogStartBytes = $logStartBytes; Adapter = $Config.Adapter }
+    return @{ Outcome = $outcome; ExitCode = $exit; ElapsedSeconds = $elapsedSeconds; LogStartBytes = $logStartBytes; Adapter = $Config.Adapter; CompletedAfterArtifacts = $completedAfterArtifacts; AttemptStartedAt = $attemptStartedAt }
 }
 
 function Classify-AttemptFailure {
     param([hashtable]$Attempt, [hashtable]$Before, [string]$AttemptLog)
 
+    # CFG090 Done When 2 (b): 강제 종료된 프로세스의 ExitCode는 0이 아니므로, watcher가 표시한
+    # 완결 인정(complete-after-artifacts)을 다른 어떤 분류보다 먼저 ok로 반환한다.
+    if ($Attempt.ContainsKey('CompletedAfterArtifacts') -and $Attempt.CompletedAfterArtifacts) { return 'ok' }
     $outcome = $Attempt.Outcome
     if ($outcome -ne 'ok' -or $null -eq $Attempt.ExitCode) { return $outcome }
     $logAbs = Resolve-RepoPath $AttemptLog

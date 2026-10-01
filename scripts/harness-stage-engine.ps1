@@ -145,6 +145,7 @@ function New-StageMonitorBaseline {
     $lastHeartbeatAt = $StartedAt; $lastHeartbeatSize = 0; $lastHeartbeatCpu = $idleStartedMetrics.Cpu
     return @{
         Deadline = $deadline; AbsoluteDeadline = $absoluteDeadline
+        StartedAt = $StartedAt
         LastSize = $lastSize; LastLogChangedAt = $lastLogChangedAt; HangReported = $hangReported
         WindowStartAt = $windowStartAt; WindowStartSize = $windowStartSize; LastWindowGrowth = $lastWindowGrowth
         IdleStartedMetrics = $idleStartedMetrics
@@ -192,6 +193,99 @@ function Test-StageArtifactFreshlyWritten {
     return $false
 }
 
+# CFG090: 작업 트리에서 .agents/briefs/ 밖에 있으면서 기준 시각(verdict 수정 시각)보다 늦게
+# 수정된 파일 목록을 돌려준다. QA가 verdict를 쓴 뒤 소스를 더 고치다 끊긴 상태를 하네스가
+# 봉인하지 않도록 하는 Done When 1 (iv)의 유일한 외부 입력이다. git 호출은 CFG-BL-019 교훈대로
+# EAP를 Continue로 낮췄다가 복원한다(2>$null만으로는 PS 5.1 + Stop에서 native stderr가 죽인다).
+function Get-ChangedFilesNewerThan {
+    param([string]$RepoRoot, [datetime]$ThresholdUtc)
+
+    $late = @()
+    if ([string]::IsNullOrWhiteSpace($RepoRoot)) { return $late }
+    $porcelain = @()
+    $gitOk = $false
+    Push-Location $RepoRoot
+    try {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $porcelain = @(git status --porcelain 2>$null)
+            $gitOk = ($LASTEXITCODE -eq 0)
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+    } catch {
+        $gitOk = $false
+    } finally {
+        Pop-Location
+    }
+    if (-not $gitOk) { return $late }
+    foreach ($line in $porcelain) {
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.Length -le 3) { continue }
+        $rel = $line.Substring(3).Trim('"')
+        if ($rel -match '\s->\s') { $rel = ($rel -split '\s->\s')[-1].Trim('"') }
+        $rel = $rel.Replace('\','/')
+        # Pipeline Status·라우터·로그 갱신은 verdict 뒤에 오는 정상 동작이라 제외한다.
+        if ($rel -like '.agents/briefs/*') { continue }
+        $abs = Join-Path $RepoRoot ($rel -replace '/','\')
+        try {
+            if ((Get-Item -LiteralPath $abs -ErrorAction Stop).LastWriteTimeUtc -gt $ThresholdUtc) { $late += $rel }
+        } catch { }
+    }
+    return $late
+}
+
+# CFG090 Done When 1: "이번 attempt에서 QA 종결 산출물이 완결됐는가"를 판정하는 순수 판정 함수.
+# 파일을 쓰거나 봉인하지 않는다. 기준 시각(-Since)은 로그 마지막 변경 시각이 아니라 이번 attempt
+# 시작 시각이어야 한다 — 에이전트는 verdict를 쓴 뒤 최종 보고를 로그에 찍으므로 로그 기준이면
+# 오판한다. 시각 비교는 반드시 LastWriteTimeUtc와 UTC로 정규화한 시작 시각으로 한다(PS 5.1은
+# Local/UTC Kind를 무시하고 Ticks만 비교하므로 그대로 비교하면 9시간 어긋난다).
+function Test-QaTerminalArtifactsComplete {
+    param([datetime]$Since)
+
+    $reasons = @()
+    $qaConfig = $null
+    if ($StageConfig -and $StageConfig.ContainsKey('qa')) { $qaConfig = $StageConfig['qa'] }
+    if ($null -eq $qaConfig) { return @{ Complete = $false; Reasons = @('qa stage config is not available') } }
+    $verdictRel = [string]$qaConfig.VerdictFile
+    if ([string]::IsNullOrWhiteSpace($verdictRel)) { return @{ Complete = $false; Reasons = @('qa VerdictFile is not configured') } }
+
+    $verdictAbs = Resolve-RepoPath $verdictRel
+    $verdictItem = $null
+    try { $verdictItem = Get-Item -LiteralPath $verdictAbs -ErrorAction Stop } catch { }
+    if ($null -eq $verdictItem) { return @{ Complete = $false; Reasons = @("verdict file missing: $verdictRel") } }
+    $sinceUtc = $Since.ToUniversalTime()
+    if ($verdictItem.LastWriteTimeUtc -le $sinceUtc) { $reasons += 'verdict was not written during this attempt' }
+
+    $verdictObj = $null
+    try { $verdictObj = Get-Content -LiteralPath $verdictAbs -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch { $reasons += "verdict JSON parse failed: $($_.Exception.Message)" }
+    if ($null -ne $verdictObj) {
+        if ([bool]$verdictObj.synthetic -eq $true) { $reasons += 'verdict is synthetic' }
+        if ([string]$verdictObj.taskId -ne $TaskId) { $reasons += "verdict taskId mismatch: $($verdictObj.taskId)" }
+        if ([string]::IsNullOrWhiteSpace([string]$verdictObj.verdict)) { $reasons += 'verdict value is empty' }
+    }
+
+    # (iii) ReportFile은 codex 어댑터의 `-o`가 실제로 쓰는 산출물이다(antigravity/opencode/claude는
+    # 쓰지 않는다 — model-profile.ps1 Get-AdapterInvocationArgv). 쓰지 않는 어댑터에 이 조건을
+    # 요구하면 정상 완결도 영구 거부되므로, ReportFile을 생산하는 codex에만 요구한다.
+    $reportRel = [string]$qaConfig.ReportFile
+    $adapter = if ($qaConfig.ContainsKey('Adapter')) { [string]$qaConfig.Adapter } else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($reportRel) -and $adapter -eq 'codex') {
+        $reportAbs = Resolve-RepoPath $reportRel
+        $reportItem = $null
+        try { $reportItem = Get-Item -LiteralPath $reportAbs -ErrorAction Stop } catch { }
+        if ($null -eq $reportItem) { $reasons += "report file missing: $reportRel" }
+        elseif ($reportItem.LastWriteTimeUtc -le $sinceUtc) { $reasons += 'report file was not written during this attempt' }
+    }
+
+    # (iv) verdict보다 늦게 수정된 .agents/briefs/ 밖 변경 파일이 있으면 완결로 인정하지 않는다.
+    $latePaths = @(Get-ChangedFilesNewerThan -RepoRoot $RepoRoot -ThresholdUtc $verdictItem.LastWriteTimeUtc)
+    if ($latePaths.Count -gt 0) { $reasons += "files outside .agents/briefs modified after the verdict: $($latePaths -join ', ')" }
+
+    return @{ Complete = ($reasons.Count -eq 0); Reasons = $reasons }
+}
+
 function Test-StageHangProgress {
     param([string]$Stage, [hashtable]$Monitor, $metricsNow, [double]$noChange, [double]$noChangeText, [hashtable]$Config)
 
@@ -209,8 +303,20 @@ function Test-StageHangProgress {
         Write-Log "[$Stage] 로그 무변화 ${noChangeText}초지만 트리 I/O +${idleIoDelta}B(${ioRate}B/s) — I/O 작업 중으로 보고 계속 대기" INFO
         $Monitor.LastLogChangedAt = Get-Date; $Monitor.IdleStartedMetrics = $metricsNow; $Monitor.HangReported = $false
     } elseif ($Config.KillOnHang) {
-        Write-Log "⚠️ hang 감지 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 프로세스 트리 종료" WARN
-        $decision = @{ Action = 'kill-hang' }
+        # CFG090(CFG-BL-064): KillOnHang=$true 스테이지라도 VerdictFile을 정의한 단계(QA)는
+        # "결론을 이미 다 쓴 뒤 종료만 지연"과 "진짜 멈춤"을 구분한다. Done When 1이 true면
+        # kill-hang 대신 complete-after-artifacts를 반환해 resume 재디스패치를 건너뛴다.
+        # 스테이지 이름을 하드코딩하지 않는다 — VerdictFile 정의 여부로 일반화한다.
+        $terminal = $null
+        if ($Config.ContainsKey('VerdictFile') -and -not [string]::IsNullOrWhiteSpace([string]$Config.VerdictFile)) {
+            $terminal = Test-QaTerminalArtifactsComplete -Since $Monitor.StartedAt
+        }
+        if ($terminal -and $terminal.Complete) {
+            $decision = @{ Action = 'complete-after-artifacts' }
+        } else {
+            Write-Log "⚠️ hang 감지 [$Stage] — 로그 무변화 ${noChangeText}초, 그 구간 트리 CPU +${idleCpuDelta}s(코어 ${ratePct}% < 임계 ${thresholdPct}%); 프로세스 트리 종료" WARN
+            $decision = @{ Action = 'kill-hang' }
+        }
     } elseif (-not $Monitor.HangReported) {
         # CFG031 3분법: KillOnHang=$false 스테이지에서 git 진행 중이면 대기, 아니면 즉시 종료.
         # 특정 스테이지 이름을 하드코딩하지 않는다 — $Config.KillOnHang=$false인 모든 스테이지에 일반 적용.
@@ -365,6 +471,14 @@ function Invoke-StageProcess {
                     $policyKilled = $true
                     Write-Log "강제 종료 [$Stage] (PID: $($proc.Id), 경과 $([math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1))초)" WARN
                     return 'hang'
+                }
+                if ($hangDecision.Action -eq 'complete-after-artifacts') {
+                    # CFG090(CFG-BL-064): verdict·보고서가 이미 완결됐고 그 뒤 소스 변경도 없다.
+                    # 프로세스 트리만 정리하고 정상 완료로 분류한다(resume 재시도 생략).
+                    Stop-ProcessTree $proc.Id
+                    $policyKilled = $true
+                    Write-Log "✅ [$Stage] 종결 산출물 완결 확인 — 종료 지연으로 보고 프로세스 트리 정리 후 정상 완료 처리(resume 생략)" WARN
+                    return 'complete-after-artifacts'
                 }
                 if ($hangDecision.Action -eq 'kill-git') {
                     Stop-ProcessTree $proc.Id

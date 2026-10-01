@@ -579,6 +579,44 @@ function Warn-UnchangedTree {
     }
 }
 
+function Resolve-QaAttemptCompletion {
+    # CFG090: 모델 폴백·hang 재시도에 앞서 "이미 완결된 QA attempt"인지 판정한다. Done When 2
+    # (hang 오탐)와 Done When 3 (비정상 종료 후 유효 verdict)이 이 지점을 공유한다. 판정만 하며
+    # 파일을 쓰거나 봉인하지 않는다.
+    param([string]$Stage, [string]$Outcome, [hashtable]$Attempt, [string]$AttemptLog)
+    if ($Stage -ne 'qa') { return @{ Accept = $false; Reason = 'not the qa stage' } }
+
+    # Done When 2: watcher가 이미 완결을 확인하고 프로세스 트리를 정리한 경우(hang 오탐).
+    # 이 경로는 verdict 값이 pass가 아니어도(blocked 등) 완결로 넘겨 기존 verdict 게이트가 판정하게 한다.
+    if ($Attempt.ContainsKey('CompletedAfterArtifacts') -and $Attempt.CompletedAfterArtifacts) {
+        return @{ Accept = $true; SealReason = $null; AbnormalExitCode = $null; OriginalOutcome = 'hang' }
+    }
+
+    # Done When 3: 비정상 종료(exit≠0 또는 quota/billing 등 실패 분류). approval_required·
+    # pollution·provider_timeout은 같은 세션 자동 재개·사람 확인 경로가 따로 있어 제외한다.
+    if ($Outcome -in @('ok', 'approval_required', 'pollution', 'provider_timeout')) {
+        return @{ Accept = $false; Reason = "outcome '$Outcome' is not eligible for completion acknowledgment" }
+    }
+    if (-not $Attempt.ContainsKey('AttemptStartedAt') -or $null -eq $Attempt.AttemptStartedAt) {
+        return @{ Accept = $false; Reason = 'attempt start time is unavailable' }
+    }
+    $artifacts = Test-QaTerminalArtifactsComplete -Since ([datetime]$Attempt.AttemptStartedAt)
+    if (-not $artifacts.Complete) {
+        return @{ Accept = $false; Reason = "terminal artifacts incomplete: $($artifacts.Reasons -join '; ')" }
+    }
+    $verdictObj = $null
+    try {
+        $verdictAbs = Resolve-RepoPath ([string]$StageConfig['qa'].VerdictFile)
+        $verdictObj = Get-Content -LiteralPath $verdictAbs -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        return @{ Accept = $false; Reason = "verdict unreadable: $($_.Exception.Message)" }
+    }
+    if ([string]$verdictObj.verdict -ne 'pass') {
+        return @{ Accept = $false; Reason = "verdict is not pass: $($verdictObj.verdict)" }
+    }
+    return @{ Accept = $true; SealReason = 'abnormal-exit-after-verdict'; AbnormalExitCode = $Attempt.ExitCode; OriginalOutcome = $Outcome }
+}
+
 function Dispatch-Stage {
     param([string]$Stage, [string]$PromptOverride)
     $config = $StageConfig[$Stage]
@@ -684,6 +722,11 @@ function Dispatch-Stage {
     $continuationCount = 0
     $exit = $null; $outcome = $null; $attemptFailures = @()
     $modelIndex = 0; $attemptNumber = 0; $previousAttemptModel = $null; $lastDeterministicSig = $null; $consecutiveDeterministicCount = 0
+    # CFG090: 완결 인정 attempt의 원래 실패 서명·종료 코드를 보존해 봉인·감사에 남긴다.
+    $completionAcknowledged = $false
+    $sealReason = $null
+    $abnormalExitCode = $null
+    $originalFailureOutcome = $null
 
     while ($modelIndex -lt $models.Count) {
         $model = $models[$modelIndex]
@@ -734,6 +777,28 @@ function Dispatch-Stage {
                 if ($pollutionResult.Polluted) {
                     $outcome = 'pollution'
                     Write-Log "❌ [$Stage] 프로토콜 오염 감지: $($pollutionResult.Reason) → 실패 처리" ERROR
+                }
+            }
+            # CFG090 Done When 2·3: attempt 종결 인정 — hang 재시도·모델 폴백보다 먼저 판정한다.
+            # 완결된 QA를 다른 모델로 다시 돌리지 않는다. 인정되면 outcome을 ok로 승격하고
+            # 원래 실패 서명·종료 코드를 보존한 채 attempt 루프를 빠져나간다.
+            if ($Stage -eq 'qa' -and ($attemptResult.CompletedAfterArtifacts -or $outcome -notin @('ok', 'approval_required', 'pollution', 'provider_timeout'))) {
+                $completion = Resolve-QaAttemptCompletion -Stage $Stage -Outcome $outcome -Attempt $attemptResult -AttemptLog $attemptLog
+                if ($completion.Accept) {
+                    $originalFailureOutcome = $completion.OriginalOutcome
+                    $completionAcknowledged = $true
+                    $sealReason = $completion.SealReason
+                    $abnormalExitCode = $completion.AbnormalExitCode
+                    # 쿼터 소진 사실을 숨기지 않는다 — 원래 실패 outcome을 provider health에 남긴다
+                    # (Update-ProviderHealth는 모델 식별자가 catalog에 없으면 no-op이다).
+                    if ((Get-Command Update-ProviderHealth -ErrorAction SilentlyContinue) -and $abnormalExitCode -ne $null) {
+                        Update-ProviderHealth -Model $model -Outcome $originalFailureOutcome -AttemptLog $attemptLog
+                    }
+                    if ($abnormalExitCode -ne $null) {
+                        Write-Log "⚠️ [qa] 비정상 종료(exit=$abnormalExitCode, 원래 outcome=$originalFailureOutcome)지만 종결 verdict가 신선·pass — 정상 완료로 인정하고 진행 (sealReason=$sealReason)" WARN
+                    }
+                    $outcome = 'ok'; $exit = 0
+                    break
                 }
             }
             if ($outcome -eq 'approval_required') {
@@ -816,6 +881,10 @@ function Dispatch-Stage {
     if ($verifyResult.Retried -and $verifyResult.RetryRecovered) {
         $successReason = 'stage succeeded and verify passed (auto-retry after spurious failure)'
     }
+    if ($completionAcknowledged) {
+        # CFG090: 원래 실패 outcome을 기록에 남겨 쿼터 소진 사실을 숨기지 않는다.
+        $successReason += " [CFG090 accepted after abnormal termination: original outcome=$originalFailureOutcome exit=$abnormalExitCode]"
+    }
     Write-Log "✅ [$Stage] 성공 + 검증 통과" SUCCESS
     # CFG042 완료 정리 경계 ②: Integration이 검증 게이트를 통과한 이 지점에 이르러서야 완료 정리
     # (⑤ 체크·router DONE·아카이브 이동·완료 커밋·push)가 허용된다. 이 경계 앞에서는 할 수 없다.
@@ -824,7 +893,7 @@ function Dispatch-Stage {
     }
     Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'completed' -ProcessId $PID -EvidencePaths @($logRel) -Reason $successReason -Model $model
     Record-ChainRuntime -Stage $Stage -Model $model -Status 'success' -Reason $successReason -Adapter $config.Adapter
-    return @{ Success = $true; FailureReason = $null; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id }
+    return @{ Success = $true; FailureReason = $null; QaDispatchedAt = $qaDispatchedAt; CycleId = $cycle.Id; SealReason = $sealReason; AbnormalExitCode = $abnormalExitCode }
 }
 
 function Test-LiveStageActivity {
@@ -1394,7 +1463,7 @@ function Invoke-DispatchChain {
                 Write-Log "❌ [$stage] 파이프라인 중단 (상태: $chainState, 로그: $($StageConfig[$stage].LogFile))" ERROR
                 return 1
             }
-            if ($stage -eq 'qa' -and -not $DryRun -and -not (Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt -ExpectedCycle $result.CycleId)) {
+            if ($stage -eq 'qa' -and -not $DryRun -and -not (Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt -ExpectedCycle $result.CycleId -SealReason $result.SealReason -AbnormalExitCode $result.AbnormalExitCode)) {
                 $actualQaVerdict = $null
                 try {
                     $vfPath = Resolve-RepoPath ($StageConfig['qa'].VerdictFile)
@@ -1452,7 +1521,7 @@ function Invoke-DispatchChain {
         $result = Invoke-StageWithLock -Stage $singleStage -PromptOverride $Plan.Prompt -CheckPipelineBefore $true -CheckPipelinePacket $checkPipelinePacket
         $ok = $result.Success
         if ($ok -and $singleStage -eq 'qa' -and -not $DryRun) {
-            $ok = Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt -ExpectedCycle $result.CycleId
+            $ok = Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt -ExpectedCycle $result.CycleId -SealReason $result.SealReason -AbnormalExitCode $result.AbnormalExitCode
             if (-not $ok) { Write-FailureMarker -Stage 'qa' -Reason 'QA verdict 미통과 — ⑤ 진행 중단' }
             if ($ok -and $result.CycleId) { Resolve-ApprovalRecords -Stage 'qa' -ResolvingCycle $result.CycleId }
         }
