@@ -221,11 +221,52 @@ function Get-AttemptFinalResponse {
             }
             if (-not [string]::IsNullOrWhiteSpace($response)) { return $response }
         }
-        # result 이벤트를 찾지 못하면 로그 원문으로 폴백한다(부분 로그·hang 대비).
-        return (Get-Content -LiteralPath $AttemptLogAbs -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+        # result 이벤트를 찾지 못하면 $null이다(hang 후 프로세스 트리 정리·부분 로그). 로그 원문은
+        # stream-json 이벤트 수만 줄이라 보고서로 쓸모가 없고, 실로그(CFG091 QA)에는 agent_response
+        # 스텝에 텍스트 본문조차 없어 마지막 응답 복원도 불가능하다 — 호출자가 대체 보고서를 만든다
+        # (CFG-BL-073).
+        return $null
     }
     # opencode·gemini는 stdout 전체가 응답이다.
     return (Get-Content -LiteralPath $AttemptLogAbs -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+}
+
+# CFG-BL-073: stream-json 어댑터가 최종 응답 이벤트 없이 끝났을 때(hang 후 정리 등) 쓰는 대체 보고서.
+# 에이전트 응답 본문은 로그에 없으므로 복원하지 않고, 존재하는 사실만 적는다 — 안내문 + VerdictFile이
+# 있으면 verdict·doneWhen 집계·findings 요약. verdict 파싱 실패는 안내문만 남기고 스테이지를 막지 않는다.
+function New-StageReportFallback {
+    param([string]$Stage, [hashtable]$Config, [string]$AttemptLog)
+    $out = New-Object System.Collections.Generic.List[string]
+    $out.Add("# [$Stage] 대체 보고서 (하네스 생성)")
+    $out.Add('')
+    $out.Add("어댑터가 최종 응답 이벤트를 남기기 전에 종료되어 에이전트의 보고서 본문이 없다(시도 로그: ``$AttemptLog``). 아래는 같은 시도가 남긴 산출물에서 하네스가 요약한 내용이다.")
+    $verdictRel = if ($Config.ContainsKey('VerdictFile')) { [string]$Config.VerdictFile } else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($verdictRel)) {
+        $verdictAbs = Resolve-RepoPath $verdictRel
+        try {
+            $v = Get-Content -LiteralPath $verdictAbs -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $out.Add('')
+            $out.Add("## Verdict: $([string]$v.verdict) (``$verdictRel``)")
+            if ($v.PSObject.Properties.Name -contains 'reason' -and -not [string]::IsNullOrWhiteSpace([string]$v.reason)) { $out.Add("- reason: $([string]$v.reason)") }
+            $dw = @($v.doneWhen)
+            if ($dw.Count -gt 0) {
+                $sat = @($dw | Where-Object { $_.satisfied -eq $true }).Count
+                $out.Add("- doneWhen: $sat/$($dw.Count) satisfied")
+                foreach ($item in @($dw | Where-Object { $_.satisfied -ne $true })) { $out.Add("  - 미충족: $([string]$item.item) $([string]$item.evidence)") }
+            }
+            $findings = @($v.findings)
+            $out.Add("- findings: $($findings.Count)건")
+            foreach ($f in $findings) {
+                $desc = [string]$f.description
+                if ($desc.Length -gt 300) { $desc = $desc.Substring(0, 300) + '…' }
+                $out.Add("  - $([string]$f.id) [$([string]$f.severity)] $desc")
+            }
+        } catch {
+            $out.Add('')
+            $out.Add("verdict 파일을 요약하지 못했다(``$verdictRel``): $($_.Exception.Message)")
+        }
+    }
+    return ($out -join "`n")
 }
 
 # CFG091(CFG-BL-070): 시도 종료 후 어댑터 불문 $Config.ReportFile을 생성한다. codex는 argv의
@@ -240,6 +281,10 @@ function Write-StageReportFromAttempt {
     if ($adapter -eq 'codex') { return }
     $attemptAbs = Resolve-RepoPath $AttemptLog
     $response = Get-AttemptFinalResponse -Adapter $adapter -AttemptLogAbs $attemptAbs
+    if ([string]::IsNullOrWhiteSpace($response) -and $adapter -in @('antigravity', 'claude') -and (Test-Path -LiteralPath $attemptAbs)) {
+        $response = New-StageReportFallback -Stage $Stage -Config $Config -AttemptLog $AttemptLog
+        Write-Log "[$Stage] 최종 응답 이벤트 없음 — verdict 요약으로 ReportFile을 대체합니다($AttemptLog)" WARN
+    }
     if ([string]::IsNullOrWhiteSpace($response)) {
         Write-Log "⚠️ [$Stage] 시도 로그에서 최종 응답을 추출하지 못했습니다($AttemptLog) — ReportFile을 생성하지 않습니다" WARN
         return
