@@ -1045,6 +1045,8 @@ function Resolve-DispatchPlan {
         [Parameter(Mandatory=$false)][switch]$ManualComplete,
         [Parameter(Mandatory=$false)][switch]$ManualAbort,
         [Parameter(Mandatory=$false)][switch]$ResealQaVerdict,
+        # CFG091(CFG-BL-071 (b)): 최초 봉인이 누락된 유효 QA verdict를 사후 봉인하는 관리자 액션.
+        [Parameter(Mandatory=$false)][switch]$SealQaVerdict,
         [Parameter(Mandatory=$false)][string]$Reason,
         [Parameter(Mandatory=$false)][hashtable]$StageConfig,
         [Parameter(Mandatory=$false)][string]$RepoRoot,
@@ -1093,6 +1095,23 @@ function Resolve-DispatchPlan {
             return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'ResealQaVerdict requires Reason' }
         }
         return [pscustomobject]@{ EarlyExit = $true; ExitCode = 0; Reason = 'ResealQaVerdict requested'; Action = 'resealQaVerdict'; ActionStage = $Stage; ActionReason = $Reason }
+    }
+
+    # ── CFG091(CFG-BL-071 (b)): QA verdict 사후 봉인 (실행 대신 관리자 액션) ──
+    if ($SealQaVerdict) {
+        if ($Chain) {
+            Write-Log '오류: -SealQaVerdict는 -Chain과 함께 사용할 수 없습니다 — -Stage qa 단일 실행으로만 봉인합니다.' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'SealQaVerdict cannot be combined with Chain' }
+        }
+        if ($Stage -ne 'qa') {
+            Write-Log '오류: -SealQaVerdict는 -Stage qa 와 함께 사용하세요.' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'SealQaVerdict requires Stage qa' }
+        }
+        if ([string]::IsNullOrWhiteSpace($Reason)) {
+            Write-Log '오류: -SealQaVerdict는 -Reason으로 사후 봉인 사유를 반드시 남기세요 (예: "비정상 종료 후 유효 verdict 사후 봉인").' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'SealQaVerdict requires Reason' }
+        }
+        return [pscustomobject]@{ EarlyExit = $true; ExitCode = 0; Reason = 'SealQaVerdict requested'; Action = 'sealQaVerdict'; ActionStage = $Stage; ActionReason = $Reason }
     }
 
     if ($Chain -and $Stage) {
@@ -1333,6 +1352,9 @@ function Invoke-DispatchChain {
         }
         if ($Plan.Action -eq 'resealQaVerdict') {
             return (Invoke-QaVerdictReseal -Stage $Plan.ActionStage -ReasonText $Plan.ActionReason)
+        }
+        if ($Plan.Action -eq 'sealQaVerdict') {
+            return (Invoke-QaVerdictSeal -Stage $Plan.ActionStage -ReasonText $Plan.ActionReason)
         }
         return [int]$Plan.ExitCode
     }

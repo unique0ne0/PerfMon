@@ -866,6 +866,195 @@ function Invoke-QaVerdictReseal {
     return 0
 }
 
+# CFG091(CFG-BL-071 (b)): 마지막 QA 디스패치 "시작" 시각을 확정한다. Invoke-QaVerdictSeal의 (iii)
+# 조건(verdict 기록 시각 ≥ 마지막 QA 디스패치 시각)에 쓴다.
+#  - stage-state.json이 qa를 가리키면 그 startedAt이 가장 정확한 근거다(CFG057 통합 스키마 — cycle 내
+#    보존되므로 실패·완료 후에도 디스패치 시작 시각이 남는다).
+#  - 파이프라인이 이미 다음 단계로 넘어가 stage-state가 qa가 아니면 체인 런타임의 qa 기록(recordedAt)을
+#    보수적 하한으로 쓴다. 둘 다 없으면 $null을 돌려주고 호출자가 거부한다(오래된 verdict 세탁 차단).
+function Get-LastQaDispatchAt {
+    $statePath = Resolve-RepoPath "$LogDir/$TaskId-stage-state.json"
+    if (Test-Path -LiteralPath $statePath) {
+        try {
+            $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($state -and [string]$state.stage -eq 'qa') {
+                foreach ($field in @('startedAt', 'heartbeatAt', 'eventAt')) {
+                    $rawValue = [string]$state.$field
+                    if ([string]::IsNullOrWhiteSpace($rawValue)) { continue }
+                    $parsed = [datetime]::MinValue
+                    if ([datetime]::TryParse($rawValue, [ref]$parsed)) { return $parsed.ToUniversalTime() }
+                }
+            }
+        } catch { }
+    }
+    try {
+        $runtime = Read-ChainRuntime
+        $qaEntry = $runtime.stages.qa
+        if ($qaEntry) {
+            $rawValue = [string]$qaEntry.recordedAt
+            $parsed = [datetime]::MinValue
+            if (-not [string]::IsNullOrWhiteSpace($rawValue) -and [datetime]::TryParse($rawValue, [ref]$parsed)) {
+                return $parsed.ToUniversalTime()
+            }
+        }
+    } catch { }
+    return $null
+}
+
+# CFG091(CFG-BL-071 (b)): QA 실행이 이미 끝난 뒤(하네스가 실패 마커까지 남긴 상태) 최초 봉인(treeHash)이
+# 누락된 유효 verdict를 사후 봉인하는 관리자 액션. Invoke-QaVerdictReseal의 반대 케이스다 — 재봉인은
+# "이미 treeHash가 있는 verdict"만 대상이지만, 이 액션은 "treeHash가 없어 최초 봉인을 건너뛴 verdict"를
+# 대상으로 한다(CFG090의 조건부 자동 봉인이 잡지 못한 잔여 케이스의 복구 경로).
+# 오래된 pass 세탁을 막기 위해 (i)~(v) 조건을 모두 만족할 때만 봉인하고, 아니면 사유를 남기고 exit 1.
+# 봉인 값은 언제나 하네스가 현재 트리로 계산한다(CFG086 — 에이전트 treeHash 신뢰 경로 금지).
+function Invoke-QaVerdictSeal {
+    param([string]$Stage, [string]$ReasonText)
+    if (-not $Stage -or $Stage -ne 'qa') {
+        Write-Log '오류: QA verdict 사후 봉인은 -Stage qa 와 함께 사용하세요.' ERROR
+        return 1
+    }
+    # 사유 없는 봉인은 감사 로그의 의미를 없앤다 — -ResealQaVerdict의 -Reason 계약과 동일.
+    if ([string]::IsNullOrWhiteSpace($ReasonText)) {
+        Write-Log '오류: -SealQaVerdict는 -Reason으로 사후 봉인 사유를 반드시 남기세요 (예: "비정상 종료 후 유효 verdict 사후 봉인").' ERROR
+        return 1
+    }
+    $verdictRel = $StageConfig['qa'].VerdictFile
+    $verdictAbs = Resolve-RepoPath $verdictRel
+    if (-not (Test-Path -LiteralPath $verdictAbs)) {
+        Write-Log "오류: QA verdict 파일이 없습니다($verdictRel) — 사후 봉인 대상이 아닙니다." ERROR
+        return 1
+    }
+    # (i) verdict JSON 파싱 성공 + treeHash 없음(재봉인과 반대 케이스).
+    $verdictObj = $null
+    try {
+        $verdictObj = Get-Content -LiteralPath $verdictAbs -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        Write-Log "오류: QA verdict JSON 파싱 실패($verdictRel) — 사후 봉인을 거부합니다: $($_.Exception.Message)" ERROR
+        return 1
+    }
+    if ($null -eq $verdictObj) {
+        Write-Log "오류: QA verdict가 비어 있습니다($verdictRel) — 사후 봉인을 거부합니다." ERROR
+        return 1
+    }
+    if ($verdictObj.PSObject.Properties.Name -contains 'treeHash' -and -not [string]::IsNullOrWhiteSpace([string]$verdictObj.treeHash)) {
+        Write-Log '오류: verdict에 이미 treeHash가 있습니다 — 이는 재봉인(-ResealQaVerdict)의 영역입니다. 사후 봉인을 거부합니다.' ERROR
+        return 1
+    }
+    # (ii) treeHash를 제외한 무결성(schema·taskId·stage·cycle·doneWhen·findings) 통과.
+    $selfCycle = 0
+    $hasCycle = $verdictObj.PSObject.Properties.Name -contains 'cycle'
+    if (-not $hasCycle -or -not [int]::TryParse([string]$verdictObj.cycle, [ref]$selfCycle)) {
+        Write-Log '오류: verdict의 cycle을 읽을 수 없습니다 — 무결성 사전검증을 수행할 수 없어 사후 봉인을 거부합니다.' ERROR
+        return 1
+    }
+    $validation = Validate-QaVerdict -VerdictObj $verdictObj -ExpectedTaskId $TaskId -ExpectedStage 'qa' -ExpectedCycle $selfCycle -SkipWorktreeFingerprint
+    if (-not $validation.Valid) {
+        foreach ($r in $validation.Reasons) { Write-Log "⚠️ QA verdict 사후 봉인 거부 — 무결성 검증 실패: $r" ERROR }
+        Write-Log "오류: 무결성이 깨진 verdict는 사후 봉인하지 않습니다($($validation.Reasons.Count)건)." ERROR
+        return 1
+    }
+    # (iii) verdict 기록 시각 ≥ 마지막 QA 디스패치 시각 — 최근 QA 결과라는 증거. 확정 불가면 거부.
+    $lastQaDispatchAt = Get-LastQaDispatchAt
+    if ($null -eq $lastQaDispatchAt) {
+        Write-Log '오류: 마지막 QA 디스패치 시각을 확정할 수 없습니다 — 오래된 verdict 세탁을 막기 위해 사후 봉인을 거부합니다.' ERROR
+        return 1
+    }
+    $verdictWrittenUtc = (Get-Item -LiteralPath $verdictAbs).LastWriteTimeUtc
+    if ($verdictWrittenUtc -lt $lastQaDispatchAt.ToUniversalTime()) {
+        Write-Log "오류: verdict 기록 시각($($verdictWrittenUtc.ToString('o')))이 마지막 QA 디스패치 시각($($lastQaDispatchAt.ToUniversalTime().ToString('o'))) 이전입니다 — 오래된 verdict이므로 사후 봉인을 거부합니다." ERROR
+        return 1
+    }
+    # (iv) verdict보다 늦게 수정된 .agents/briefs/ 밖 추적 파일이 없어야 한다(CFG090 (l)의 수동 하네스화).
+    $latePaths = @(Get-ChangedFilesNewerThan -RepoRoot $RepoRoot -ThresholdUtc $verdictWrittenUtc)
+    if ($latePaths.Count -gt 0) {
+        Write-Log "오류: verdict 이후 .agents/briefs/ 밖 파일이 변경됐습니다 — 사후 봉인을 거부합니다: $($latePaths -join ', ')" ERROR
+        return 1
+    }
+    # (v) 봉인 값은 언제나 하네스가 현재 트리로 계산한다(CFG086).
+    $treeState = Get-TreeState
+    if ($null -eq $treeState -or -not $treeState.FingerprintOk -or [string]::IsNullOrWhiteSpace([string]$treeState.Fingerprint)) {
+        Write-Log '오류: 현재 작업 트리 지문을 계산할 수 없습니다(FingerprintOk=false) — 사후 봉인을 거부합니다.' ERROR
+        return 1
+    }
+    # 살아 있는 실행과 경합하지 않는다.
+    $live = Test-LiveStageActivity
+    if ($live) {
+        Write-Log "⛔ [사후 봉인] 살아 있는 실행이 있어 QA verdict를 사후 봉인하지 않습니다: $live" ERROR
+        return 1
+    }
+    $newTreeHash = [string]$treeState.Fingerprint
+    $sealAt = [datetime]::UtcNow.ToString('o')
+    $script:cfg091SealApplied = $false
+    $script:cfg091SealRejected = $null
+    Write-AtomicRMW -Path $verdictAbs -Transform {
+        param($current)
+        if ($null -eq $current) {
+            $script:cfg091SealRejected = 'QA verdict가 RMW 잠금 획득 전에 사라졌거나 JSON 파싱에 실패했습니다.'
+            return $null
+        }
+        $currentCycle = 0
+        if ($current.PSObject.Properties.Name -notcontains 'cycle' -or
+            -not [int]::TryParse([string]$current.cycle, [ref]$currentCycle)) {
+            $script:cfg091SealRejected = 'RMW 잠금 안에서 다시 읽은 verdict의 cycle이 유효하지 않습니다.'
+            return $null
+        }
+        # RMW 잠금 안에서 최신 객체를 다시 검증한다 — 초기 검증과 잠금 획득 사이 변경을 반영.
+        $currentValidation = Validate-QaVerdict -VerdictObj $current -ExpectedTaskId $TaskId -ExpectedStage 'qa' -ExpectedCycle $currentCycle -SkipWorktreeFingerprint
+        if (-not $currentValidation.Valid) {
+            $script:cfg091SealRejected = "RMW 잠금 안에서 다시 읽은 verdict 무결성 검증 실패: $($currentValidation.Reasons -join '; ')"
+            return $null
+        }
+        # 이미 treeHash가 있으면 경합 해소(같은 값) 또는 재봉인 영역(다른 값)이다.
+        if ($current.PSObject.Properties.Name -contains 'treeHash' -and -not [string]::IsNullOrWhiteSpace([string]$current.treeHash)) {
+            if ([string]$current.treeHash -eq $newTreeHash) { return $current }
+            $script:cfg091SealRejected = 'RMW 잠금 안에서 다시 읽은 verdict에 이미 다른 treeHash가 있습니다 — 재봉인(-ResealQaVerdict) 영역입니다.'
+            return $null
+        }
+        $current | Add-Member -NotePropertyName treeHash -NotePropertyValue $newTreeHash -Force
+        $current | Add-Member -NotePropertyName sealReason -NotePropertyValue 'sealed-after-the-fact' -Force
+        $current | Add-Member -NotePropertyName sealReasonText -NotePropertyValue $ReasonText -Force
+        $current | Add-Member -NotePropertyName lastSealAt -NotePropertyValue $sealAt -Force
+        $script:cfg091SealApplied = $true
+        return $current
+    } -Depth 8
+    $applied = [bool]$script:cfg091SealApplied
+    $rejected = [string]$script:cfg091SealRejected
+    Remove-Variable -Name cfg091SealApplied -Scope Script -ErrorAction SilentlyContinue
+    Remove-Variable -Name cfg091SealRejected -Scope Script -ErrorAction SilentlyContinue
+    if (-not [string]::IsNullOrWhiteSpace($rejected)) {
+        Write-Log "오류: QA verdict 사후 봉인을 거부합니다 — $rejected" ERROR
+        return 1
+    }
+    if (-not $applied) {
+        Write-Log "ℹ️ [qa] QA verdict 사후 봉인 no-op — 병행 경로가 먼저 봉인했습니다($newTreeHash)." INFO
+        return 0
+    }
+    # 실제로 봉인했으면 append-only 감사 로그를 남긴다 — 재봉인(trigger=manual)과 대조 가능하게.
+    $auditRel = "$LogDir/$TaskId-qa-reseal-audit.log"
+    $auditAbs = Resolve-RepoPath $auditRel
+    try {
+        $auditParent = Split-Path -Parent $auditAbs
+        if (-not [string]::IsNullOrWhiteSpace($auditParent) -and -not (Test-Path -LiteralPath $auditParent)) {
+            New-Item -ItemType Directory -Path $auditParent -Force | Out-Null
+        }
+        $auditEntry = [ordered]@{
+            at = $sealAt
+            taskId = $TaskId
+            reason = $ReasonText
+            trigger = 'seal-after-the-fact'
+            previousTreeHash = $null
+            newTreeHash = $newTreeHash
+        } | ConvertTo-Json -Compress -Depth 4
+        [System.IO.File]::AppendAllText($auditAbs, $auditEntry + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        Write-Log "오류: QA verdict는 사후 봉인됐지만 감사 로그 기록에 실패했습니다($auditRel): $($_.Exception.Message)" ERROR
+        return 1
+    }
+    Clear-FailureMarker -Stage 'qa'
+    Write-Log "✅ [qa] QA verdict 사후 봉인(sealReason=sealed-after-the-fact) — $newTreeHash (사유: $ReasonText, 감사: $auditRel)" SUCCESS
+    return 0
+}
+
 # ── CFG043: 수동 완료·안전 재개 ─────────────────────────────────────────────
 # 실행 중('running'/'starting') lease가 아직 만료되지 않았거나 살아 있는 락이 있는지 판정한다.
 # 자동 재개(-Chain)가 이들을 "건드리지 않고" 멈추기 위한 가드다. stale(만료) lease나 종결

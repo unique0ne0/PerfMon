@@ -193,6 +193,66 @@ function Test-StageArtifactFreshlyWritten {
     return $false
 }
 
+# CFG091(CFG-BL-070): 어댑터 불문 ReportFile 생산을 위해 시도 로그에서 최종 응답 텍스트를 뽑는다.
+#  - antigravity(agy, stream-json): 마지막 result 이벤트의 result.response
+#  - claude(stream-json): 마지막 result 이벤트의 result
+#  - opencode·gemini(stdout=응답): 시도 로그 원문
+# 구조 포맷이 없는 어댑터는 로그 전체를 그대로 쓴다. 추출 실패 시 $null을 돌려주고 호출자가
+# ReportFile을 만들지 않는다(보고서는 부가 산출물이므로 스테이지를 막지 않는다).
+function Get-AttemptFinalResponse {
+    param([string]$Adapter, [string]$AttemptLogAbs)
+    if ([string]::IsNullOrWhiteSpace($AttemptLogAbs) -or -not (Test-Path -LiteralPath $AttemptLogAbs)) { return $null }
+    if ($Adapter -eq 'antigravity' -or $Adapter -eq 'claude') {
+        # 구조 포맷(stream-json)이면 마지막 result 이벤트의 응답 필드를 뽑는다.
+        # BOM 없는 로그는 -Encoding UTF8을 명시하지 않으면 PS 5.1이 ANSI로 읽어 한글이 깨진다.
+        $lines = @(Get-Content -LiteralPath $AttemptLogAbs -Encoding UTF8 -ErrorAction SilentlyContinue)
+        for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+            $line = $lines[$i]
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try { $event = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            $eventName = [string](@($event.event, $event.type) | Where-Object { $_ } | Select-Object -First 1)
+            if ($eventName -ne 'result') { continue }
+            if ($event.result -ne $null -and $event.result.PSObject.Properties.Name -contains 'response' -and -not [string]::IsNullOrWhiteSpace([string]$event.result.response)) {
+                $response = [string]$event.result.response
+            } elseif ($Adapter -eq 'antigravity') {
+                $response = [string]$event.result.response
+            } else {
+                $response = [string]$event.result
+            }
+            if (-not [string]::IsNullOrWhiteSpace($response)) { return $response }
+        }
+        # result 이벤트를 찾지 못하면 로그 원문으로 폴백한다(부분 로그·hang 대비).
+        return (Get-Content -LiteralPath $AttemptLogAbs -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+    }
+    # opencode·gemini는 stdout 전체가 응답이다.
+    return (Get-Content -LiteralPath $AttemptLogAbs -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+}
+
+# CFG091(CFG-BL-070): 시도 종료 후 어댑터 불문 $Config.ReportFile을 생성한다. codex는 argv의
+# `-o $ReportFile`이 이미 최종 응답을 쓰므로 하네스가 덮어쓰지 않는다. 그 외 어댑터는 시도 로그에서
+# 최종 응답을 추출해 ReportFile에 쓴다. 어떤 실패도 스테이지를 막지 않는다(보고서는 부가 산출물).
+function Write-StageReportFromAttempt {
+    param([string]$Stage, [hashtable]$Config, [string]$AttemptLog)
+    if ($null -eq $Config -or -not $Config.ContainsKey('ReportFile')) { return }
+    $reportRel = [string]$Config.ReportFile
+    if ([string]::IsNullOrWhiteSpace($reportRel)) { return }
+    $adapter = if ($Config.ContainsKey('Adapter')) { [string]$Config.Adapter } else { '' }
+    if ($adapter -eq 'codex') { return }
+    $attemptAbs = Resolve-RepoPath $AttemptLog
+    $response = Get-AttemptFinalResponse -Adapter $adapter -AttemptLogAbs $attemptAbs
+    if ([string]::IsNullOrWhiteSpace($response)) {
+        Write-Log "⚠️ [$Stage] 시도 로그에서 최종 응답을 추출하지 못했습니다($AttemptLog) — ReportFile을 생성하지 않습니다" WARN
+        return
+    }
+    $reportAbs = Resolve-RepoPath $reportRel
+    try {
+        [System.IO.File]::WriteAllText($reportAbs, $response, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Log "[$Stage] ReportFile 생성($adapter 어댑터 → $reportRel)" INFO
+    } catch {
+        Write-Log "⚠️ [$Stage] ReportFile 쓰기 실패($reportRel): $($_.Exception.Message)" WARN
+    }
+}
+
 # CFG090: 작업 트리에서 .agents/briefs/ 밖에 있으면서 기준 시각(verdict 수정 시각)보다 늦게
 # 수정된 파일 목록을 돌려준다. QA가 verdict를 쓴 뒤 소스를 더 고치다 끊긴 상태를 하네스가
 # 봉인하지 않도록 하는 Done When 1 (iv)의 유일한 외부 입력이다. git 호출은 CFG-BL-019 교훈대로
@@ -241,7 +301,9 @@ function Get-ChangedFilesNewerThan {
 # 오판한다. 시각 비교는 반드시 LastWriteTimeUtc와 UTC로 정규화한 시작 시각으로 한다(PS 5.1은
 # Local/UTC Kind를 무시하고 Ticks만 비교하므로 그대로 비교하면 9시간 어긋난다).
 function Test-QaTerminalArtifactsComplete {
-    param([datetime]$Since)
+    # -InFlight: 프로세스가 아직 살아 있는 hang 감시 중 호출. 비codex 보고서는 attempt 종료 후
+    # 하네스가 쓰므로 이 시점에는 존재할 수 없다 — (iii)을 codex에만 요구한다.
+    param([datetime]$Since, [switch]$InFlight)
 
     $reasons = @()
     $qaConfig = $null
@@ -266,12 +328,13 @@ function Test-QaTerminalArtifactsComplete {
         if ([string]::IsNullOrWhiteSpace([string]$verdictObj.verdict)) { $reasons += 'verdict value is empty' }
     }
 
-    # (iii) ReportFile은 codex 어댑터의 `-o`가 실제로 쓰는 산출물이다(antigravity/opencode/claude는
-    # 쓰지 않는다 — model-profile.ps1 Get-AdapterInvocationArgv). 쓰지 않는 어댑터에 이 조건을
-    # 요구하면 정상 완결도 영구 거부되므로, ReportFile을 생산하는 codex에만 요구한다.
+    # (iii) ReportFile은 codex는 argv의 `-o`가, 그 외 어댑터는 하네스의
+    # Write-StageReportFromAttempt(시도 로그 최종 응답 추출)가 생산한다(CFG091/CFG-BL-070).
+    # 두 경로 모두 "이번 attempt에서 보고서가 새로 쓰였는가"를 검사 대상으로 삼는다.
+    # 단, -InFlight(hang 감시)에서는 하네스 생산 보고서가 아직 없으므로 codex에만 요구한다.
     $reportRel = [string]$qaConfig.ReportFile
     $adapter = if ($qaConfig.ContainsKey('Adapter')) { [string]$qaConfig.Adapter } else { '' }
-    if (-not [string]::IsNullOrWhiteSpace($reportRel) -and $adapter -eq 'codex') {
+    if (-not [string]::IsNullOrWhiteSpace($reportRel) -and (-not $InFlight -or $adapter -eq 'codex')) {
         $reportAbs = Resolve-RepoPath $reportRel
         $reportItem = $null
         try { $reportItem = Get-Item -LiteralPath $reportAbs -ErrorAction Stop } catch { }
@@ -309,7 +372,7 @@ function Test-StageHangProgress {
         # 스테이지 이름을 하드코딩하지 않는다 — VerdictFile 정의 여부로 일반화한다.
         $terminal = $null
         if ($Config.ContainsKey('VerdictFile') -and -not [string]::IsNullOrWhiteSpace([string]$Config.VerdictFile)) {
-            $terminal = Test-QaTerminalArtifactsComplete -Since $Monitor.StartedAt
+            $terminal = Test-QaTerminalArtifactsComplete -Since $Monitor.StartedAt -InFlight
         }
         if ($terminal -and $terminal.Complete) {
             $decision = @{ Action = 'complete-after-artifacts' }

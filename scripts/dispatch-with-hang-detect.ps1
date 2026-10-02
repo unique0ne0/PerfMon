@@ -70,6 +70,10 @@ param(
     # 이후 ⑤ 게이트가 "treeHash mismatch"로 오차단되는 것을 해소하는 관리자 액션. verdict 판정 내용은
     # 건드리지 않고 treeHash 메타데이터만 명시적으로 갱신하며, -Reason을 필수 사유로 남긴다(감사 로그).
     [Parameter(Mandatory=$false)][switch]$ResealQaVerdict,
+    # CFG091(CFG-BL-071 (b)): QA 실행이 끝난 뒤(하네스가 실패 마커까지 남긴 상태) 최초 봉인(treeHash)이
+    # 누락된 유효 verdict를 사후 봉인하는 관리자 액션. -ResealQaVerdict(이미 봉인된 verdict의 treeHash
+    # 갱신)와 구분된다 — 이쪽은 "treeHash가 아예 없는" verdict가 대상이다. -Reason 필수.
+    [Parameter(Mandatory=$false)][switch]$SealQaVerdict,
     [Parameter(Mandatory=$false)][string]$Reason
 )
 
@@ -755,6 +759,7 @@ if ($MyInvocation.InvocationName -ne '.' -and ($MyInvocation.Line -notmatch '^\s
         -ResetStageLedger:$ResetStageLedger -ResetReason $ResetReason `
         -ManualComplete:$ManualComplete -ManualAbort:$ManualAbort -Reason $Reason `
         -ResealQaVerdict:$ResealQaVerdict `
+        -SealQaVerdict:$SealQaVerdict `
         -StageConfig $StageConfig -RepoRoot $RepoRoot -ProfileModule $ProfileModule -ProfileConfigPath $ProfileConfigPath
 
     if ($dispatchPlan.EarlyExit) {

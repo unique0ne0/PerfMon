@@ -209,6 +209,9 @@ function Invoke-ModelAttempt {
     $completedAfterArtifacts = ($outcome -eq 'complete-after-artifacts')
     if ($completedAfterArtifacts) { $outcome = 'ok' }
     Update-LatestAttemptLog -AttemptLog $AttemptLog -LatestLog $LatestLog
+    # CFG091(CFG-BL-070): codex 외 어댑터도 ReportFile을 산출하도록 시도 로그에서 최종 응답을 추출한다.
+    # 비정상 종료·hang으로 끝난 attempt에서도 그때까지의 로그로 보고서를 남긴다(부가 산출물).
+    Write-StageReportFromAttempt -Stage $Stage -Config $Config -AttemptLog $AttemptLog
     return @{ Outcome = $outcome; ExitCode = $exit; ElapsedSeconds = $elapsedSeconds; LogStartBytes = $logStartBytes; Adapter = $Config.Adapter; CompletedAfterArtifacts = $completedAfterArtifacts; AttemptStartedAt = $attemptStartedAt }
 }
 
