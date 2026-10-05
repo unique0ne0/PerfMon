@@ -21,7 +21,7 @@
     "claude-driver": { "adapter": "claude", "family": "claude", "model": "claude-sonnet-5-5", "fallbackProfiles": ["codex-driver"] },
     "claude-qa": { "adapter": "claude", "family": "claude", "model": "claude-sonnet-5-5", "fallbackProfiles": [] },
     "codex-driver": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "fallbackProfiles": [] },
-    "codex-qa": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-sol", "fallbackProfiles": [] },
+    "codex-qa": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "fallbackProfiles": [] },
     "codex-qa-terra": { "adapter": "codex", "family": "codex", "model": "gpt-5.6-terra", "fallbackProfiles": [] },
     "gemini-qa": { "adapter": "antigravity", "family": "gemini", "model": "gemini-3.8-flash", "fallbackProfiles": ["gemini-qa-opencode"] },
     "gemini-qa-opencode": { "adapter": "opencode", "family": "gemini", "model": "google/gemini-3.8-flash", "fallbackProfiles": [] },
