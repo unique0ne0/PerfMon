@@ -7,6 +7,24 @@ $ErrorActionPreference = 'Stop'
 
 function Exit-Silent { exit 0 }
 
+function Get-HookTargetIdentifier {
+    param([string]$Command)
+    if ([string]::IsNullOrWhiteSpace($Command)) { return 'unknown' }
+
+    if ($Command -match '(?i)-File\s+("([^"]+)"|''([^'']+)''|(\S+))') {
+        $rawPath = if ($matches[2]) { $matches[2] } elseif ($matches[3]) { $matches[3] } else { $matches[4] }
+        try {
+            $leaf = Split-Path -Path $rawPath -Leaf
+            if (-not [string]::IsNullOrWhiteSpace($leaf)) { return $leaf }
+        } catch { }
+    }
+
+    if ($Command.Length -gt 80) {
+        return $Command.Substring(0, 80)
+    }
+    return $Command
+}
+
 # A hook failure must never reject a prompt.  This also covers state-directory
 # creation and atomic-state replacement failures below, outside the parsing
 # try/catch blocks.
@@ -25,8 +43,31 @@ if ($hookPayload.session_id) { $sessionId = [string]$hookPayload.session_id }
 if ([string]::IsNullOrWhiteSpace($transcriptPath) -or [string]::IsNullOrWhiteSpace($sessionId)) { Exit-Silent }
 if (-not (Test-Path -LiteralPath $transcriptPath)) { Exit-Silent }
 
-if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
-    if ($hookPayload.cwd) { $ProjectRoot = [string]$hookPayload.cwd } else { Exit-Silent }
+$isExplicitProjectRoot = -not [string]::IsNullOrWhiteSpace($ProjectRoot)
+
+if (-not $isExplicitProjectRoot) {
+    $searchDir = if ($hookPayload.cwd) { [string]$hookPayload.cwd } else { $null }
+    if ([string]::IsNullOrWhiteSpace($searchDir)) { Exit-Silent }
+
+    $foundRoot = $null
+    $curr = $searchDir
+    while (-not [string]::IsNullOrWhiteSpace($curr)) {
+        $candidate = Join-Path $curr '.agents\briefs'
+        if (Test-Path -LiteralPath $candidate) {
+            $foundRoot = $curr
+            break
+        }
+        $parent = Split-Path -Path $curr -Parent
+        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $curr) {
+            break
+        }
+        $curr = $parent
+    }
+
+    if (-not $foundRoot) {
+        Exit-Silent
+    }
+    $ProjectRoot = $foundRoot
 }
 
 $now = [datetime]::UtcNow
@@ -50,6 +91,26 @@ $issued = @{}
 if ($state -and $state.issuedWarnings) {
     foreach ($prop in @($state.issuedWarnings.psobject.Properties)) {
         $issued[$prop.Name] = [string]$prop.Value
+    }
+}
+
+$transcriptScanOffsets = @{}
+if ($state -and $state.transcriptScanOffsets) {
+    foreach ($prop in @($state.transcriptScanOffsets.psobject.Properties)) {
+        try { $transcriptScanOffsets[$prop.Name] = [long]$prop.Value } catch { }
+    }
+}
+
+$reportedHookErrors = @{}
+if ($state -and $state.reportedHookErrors) {
+    foreach ($sessionProp in @($state.reportedHookErrors.psobject.Properties)) {
+        $sessErrors = @{}
+        if ($sessionProp.Value) {
+            foreach ($errProp in @($sessionProp.Value.psobject.Properties)) {
+                $sessErrors[$errProp.Name] = [string]$errProp.Value
+            }
+        }
+        $reportedHookErrors[$sessionProp.Name] = $sessErrors
     }
 }
 
@@ -91,46 +152,144 @@ try {
         } finally { $reader.Close() }
     }
 
-    if (-not $firstTimestamp) { Exit-Silent }
-
     $tailLines = 200
     $tailContent = $null
-    try { $tailContent = @(Get-Content -LiteralPath $transcriptPath -Tail $tailLines -Encoding UTF8) } catch { Exit-Silent }
-    if (-not $tailContent) { Exit-Silent }
-
-    for ($i = $tailContent.Count - 1; $i -ge 0; $i--) {
-        $line = $tailContent[$i]
-        if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        try {
-            $obj = $line | ConvertFrom-Json
-            if ($obj.type -eq 'assistant' -and $obj.message -and $obj.message.usage) {
-                $u = $obj.message.usage
-                $inputT = 0; $cacheCreateT = 0; $cacheReadT = 0
-                if ($u.input_tokens) { $inputT = [int]$u.input_tokens }
-                if ($u.cache_creation_input_tokens) { $cacheCreateT = [int]$u.cache_creation_input_tokens }
-                if ($u.cache_read_input_tokens) { $cacheReadT = [int]$u.cache_read_input_tokens }
-                $lastContextTokens = $inputT + $cacheCreateT + $cacheReadT
-                break
-            }
-        } catch { continue }
+    try { $tailContent = @(Get-Content -LiteralPath $transcriptPath -Tail $tailLines -Encoding UTF8) } catch { }
+    if ($tailContent) {
+        for ($i = $tailContent.Count - 1; $i -ge 0; $i--) {
+            $line = $tailContent[$i]
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try {
+                $obj = $line | ConvertFrom-Json
+                if ($obj.type -eq 'assistant' -and $obj.message -and $obj.message.usage) {
+                    $u = $obj.message.usage
+                    $inputT = 0; $cacheCreateT = 0; $cacheReadT = 0
+                    if ($u.input_tokens) { $inputT = [int]$u.input_tokens }
+                    if ($u.cache_creation_input_tokens) { $cacheCreateT = [int]$u.cache_creation_input_tokens }
+                    if ($u.cache_read_input_tokens) { $cacheReadT = [int]$u.cache_read_input_tokens }
+                    $lastContextTokens = $inputT + $cacheCreateT + $cacheReadT
+                    break
+                }
+            } catch { continue }
+        }
     }
 } catch { Exit-Silent }
 
 $warnings = New-Object System.Collections.ArrayList
-$elapsedHours = [math]::Max(0, ($now - $firstTimestamp).TotalHours)
 
-foreach ($threshold in @(4, 6, 8)) {
-    if ($elapsedHours -ge $threshold) {
-        $key = "${sessionKey}-activity-$threshold"
-        $lastIssued = $null
-        if ($issued.ContainsKey($key)) {
-            [datetime]$parsedLast = [datetime]::MinValue
-            if ([datetime]::TryParse([string]$issued[$key], [ref]$parsedLast)) { $lastIssued = $parsedLast }
+try {
+    $fileInfo = Get-Item -LiteralPath $transcriptPath -ErrorAction SilentlyContinue
+    if ($fileInfo) {
+        $fileLen = [long]$fileInfo.Length
+        $scanOffset = 0L
+        if ($transcriptScanOffsets.ContainsKey($sessionId)) {
+            try { $scanOffset = [long]$transcriptScanOffsets[$sessionId] } catch { $scanOffset = 0L }
         }
-        if ($null -eq $lastIssued -or ($now - $lastIssued.ToUniversalTime()).TotalMinutes -ge 60) {
-            $message = if ($threshold -eq 8) { "Session has been active for $([math]::Round($elapsedHours, 1))h (>=${threshold}h). Consider recording a handoff and starting a new session." } else { "Session has been active for $([math]::Round($elapsedHours, 1))h (>=${threshold}h). Consider a fresh session." }
-            [void]$warnings.Add($message)
-            $issued[$key] = $now.ToString('o')
+
+        if ($scanOffset -gt $fileLen -or $scanOffset -lt 0) {
+            $scanOffset = 0L
+        }
+
+        $bytesToRead = [long]($fileLen - $scanOffset)
+        if ($bytesToRead -gt 0) {
+            $rawBytes = $null
+            $fs = [System.IO.FileStream]::new($transcriptPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            try {
+                if ($scanOffset -gt 0) { [void]$fs.Seek($scanOffset, [System.IO.SeekOrigin]::Begin) }
+                $readLen = [math]::Min($bytesToRead, [int]::MaxValue)
+                $buffer = New-Object byte[] $readLen
+                # FileStream.Read is permitted to return a partial buffer.  Keep
+                # reading the snapshot range so a just-appended complete JSONL
+                # record is not deferred (or intermittently missed by the hook).
+                $actualRead = 0
+                while ($actualRead -lt $readLen) {
+                    $readNow = $fs.Read($buffer, $actualRead, $readLen - $actualRead)
+                    if ($readNow -le 0) { break }
+                    $actualRead += $readNow
+                }
+                if ($actualRead -gt 0) {
+                    if ($actualRead -lt $readLen) {
+                        $trimmed = New-Object byte[] $actualRead
+                        [Array]::Copy($buffer, $trimmed, $actualRead)
+                        $rawBytes = $trimmed
+                    } else {
+                        $rawBytes = $buffer
+                    }
+                }
+            } finally {
+                $fs.Close()
+            }
+
+            if ($rawBytes -and $rawBytes.Length -gt 0) {
+                $lastNewlineIdx = [Array]::LastIndexOf($rawBytes, [byte]10)
+                if ($lastNewlineIdx -ge 0) {
+                    $validBytesCount = $lastNewlineIdx + 1
+                    $transcriptScanOffsets[$sessionId] = $scanOffset + $validBytesCount
+
+                    $text = [System.Text.Encoding]::UTF8.GetString($rawBytes, 0, $validBytesCount)
+                    $lines = $text -split "\r?\n"
+
+                    if (-not $reportedHookErrors.ContainsKey($sessionId)) {
+                        $reportedHookErrors[$sessionId] = @{}
+                    }
+                    $sessReported = $reportedHookErrors[$sessionId]
+
+                    foreach ($line in $lines) {
+                        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                        if ($line.IndexOf('hook_non_blocking_error', [System.StringComparison]::Ordinal) -ge 0) {
+                            try {
+                                $obj = $line | ConvertFrom-Json
+                                $attachments = @()
+                                if ($obj.attachment) { $attachments += $obj.attachment }
+                                if ($obj.attachments) {
+                                    foreach ($att in @($obj.attachments)) { $attachments += $att }
+                                }
+                                if ($obj.type -eq 'hook_non_blocking_error') {
+                                    $attachments += $obj
+                                }
+
+                                foreach ($att in $attachments) {
+                                    if ($att.type -eq 'hook_non_blocking_error') {
+                                        $hName = [string]$att.hookName
+                                        $hExit = [string]$att.exitCode
+                                        $hCmd  = [string]$att.command
+
+                                        $dedupKey = "$hName|$hCmd"
+                                        if (-not $sessReported.ContainsKey($dedupKey)) {
+                                            $sessReported[$dedupKey] = $now.ToString('o')
+                                            $targetId = Get-HookTargetIdentifier -Command $hCmd
+                                            $warnMsg = "Hook failure detected: $hName (exit $hExit, target: $targetId)"
+                                            [void]$warnings.Add($warnMsg)
+                                        }
+                                    }
+                                }
+                            } catch {
+                                continue
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+} catch { Exit-Silent }
+
+$elapsedHours = if ($firstTimestamp) { [math]::Max(0, ($now - $firstTimestamp).TotalHours) } else { $null }
+
+if ($null -ne $elapsedHours) {
+    foreach ($threshold in @(4, 6, 8)) {
+        if ($elapsedHours -ge $threshold) {
+            $key = "${sessionKey}-activity-$threshold"
+            $lastIssued = $null
+            if ($issued.ContainsKey($key)) {
+                [datetime]$parsedLast = [datetime]::MinValue
+                if ([datetime]::TryParse([string]$issued[$key], [ref]$parsedLast)) { $lastIssued = $parsedLast }
+            }
+            if ($null -eq $lastIssued -or ($now - $lastIssued.ToUniversalTime()).TotalMinutes -ge 60) {
+                $message = if ($threshold -eq 8) { "Session has been active for $([math]::Round($elapsedHours, 1))h (>=${threshold}h). Consider recording a handoff and starting a new session." } else { "Session has been active for $([math]::Round($elapsedHours, 1))h (>=${threshold}h). Consider a fresh session." }
+                [void]$warnings.Add($message)
+                $issued[$key] = $now.ToString('o')
+            }
         }
     }
 }
@@ -171,17 +330,38 @@ if ($null -ne $lastContextTokens -and $ContextWindowSize -gt 0) {
     }
 }
 
-$hookSessions[$sessionKey] = $firstTimestamp.ToString('o')
+if ($firstTimestamp) {
+    $hookSessions[$sessionKey] = $firstTimestamp.ToString('o')
+}
 
 $updatedHookSessions = [ordered]@{}
 foreach ($k in $hookSessions.Keys) { $updatedHookSessions[$k] = $hookSessions[$k] }
 $updatedIssued = [ordered]@{}
 foreach ($k in $issued.Keys) { $updatedIssued[$k] = $issued[$k] }
+$updatedScanOffsets = [ordered]@{}
+foreach ($k in $transcriptScanOffsets.Keys) { $updatedScanOffsets[$k] = $transcriptScanOffsets[$k] }
+$updatedReportedErrors = [ordered]@{}
+foreach ($k in $reportedHookErrors.Keys) {
+    $sub = [ordered]@{}
+    $inner = $reportedHookErrors[$k]
+    if ($inner) {
+        foreach ($ik in $inner.Keys) { $sub[$ik] = $inner[$ik] }
+    }
+    $updatedReportedErrors[$k] = $sub
+}
 
-$stateObj = [ordered]@{ schemaVersion = 4; hookSessions = $updatedHookSessions; issuedWarnings = $updatedIssued; toolReviewOccurrences = $toolReviewOccurrences }
+$stateObj = [ordered]@{
+    schemaVersion = 5;
+    hookSessions = $updatedHookSessions;
+    issuedWarnings = $updatedIssued;
+    toolReviewOccurrences = $toolReviewOccurrences;
+    transcriptScanOffsets = $updatedScanOffsets;
+    reportedHookErrors = $updatedReportedErrors
+}
+$preservedKeys = @('schemaVersion', 'hookSessions', 'issuedWarnings', 'toolReviewOccurrences', 'transcriptScanOffsets', 'reportedHookErrors')
 if ($state) {
     foreach ($prop in @($state.psobject.Properties)) {
-        if ($prop.Name -notin @('schemaVersion', 'hookSessions', 'issuedWarnings', 'toolReviewOccurrences')) {
+        if ($prop.Name -notin $preservedKeys) {
             if (-not $stateObj.Contains($prop.Name)) { $stateObj[$prop.Name] = $prop.Value }
         }
     }
