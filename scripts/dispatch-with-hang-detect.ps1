@@ -74,6 +74,11 @@ param(
     # 누락된 유효 verdict를 사후 봉인하는 관리자 액션. -ResealQaVerdict(이미 봉인된 verdict의 treeHash
     # 갱신)와 구분된다 — 이쪽은 "treeHash가 아예 없는" verdict가 대상이다. -Reason 필수.
     [Parameter(Mandatory=$false)][switch]$SealQaVerdict,
+    # CFG093(CFG-BL-074): 사람이 설정하는 공급자 쿨다운 관리자 액션.
+    [Parameter(Mandatory=$false)][switch]$MarkProviderCooldown,
+    [Parameter(Mandatory=$false)][switch]$ClearProviderCooldown,
+    [Parameter(Mandatory=$false)][string]$Principal,
+    [Parameter(Mandatory=$false)][string]$Until,
     [Parameter(Mandatory=$false)][string]$Reason
 )
 
@@ -891,7 +896,7 @@ function Measure-ContextBytes {
 
 # ── 메인 진입점 ─────────────────────────────────────────────────────────────
 if ($MyInvocation.InvocationName -ne '.' -and ($MyInvocation.Line -notmatch '^\s*\.\s' -or $MyInvocation.Line -eq $null)) {
-    if ([string]::IsNullOrWhiteSpace($TaskId)) {
+    if ([string]::IsNullOrWhiteSpace($TaskId) -and -not $MarkProviderCooldown -and -not $ClearProviderCooldown) {
         throw 'TaskId is required when executing dispatch-with-hang-detect.ps1 directly.'
     }
     $dispatchPlan = Resolve-DispatchPlan -TaskId $TaskId -Stage $Stage -Prompt $Prompt -Model $Model `
@@ -900,6 +905,8 @@ if ($MyInvocation.InvocationName -ne '.' -and ($MyInvocation.Line -notmatch '^\s
         -ManualComplete:$ManualComplete -ManualAbort:$ManualAbort -Reason $Reason `
         -ResealQaVerdict:$ResealQaVerdict `
         -SealQaVerdict:$SealQaVerdict `
+        -MarkProviderCooldown:$MarkProviderCooldown -ClearProviderCooldown:$ClearProviderCooldown `
+        -Principal $Principal -Until $Until `
         -StageConfig $StageConfig -RepoRoot $RepoRoot -ProfileModule $ProfileModule -ProfileConfigPath $ProfileConfigPath
 
     if ($dispatchPlan.EarlyExit) {

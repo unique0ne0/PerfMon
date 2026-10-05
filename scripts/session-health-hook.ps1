@@ -194,6 +194,8 @@ Move-Item -LiteralPath $tempPath -Destination $statePath -Force
 if ($warnings.Count -gt 0) {
     $output = "=== Session Health Warning ==="
     foreach ($w in $warnings) { $output += "`n$w" }
+    # Context-only warnings were silently absorbed by the model; make it relay them.
+    $output += "`nRelay these warnings to the user at the top of your reply. If a packet just finished, record its Task Handoff Summary and recommend starting a new session for the next packet."
     Write-Output $output
 }
 

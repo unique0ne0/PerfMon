@@ -411,7 +411,19 @@ function Update-ProviderHealth {
             if ($principal) {
                 $principalKey = "principal:$principal"
                 $principalModels = @($state.providers.psobject.Properties | Where-Object { $_.Name -like "model:*" -and [string]$_.Value.principal -eq $principal })
-                if ($principalModels.Count -eq 0) { $state.providers.psobject.Properties.Remove($principalKey) }
+                if ($principalModels.Count -eq 0) {
+                    $existingP = $state.providers.$principalKey
+                    $isManualUnexpired = $false
+                    if ($existingP -and [string]$existingP.source -eq 'operator' -and $existingP.nextProbeAt) {
+                        [datetime]$exp = [datetime]::MinValue
+                        if ([datetime]::TryParse([string]$existingP.nextProbeAt, [ref]$exp) -and $exp.ToUniversalTime() -gt [datetime]::UtcNow) {
+                            $isManualUnexpired = $true
+                        }
+                    }
+                    if (-not $isManualUnexpired) {
+                        $state.providers.psobject.Properties.Remove($principalKey)
+                    }
+                }
             }
             Write-ProviderHealth -Path $script:ProviderHealthPath -Value $state
             return
@@ -447,11 +459,130 @@ function Update-ProviderHealth {
                         } catch { }
                     }
                 }
-                $principalEntry = [pscustomobject]@{ reason = $Outcome; consecutiveFailures = $count; observedAt = [datetime]::UtcNow.ToString('o'); nextProbeAt = [datetime]::UtcNow.AddHours($longestHours).ToString('o') }
-                $state.providers | Add-Member -NotePropertyName $principalKey -NotePropertyValue $principalEntry -Force
+                # CFG093 QA: an operator cooldown is an explicit administrative boundary. Automatic
+                # quota aggregation must not replace its audit metadata or shorten its expiry.
+                $existingPrincipal = $state.providers.$principalKey
+                $preserveOperatorCooldown = $false
+                if ($existingPrincipal -and [string]$existingPrincipal.source -eq 'operator' -and $existingPrincipal.nextProbeAt) {
+                    [datetime]$operatorExpiry = [datetime]::MinValue
+                    if ([datetime]::TryParse([string]$existingPrincipal.nextProbeAt, [ref]$operatorExpiry) -and
+                        $operatorExpiry.ToUniversalTime() -gt [datetime]::UtcNow) {
+                        $preserveOperatorCooldown = $true
+                    }
+                }
+                if (-not $preserveOperatorCooldown) {
+                    $principalEntry = [pscustomobject]@{ reason = $Outcome; consecutiveFailures = $count; observedAt = [datetime]::UtcNow.ToString('o'); nextProbeAt = [datetime]::UtcNow.AddHours($longestHours).ToString('o') }
+                    $state.providers | Add-Member -NotePropertyName $principalKey -NotePropertyValue $principalEntry -Force
+                }
             }
         }
         Write-ProviderHealth -Path $script:ProviderHealthPath -Value $state
+    }
+}
+
+function ConvertTo-CooldownUtcDateTime {
+    param([string]$Until)
+    if ([string]::IsNullOrWhiteSpace($Until)) { throw 'Until 매개변수가 비어 있습니다.' }
+    $cleanUntil = $Until.Trim()
+    $nowUtc = [datetime]::UtcNow
+
+    # Relative format regex, e.g. +14h, 14h, 2d, 30m, 3600s, 1.5h, or compound 1d2h30m
+    $relativePattern = '^\+?(?:(\d+(?:\.\d+)?)\s*(?:d|days?))?\s*(?:(\d+(?:\.\d+)?)\s*(?:h|hrs?|hours?))?\s*(?:(\d+(?:\.\d+)?)\s*(?:m|mins?|minutes?))?\s*(?:(\d+(?:\.\d+)?)\s*(?:s|secs?|seconds?))?$'
+    if ($cleanUntil -match $relativePattern -and ($Matches[1] -or $Matches[2] -or $Matches[3] -or $Matches[4])) {
+        $days = if ($Matches[1]) { [double]$Matches[1] } else { 0.0 }
+        $hours = if ($Matches[2]) { [double]$Matches[2] } else { 0.0 }
+        $minutes = if ($Matches[3]) { [double]$Matches[3] } else { 0.0 }
+        $seconds = if ($Matches[4]) { [double]$Matches[4] } else { 0.0 }
+        $totalSeconds = ($days * 86400) + ($hours * 3600) + ($minutes * 60) + $seconds
+        if ($totalSeconds -le 0) { throw "상대 시간은 0보다 커야 합니다: $Until" }
+        return $nowUtc.AddSeconds($totalSeconds)
+    }
+
+    # ISO 8601 or absolute datetime parse
+    [datetime]$parsed = [datetime]::MinValue
+    $parseStyles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    if ([datetime]::TryParse($cleanUntil, [System.Globalization.CultureInfo]::InvariantCulture, $parseStyles, [ref]$parsed) -or
+        [datetime]::TryParse($cleanUntil, [ref]$parsed)) {
+        $targetUtc = $parsed.ToUniversalTime()
+        if ($targetUtc -le $nowUtc) {
+            throw "만료 시각은 현재(UTC $($nowUtc.ToString('o')))보다 미래여야 합니다: $Until"
+        }
+        return $targetUtc
+    }
+
+    throw "만료 시각 형식을 해석할 수 없습니다: $Until"
+}
+
+function Set-ProviderCooldown {
+    param(
+        [Parameter(Mandatory=$true)][string]$Principal,
+        [Parameter(Mandatory=$true)][string]$Until,
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [Parameter(Mandatory=$false)][string]$HealthPath
+    )
+    if ([string]::IsNullOrWhiteSpace($Principal)) { throw 'Principal이 필요합니다.' }
+    if ([string]::IsNullOrWhiteSpace($Reason)) { throw 'Reason이 필요합니다.' }
+    $untilUtc = ConvertTo-CooldownUtcDateTime -Until $Until
+
+    $path = if ($HealthPath) { $HealthPath }
+            elseif ($script:ProviderHealthPath) { $script:ProviderHealthPath }
+            else {
+                $stateRoot = if ($env:USERPROFILE) { Join-Path $env:USERPROFILE '.agents\harness-state' } else { Join-Path ([IO.Path]::GetTempPath()) 'agents-harness-state' }
+                Join-Path $stateRoot 'provider-health.json'
+            }
+    $parent = Split-Path -Parent $path
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    $operator = if ($env:USERNAME) { $env:USERNAME } else { 'operator' }
+    Invoke-WithProviderHealthLock -Action {
+        $state = Read-ProviderHealth -Path $path
+        if ($null -eq $state.providers) { $state | Add-Member -NotePropertyName providers -NotePropertyValue ([pscustomobject]@{}) -Force }
+        $principalKey = "principal:$Principal"
+        $entry = [pscustomobject]@{
+            reason = $Reason
+            source = 'operator'
+            operator = $operator
+            consecutiveFailures = 1
+            observedAt = [datetime]::UtcNow.ToString('o')
+            nextProbeAt = $untilUtc.ToString('o')
+        }
+        $state.providers | Add-Member -NotePropertyName $principalKey -NotePropertyValue $entry -Force
+        Write-ProviderHealth -Path $path -Value $state
+    }
+    if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+        Write-Log "🔒 [provider-cooldown] Principal '$Principal' cooldown marked until $($untilUtc.ToString('o')) by $operator (reason: $Reason)" INFO
+    }
+}
+
+function Clear-ProviderCooldown {
+    param(
+        [Parameter(Mandatory=$true)][string]$Principal,
+        [Parameter(Mandatory=$false)][string]$HealthPath
+    )
+    if ([string]::IsNullOrWhiteSpace($Principal)) { throw 'Principal이 필요합니다.' }
+
+    $path = if ($HealthPath) { $HealthPath }
+            elseif ($script:ProviderHealthPath) { $script:ProviderHealthPath }
+            else {
+                $stateRoot = if ($env:USERPROFILE) { Join-Path $env:USERPROFILE '.agents\harness-state' } else { Join-Path ([IO.Path]::GetTempPath()) 'agents-harness-state' }
+                Join-Path $stateRoot 'provider-health.json'
+            }
+    if (-not (Test-Path -LiteralPath $path)) { return }
+
+    $operator = if ($env:USERNAME) { $env:USERNAME } else { 'operator' }
+    Invoke-WithProviderHealthLock -Action {
+        $state = Read-ProviderHealth -Path $path
+        if ($null -eq $state.providers) { return }
+        $principalKey = "principal:$Principal"
+        if ($state.providers.psobject.Properties[$principalKey]) {
+            $state.providers.psobject.Properties.Remove($principalKey)
+            Write-ProviderHealth -Path $path -Value $state
+        }
+    }
+    if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+        Write-Log "🔓 [provider-cooldown] Principal '$Principal' cooldown cleared by $operator" INFO
     }
 }
 

@@ -1037,7 +1037,7 @@ function Invoke-StageWithLock {
 
 function Resolve-DispatchPlan {
     param(
-        [Parameter(Mandatory=$true)][string]$TaskId,
+        [Parameter(Mandatory=$false)][string]$TaskId,
         [Parameter(Mandatory=$false)][string]$Stage,
         [Parameter(Mandatory=$false)][string]$Prompt,
         [Parameter(Mandatory=$false)][string]$Model,
@@ -1052,12 +1052,74 @@ function Resolve-DispatchPlan {
         [Parameter(Mandatory=$false)][switch]$ResealQaVerdict,
         # CFG091(CFG-BL-071 (b)): 최초 봉인이 누락된 유효 QA verdict를 사후 봉인하는 관리자 액션.
         [Parameter(Mandatory=$false)][switch]$SealQaVerdict,
+        # CFG093(CFG-BL-074): 사람이 설정하는 공급자 쿨다운 관리자 액션.
+        [Parameter(Mandatory=$false)][switch]$MarkProviderCooldown,
+        [Parameter(Mandatory=$false)][switch]$ClearProviderCooldown,
+        [Parameter(Mandatory=$false)][string]$Principal,
+        [Parameter(Mandatory=$false)][string]$Until,
         [Parameter(Mandatory=$false)][string]$Reason,
         [Parameter(Mandatory=$false)][hashtable]$StageConfig,
         [Parameter(Mandatory=$false)][string]$RepoRoot,
         [Parameter(Mandatory=$false)][string]$ProfileModule,
         [Parameter(Mandatory=$false)][string]$ProfileConfigPath
     )
+
+    # ── CFG093: 사람이 설정하는 공급자 쿨다운 관리자 액션 (-MarkProviderCooldown / -ClearProviderCooldown) ──
+    if ($MarkProviderCooldown -and $ClearProviderCooldown) {
+        Write-Log '-MarkProviderCooldown and -ClearProviderCooldown are mutually exclusive.' ERROR
+        return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'MarkProviderCooldown and ClearProviderCooldown mutually exclusive' }
+    }
+    if ($MarkProviderCooldown) {
+        if ($Chain) {
+            Write-Log '오류: -MarkProviderCooldown은 -Chain과 함께 사용할 수 없습니다.' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'MarkProviderCooldown cannot be combined with Chain' }
+        }
+        if ([string]::IsNullOrWhiteSpace($Principal)) {
+            Write-Log '오류: -MarkProviderCooldown은 -Principal <name> 지정이 필수입니다.' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'MarkProviderCooldown requires Principal' }
+        }
+        if ([string]::IsNullOrWhiteSpace($Until)) {
+            Write-Log '오류: -MarkProviderCooldown은 -Until <ISO8601|상대시간> 지정이 필수입니다.' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'MarkProviderCooldown requires Until' }
+        }
+        if ([string]::IsNullOrWhiteSpace($Reason)) {
+            Write-Log '오류: -MarkProviderCooldown은 -Reason 지정이 필수입니다.' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'MarkProviderCooldown requires Reason' }
+        }
+        $untilUtc = $null
+        try {
+            $untilUtc = ConvertTo-CooldownUtcDateTime -Until $Until
+        } catch {
+            Write-Log "오류: -MarkProviderCooldown -Until 거부 ($($_.Exception.Message))" ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = "Invalid Until: $($_.Exception.Message)" }
+        }
+        return [pscustomobject]@{
+            EarlyExit = $true
+            ExitCode = 0
+            Reason = 'MarkProviderCooldown requested'
+            Action = 'markProviderCooldown'
+            ActionPrincipal = $Principal
+            ActionUntil = $untilUtc.ToString('o')
+            ActionReason = $Reason
+        }
+    }
+    if ($ClearProviderCooldown) {
+        if ($Chain) {
+            Write-Log '오류: -ClearProviderCooldown은 -Chain과 함께 사용할 수 없습니다.' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'ClearProviderCooldown cannot be combined with Chain' }
+        }
+        if ([string]::IsNullOrWhiteSpace($Principal)) {
+            Write-Log '오류: -ClearProviderCooldown은 -Principal <name> 지정이 필수입니다.' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'ClearProviderCooldown requires Principal' }
+        }
+        return [pscustomobject]@{
+            EarlyExit = $true
+            ExitCode = 0
+            Reason = 'ClearProviderCooldown requested'
+            Action = 'clearProviderCooldown'
+            ActionPrincipal = $Principal
+        }
+    }
 
     Validate-TaskId -Id $TaskId
 
@@ -1360,6 +1422,14 @@ function Invoke-DispatchChain {
         }
         if ($Plan.Action -eq 'sealQaVerdict') {
             return (Invoke-QaVerdictSeal -Stage $Plan.ActionStage -ReasonText $Plan.ActionReason)
+        }
+        if ($Plan.Action -eq 'markProviderCooldown') {
+            Set-ProviderCooldown -Principal $Plan.ActionPrincipal -Until $Plan.ActionUntil -Reason $Plan.ActionReason
+            return 0
+        }
+        if ($Plan.Action -eq 'clearProviderCooldown') {
+            Clear-ProviderCooldown -Principal $Plan.ActionPrincipal
+            return 0
         }
         return [int]$Plan.ExitCode
     }
