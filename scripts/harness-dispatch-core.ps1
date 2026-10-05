@@ -1026,6 +1026,11 @@ function Invoke-StageWithLock {
         Write-FailureMarker -Stage $Stage -Reason "예외: $($_.Exception.Message)"
         throw
     } finally {
+        # CFG092(CFG-BL-076 (a)): 성공 후처리나 예외가 패킷 손상 때문에 실패해도 반드시 검사한다.
+        # 반환 객체가 호출자의 stage result에 섞이지 않도록 출력도 명시적으로 버린다.
+        if (Get-Command Test-PacketCorruption -ErrorAction SilentlyContinue) {
+            $null = Test-PacketCorruption -PacketPath $CheckPipelinePacket -Stage $Stage -TaskId $TaskId
+        }
         Exit-DispatchLock -Stage $Stage
     }
 }

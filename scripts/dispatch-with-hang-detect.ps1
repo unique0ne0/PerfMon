@@ -638,6 +638,146 @@ function Get-ScopeDriftWarnings {
     return $drift
 }
 
+# CFG092(CFG-BL-076 (a)): 단계(impl/qa/integration) 종료 직후 해당 패킷 파일을 검사한다.
+# 손상 판정: (i) U+FFFD 문자가 1개 이상, (ii) 직전 커밋(git show HEAD:<패킷>)에 있던 한글(가-힣)
+# 문자 수 대비 현재 한글 문자 수가 50% 미만으로 줄었고 현재 파일에 '?' 연속(3개 이상)이 직전보다 늘었다.
+# 패킷이 HEAD에 없으면(신규) (i)만 적용한다.
+# 판정 시 로그에 WARN을 남기고 .agents/briefs/logs/<TaskId>-packet-corruption.json을 쓴다. 단계 결과는 막지 않는다(경고 전용).
+function Test-PacketCorruption {
+    param(
+        [string]$PacketPath,
+        [string]$Stage,
+        [string]$TaskId,
+        [string]$HeadContentOverride = $null
+    )
+
+    try {
+        if ([string]::IsNullOrWhiteSpace($PacketPath)) {
+            if (-not [string]::IsNullOrWhiteSpace($TaskId)) {
+                $found = Find-PacketByTaskId -SearchTaskId $TaskId -ProjectPath (Resolve-RepoPath '.')
+                if ($found) { $PacketPath = $found }
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($PacketPath)) { return @{ Corrupted = $false } }
+
+        $packetAbs = if ([System.IO.Path]::IsPathRooted($PacketPath)) { $PacketPath } else { Resolve-RepoPath $PacketPath }
+        if (-not (Test-Path -LiteralPath $packetAbs)) { return @{ Corrupted = $false } }
+
+        # UTF-8로 현재 파일 내용 읽기
+        $currentContent = [System.IO.File]::ReadAllText($packetAbs, [System.Text.Encoding]::UTF8)
+
+        # (i) U+FFFD 문자가 1개 이상
+        $uffdMatches = [regex]::Matches($currentContent, '\uFFFD')
+        $uffdCount = $uffdMatches.Count
+        $isUffdCorrupted = ($uffdCount -gt 0)
+
+        # HEAD 내용 조회 (또는 override)
+        $headContent = $HeadContentOverride
+        if ($null -eq $headContent) {
+            $repoAbs = Resolve-RepoPath '.'
+            $gitRel = $PacketPath -replace '\\', '/'
+            if ([System.IO.Path]::IsPathRooted($PacketPath)) {
+                $normRepo = ($repoAbs -replace '\\', '/').TrimEnd('/') + '/'
+                if ($gitRel.StartsWith($normRepo, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $gitRel = $gitRel.Substring($normRepo.Length)
+                }
+            }
+            $gitRel = $gitRel.TrimStart('/')
+
+            $oldEncoding = [Console]::OutputEncoding
+            try {
+                [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+                $headRaw = git -C $repoAbs show ("HEAD:" + $gitRel) 2>$null
+                if ($LASTEXITCODE -eq 0 -and $null -ne $headRaw) {
+                    $headContent = ($headRaw | Out-String)
+                }
+            } catch {
+                $headContent = $null
+            } finally {
+                [Console]::OutputEncoding = $oldEncoding
+            }
+        }
+
+        # (ii) 직전 커밋에 있던 한글(가-힣) 문자 수 대비 현재 한글 문자 수가 50% 미만으로 줄었고
+        # 현재 파일에 '?' 연속(3개 이상)이 직전보다 늘었다. 패킷이 HEAD에 없으면(신규) (i)만 적용.
+        $currentHangulCount = ([regex]::Matches($currentContent, '[\uAC00-\uD7A3]')).Count
+        $headHangulCount = 0
+        $currentQuestionSeries = ([regex]::Matches($currentContent, '\?{3,}')).Count
+        $headQuestionSeries = 0
+        $isHangulDropCorrupted = $false
+
+        if ($null -ne $headContent) {
+            $headHangulCount = ([regex]::Matches($headContent, '[\uAC00-\uD7A3]')).Count
+            $headQuestionSeries = ([regex]::Matches($headContent, '\?{3,}')).Count
+
+            if ($headHangulCount -gt 0 -and $currentHangulCount -lt ($headHangulCount * 0.5) -and $currentQuestionSeries -gt $headQuestionSeries) {
+                $isHangulDropCorrupted = $true
+            }
+        }
+
+        $isCorrupted = $isUffdCorrupted -or $isHangulDropCorrupted
+        if ($isCorrupted) {
+            $reasons = New-Object System.Collections.Generic.List[string]
+            if ($isUffdCorrupted) {
+                $reasons.Add("U+FFFD 대체 문자 검출 (${uffdCount}개)")
+            }
+            if ($isHangulDropCorrupted) {
+                $reasons.Add("한글 문자 급감($headHangulCount -> $currentHangulCount, 50% 미만) 및 '?' 연속(3개 이상) 증가($headQuestionSeries -> $currentQuestionSeries)")
+            }
+            $reasonStr = ($reasons -join ' ; ')
+
+            if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+                Write-Log "⚠️ [$Stage] 패킷 파일 한글 손상 감지($PacketPath): $reasonStr" WARN
+            }
+
+            # 마커 json 작성: .agents/briefs/logs/<TaskId>-packet-corruption.json
+            if (-not [string]::IsNullOrWhiteSpace($TaskId)) {
+                $markerRel = ".agents/briefs/logs/$TaskId-packet-corruption.json"
+                $markerAbs = Resolve-RepoPath $markerRel
+                $markerData = [ordered]@{
+                    timestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssK")
+                    stage = $Stage
+                    taskId = $TaskId
+                    packetPath = $PacketPath
+                    corrupted = $true
+                    reason = $reasonStr
+                    metrics = [ordered]@{
+                        uffdCount = $uffdCount
+                        currentHangulCount = $currentHangulCount
+                        headHangulCount = $headHangulCount
+                        hangulRatio = if ($headHangulCount -gt 0) { [math]::Round($currentHangulCount / $headHangulCount, 4) } else { $null }
+                        currentQuestionSeries = $currentQuestionSeries
+                        headQuestionSeries = $headQuestionSeries
+                    }
+                }
+                Write-AtomicJson -Path $markerAbs -Value $markerData
+            }
+
+            return @{
+                Corrupted = $true
+                Reason = $reasonStr
+                UffdCount = $uffdCount
+                CurrentHangulCount = $currentHangulCount
+                HeadHangulCount = $headHangulCount
+                CurrentQuestionSeries = $currentQuestionSeries
+                HeadQuestionSeries = $headQuestionSeries
+            }
+        }
+
+        return @{
+            Corrupted = $false
+            UffdCount = $uffdCount
+            CurrentHangulCount = $currentHangulCount
+            HeadHangulCount = $headHangulCount
+            CurrentQuestionSeries = $currentQuestionSeries
+            HeadQuestionSeries = $headQuestionSeries
+        }
+    } catch {
+        # fail-open: 점검 실패가 단계를 막지 않는다 (경고 전용)
+        return @{ Corrupted = $false; Error = $_.Exception.Message }
+    }
+}
+
 function Find-PacketByTaskId {
     param([string]$SearchTaskId, [string]$ProjectPath)
     if (-not $SearchTaskId) { return $null }

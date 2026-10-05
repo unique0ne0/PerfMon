@@ -184,6 +184,84 @@ function Resolve-StageProfileSlots {
     return ,$slots
 }
 
+$InstantFailureThresholdSeconds = 30
+
+# CFG092(CFG-BL-072 (a)): 어댑터 시도가 (i) 시도 로그 크기 0 바이트이거나 시도 로그 파일이 없고,
+# (ii) 종료 코드가 0이 아니며(또는 null), (iii) 경과 시간이 임계(기본 30초) 미만이면,
+# 시도 로그에 진단 블록을 추가한다(파일이 없으면 생성). 로그가 이미 내용을 가지고 있으면 건드리지 않는다.
+# fail-open: 진단 기록 중 어떤 예외도 호출자에 전파하지 않는다. 프롬프트 본문은 넣지 않는다.
+function Write-InstantFailureDiagnostics {
+    param(
+        [string]$AttemptLog,
+        [string]$Adapter,
+        [string]$Model,
+        [object]$ExitCode,
+        [double]$ElapsedSeconds,
+        [datetime]$StartedAt,
+        [string]$ToolCmd,
+        [int]$ThresholdSeconds = 30
+    )
+
+    try {
+        if ([string]::IsNullOrWhiteSpace($AttemptLog)) { return }
+        $attemptAbs = if ([System.IO.Path]::IsPathRooted($AttemptLog)) { $AttemptLog } else { Resolve-RepoPath $AttemptLog }
+        $logExists = Test-Path -LiteralPath $attemptAbs
+        $logBytes = if ($logExists) { (Get-Item -LiteralPath $attemptAbs).Length } else { 0 }
+
+        # (i) 0바이트이거나 로그 파일이 없음. 이미 내용이 있으면 건드리지 않는다.
+        if ($logBytes -gt 0) { return }
+
+        # (ii) 종료 코드가 0이 아니며(또는 null)
+        $isNonZeroExit = ($null -eq $ExitCode -or $ExitCode -ne 0)
+        if (-not $isNonZeroExit) { return }
+
+        # (iii) 경과 시간이 임계(기본 30초) 미만
+        if ($ElapsedSeconds -ge $ThresholdSeconds) { return }
+
+        $variant = if ($ToolCmd -match '(?:^|\s)--variant\s+([^\s''"]+)') { $matches[1] } else { $null }
+        $flags = New-Object System.Collections.Generic.List[string]
+        if ($variant) { $flags.Add("--variant $variant") }
+        $effort = if ($ToolCmd -match '(?:^|\s)--effort\s+([^\s''"]+)') { $matches[1] } else { $null }
+        if ($effort) { $flags.Add("--effort $effort") }
+
+        $startedAtStr = if ($StartedAt -and $StartedAt -ne [datetime]::MinValue) {
+            $StartedAt.ToString("yyyy-MM-ddTHH:mm:ssK")
+        } else {
+            (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssK")
+        }
+
+        $lines = New-Object System.Collections.Generic.List[string]
+        $lines.Add("# [하네스 진단] 어댑터 즉시 종료 감지 (CFG-BL-072)")
+        $lines.Add("- Diagnostic: instant_failure")
+        $lines.Add("- Adapter: $Adapter")
+        $lines.Add("- Model: $Model")
+        $lines.Add("- ExitCode: $(if ($null -ne $ExitCode) { $ExitCode } else { 'null' })")
+        $lines.Add("- ElapsedSeconds: $([math]::Round($ElapsedSeconds, 2))")
+        $lines.Add("- StartedAt: $startedAtStr")
+        if ($flags.Count -gt 0) {
+            $lines.Add("- ModelFlags: $($flags -join ' ')")
+        }
+        if ($variant) {
+            $lines.Add("- Variant: $variant")
+        }
+        # ToolCmd에는 어댑터에 따라 프롬프트가 중간 인자로 들어가기도 한다. 정규식 마스킹은
+        # 인용 형태별 누출 위험이 있으므로 명령 원문은 기록하지 않고 안전한 모델 플래그만 추출한다.
+        $lines.Add("")
+
+        $content = ($lines -join "`n")
+        $dir = Split-Path -Parent $attemptAbs
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            $null = New-Item -ItemType Directory -Path $dir -Force
+        }
+        [System.IO.File]::AppendAllText($attemptAbs, $content, (New-Object System.Text.UTF8Encoding($false)))
+        if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+            Write-Log "⚠️ 어댑터 즉시 종료 감지($Adapter / $Model, ExitCode: $ExitCode, ${ElapsedSeconds}s) — 시도 로그에 진단 블록을 기록했습니다($AttemptLog)" WARN
+        }
+    } catch {
+        # fail-open: 진단 기록 중 예외가 발생해도 호출자 및 시도 결과를 막지 않는다.
+    }
+}
+
 function Invoke-ModelAttempt {
     param([string]$Stage, [hashtable]$Config, [string]$ToolCmd, [string]$AttemptLog, [string]$LatestLog, [int]$Cycle, [string]$Model)
 
@@ -212,6 +290,8 @@ function Invoke-ModelAttempt {
     # CFG091(CFG-BL-070): codex 외 어댑터도 ReportFile을 산출하도록 시도 로그에서 최종 응답을 추출한다.
     # 비정상 종료·hang으로 끝난 attempt에서도 그때까지의 로그로 보고서를 남긴다(부가 산출물).
     Write-StageReportFromAttempt -Stage $Stage -Config $Config -AttemptLog $AttemptLog
+    # CFG092(CFG-BL-072 (a)): 어댑터가 출력 없이 즉시 종료한 경우 시도 로그에 진단 블록을 fail-open으로 기록한다.
+    Write-InstantFailureDiagnostics -AttemptLog $AttemptLog -Adapter $Config.Adapter -Model $Model -ExitCode $exit -ElapsedSeconds $elapsedSeconds -StartedAt $attemptStartedAt -ToolCmd $ToolCmd -ThresholdSeconds $InstantFailureThresholdSeconds
     return @{ Outcome = $outcome; ExitCode = $exit; ElapsedSeconds = $elapsedSeconds; LogStartBytes = $logStartBytes; Adapter = $Config.Adapter; CompletedAfterArtifacts = $completedAfterArtifacts; AttemptStartedAt = $attemptStartedAt }
 }
 
