@@ -55,9 +55,17 @@ function Test-ProfileGraph {
             if ([string]$model -notmatch '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$') { throw "Invalid route model: $model" }
             if ($null -eq $Config.modelCatalog.$model) { throw "Route $($route.Name) contains unregistered model: $model" }
         }
-        $lastModel = $models[-1]
-        $lastCatalog = $Config.modelCatalog.$lastModel
-        if ($null -eq $lastCatalog -or [string]$lastCatalog.cost -ne 'free') { throw "Route $($route.Name) last slot must be a free model." }
+        $opencodeSlots = @($models | Where-Object {
+            $cat = $Config.modelCatalog.$_
+            $null -ne $cat -and ($null -eq $cat.adapter -or [string]::IsNullOrWhiteSpace([string]$cat.adapter) -or [string]$cat.adapter -eq 'opencode')
+        })
+        if ($opencodeSlots.Count -ge 2) {
+            $lastModel = $models[-1]
+            $lastCatalog = $Config.modelCatalog.$lastModel
+            if ($null -eq $lastCatalog -or [string]$lastCatalog.cost -ne 'free') {
+                throw "Route $($route.Name) with 2 or more opencode slots must end with a free model."
+            }
+        }
         $unique = @($models | Sort-Object -Unique)
         if ($unique.Count -ne $models.Count) { throw "Route $($route.Name) contains duplicate models." }
     }
