@@ -5,7 +5,35 @@
 
 $ErrorActionPreference = 'Stop'
 
+# Korean warning text must survive the hook boundary: Windows PowerShell 5.1
+# defaults stdout to the ANSI/OEM code page, while Claude Code decodes hook
+# stdout as UTF-8.  Pin UTF-8 (no BOM) so the warnings are not mangled.
+try {
+    $utf8Out = New-Object System.Text.UTF8Encoding($false)
+    [Console]::OutputEncoding = $utf8Out
+    $OutputEncoding = $utf8Out
+} catch { }
+
+# A1: warn every TurnWarnStep assistant turns (100, 200, 300, ...).  TurnWarnReissueHours
+# re-fires the highest crossed threshold this many hours after its last issuance so a
+# long /resume'd or abandoned session is re-nudged (challenge finding 5).
+$TurnWarnStep = 100
+$TurnWarnReissueHours = 6
+# Turn dedup keeps only the first 12 chars of each message.id (per session), and only
+# the 10 most-recently-used sessions, to bound the state file (A1 state schema).
+$TurnIdPrefixLength = 12
+$TurnMaxSessions = 10
+# Cap a *fresh* scan of a huge transcript to the trailing 8MB (challenge finding 2):
+# the turn count is then a lower bound (undercount allowed) but the hook never times out.
+$TurnScanByteCap = 8MB
+
 function Exit-Silent { exit 0 }
+
+function Get-TurnWarningMessage {
+    param([int]$TurnThreshold)
+    $strongPrefix = if ($TurnThreshold -ge 300) { '[강한 경고] ' } else { '' }
+    return "${strongPrefix}이 세션은 ${TurnThreshold}턴을 넘었다. 긴 세션은 매 턴 누적 컨텍스트를 다시 읽어 사용량이 커진다. 진행 중인 단계가 끝나는 지점에서 session-carryover 스킬로 인계 파일을 쓰고 새 세션 시작을 안내하라. remember 플러그인·auto-memory로 대체하지 않는다."
+}
 
 function Get-HookTargetIdentifier {
     param([string]$Command)
@@ -114,6 +142,34 @@ if ($state -and $state.reportedHookErrors) {
     }
 }
 
+# A1 turn dedup state.  turnIds[sessionId] is the set of *first 12 chars* of the
+# assistant message.id (uuid fallback) seen this session.  A per-session HashSet
+# gives O(1) membership so a 10MB first scan stays fast; the parallel ArrayList is
+# what gets serialized.  Context compaction (compact_boundary) re-records past
+# assistant records late in the transcript, so dedup must span the whole session
+# (challenge finding 1), not just compare against the previous id.
+$turnIdLists = [ordered]@{}
+$turnIdSets = @{}
+if ($state -and $state.turnIds) {
+    foreach ($sessionProp in @($state.turnIds.psobject.Properties)) {
+        $list = New-Object System.Collections.ArrayList
+        $set = New-Object 'System.Collections.Generic.HashSet[string]'
+        if ($sessionProp.Value) {
+            foreach ($idVal in @($sessionProp.Value)) {
+                $idText = [string]$idVal
+                if ([string]::IsNullOrEmpty($idText)) { continue }
+                if ($set.Add($idText)) { [void]$list.Add($idText) }
+            }
+        }
+        $turnIdLists[$sessionProp.Name] = $list
+        $turnIdSets[$sessionProp.Name] = $set
+    }
+}
+if (-not $turnIdLists.Contains($sessionId)) {
+    $turnIdLists[$sessionId] = New-Object System.Collections.ArrayList
+    $turnIdSets[$sessionId] = New-Object 'System.Collections.Generic.HashSet[string]'
+}
+
 # Project-scoped (not session-scoped) counter: how many distinct sessions have
 # hit the context-70 threshold since the last tool/MCP review suggestion was
 # emitted. Mirrors the orchestration-runbook §7 idiom — observe, then only
@@ -154,7 +210,26 @@ try {
 
     $tailLines = 200
     $tailContent = $null
-    try { $tailContent = @(Get-Content -LiteralPath $transcriptPath -Tail $tailLines -Encoding UTF8) } catch { }
+    # Get-Content -Tail walks a 17MB transcript in ~8s (> the 5s hook timeout), which would kill the
+    # whole hook including the turn warning exactly for the long sessions it targets.  Read only the
+    # last 1MB by seeking, dropping the first (possibly partial) line when we did not start at 0.
+    try {
+        $tailFs = [System.IO.File]::Open($transcriptPath, 'Open', 'Read', 'ReadWrite')
+        try {
+            $tailStart = [math]::Max(0, $tailFs.Length - 1MB)
+            [void]$tailFs.Seek($tailStart, 'Begin')
+            $tailBytes = New-Object byte[] ($tailFs.Length - $tailStart)
+            $tailRead = 0
+            while ($tailRead -lt $tailBytes.Length) {
+                $n = $tailFs.Read($tailBytes, $tailRead, $tailBytes.Length - $tailRead)
+                if ($n -le 0) { break }
+                $tailRead += $n
+            }
+        } finally { $tailFs.Close() }
+        $tailLinesAll = [System.Text.Encoding]::UTF8.GetString($tailBytes, 0, $tailRead).TrimStart([char]0xFEFF) -split "`r?`n"
+        if ($tailStart -gt 0 -and $tailLinesAll.Count -gt 0) { $tailLinesAll = $tailLinesAll[1..($tailLinesAll.Count - 1)] }
+        $tailContent = @($tailLinesAll | Select-Object -Last $tailLines)
+    } catch { }
     if ($tailContent) {
         for ($i = $tailContent.Count - 1; $i -ge 0; $i--) {
             $line = $tailContent[$i]
@@ -177,6 +252,10 @@ try {
 
 $warnings = New-Object System.Collections.ArrayList
 
+# Done When 1: every warning must name the session-carryover skill (not the
+# remember plugin / auto-memory).  Shared suffix keeps the wording consistent.
+$carryoverGuidance = 'At the next stage boundary use the session-carryover skill to write a carry-over file and start a new session. Do not substitute the remember plugin or auto-memory.'
+
 try {
     $fileInfo = Get-Item -LiteralPath $transcriptPath -ErrorAction SilentlyContinue
     if ($fileInfo) {
@@ -188,6 +267,24 @@ try {
 
         if ($scanOffset -gt $fileLen -or $scanOffset -lt 0) {
             $scanOffset = 0L
+        }
+
+        # A1 performance (challenge finding 2): a fresh (or reset) scan of a huge
+        # transcript is capped to the trailing 8MB, aligned to the next newline so
+        # no partial JSON line is scanned.  The resulting turn count is a lower
+        # bound (undercount acceptable); this keeps the 5s hook timeout safe.
+        if ($scanOffset -eq 0L -and $fileLen -gt $TurnScanByteCap) {
+            $capStart = [long]($fileLen - $TurnScanByteCap)
+            $capStream = $null
+            try {
+                $capStream = [System.IO.File]::Open($transcriptPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                [void]$capStream.Seek($capStart, [System.IO.SeekOrigin]::Begin)
+                while (($capByte = $capStream.ReadByte()) -ne -1 -and $capByte -ne 10) { }
+                $capStart = $capStream.Position
+            } catch { $capStart = [long]($fileLen - $TurnScanByteCap) } finally {
+                if ($capStream) { $capStream.Close() }
+            }
+            $scanOffset = $capStart
         }
 
         $bytesToRead = [long]($fileLen - $scanOffset)
@@ -236,6 +333,34 @@ try {
 
                     foreach ($line in $lines) {
                         if ([string]::IsNullOrWhiteSpace($line)) { continue }
+
+                        # Turn counting (A1): count assistant records that carry
+                        # message.usage and a claude* model, deduped by the set of
+                        # message.id (uuid fallback) prefixes seen this session --
+                        # the same "turn" definition as scripts/measure-session-usage.py.
+                        # IndexOf discriminators + a single regex avoid a per-line
+                        # ConvertFrom-Json so a 10MB first scan stays within the 5s
+                        # hook timeout (challenge finding 2).
+                        try {
+                            if ($line.IndexOf('"type":"assistant"', [System.StringComparison]::Ordinal) -ge 0 -and
+                                $line.IndexOf('"usage"', [System.StringComparison]::Ordinal) -ge 0 -and
+                                $line.IndexOf('"model":"claude', [System.StringComparison]::Ordinal) -ge 0) {
+                                $idMatch = [regex]::Match($line, '"id":"(msg_[^"]{1,})"')
+                                if ($idMatch.Success) {
+                                    $turnIdText = $idMatch.Groups[1].Value
+                                } else {
+                                    $uuidMatch = [regex]::Match($line, '"uuid":"([^"]{1,})"')
+                                    $turnIdText = if ($uuidMatch.Success) { $uuidMatch.Groups[1].Value } else { $null }
+                                }
+                                if ($turnIdText) {
+                                    $turnIdPrefix = if ($turnIdText.Length -gt $TurnIdPrefixLength) { $turnIdText.Substring(0, $TurnIdPrefixLength) } else { $turnIdText }
+                                    if ($turnIdSets[$sessionId].Add($turnIdPrefix)) {
+                                        [void]$turnIdLists[$sessionId].Add($turnIdPrefix)
+                                    }
+                                }
+                            }
+                        } catch { }
+
                         if ($line.IndexOf('hook_non_blocking_error', [System.StringComparison]::Ordinal) -ge 0) {
                             try {
                                 $obj = $line | ConvertFrom-Json
@@ -274,6 +399,41 @@ try {
     }
 } catch { Exit-Silent }
 
+# A1 turn warnings: fire once per crossed 100-turn threshold, per session.  The
+# issuedWarnings key persists in state, so a restart/`resume` never re-fires an
+# already-announced threshold.  300+ thresholds are escalated as strong warnings.
+$currentTurnCount = 0
+if ($turnIdLists.Contains($sessionId)) {
+    try { $currentTurnCount = [int]$turnIdLists[$sessionId].Count } catch { $currentTurnCount = 0 }
+}
+# Failure here must not block the context/time/hook-error warnings (challenge
+# finding 2: keep turn counting in its own try/catch).
+try {
+    if ($currentTurnCount -ge $TurnWarnStep) {
+        $highestTurnThreshold = [int]([math]::Floor($currentTurnCount / $TurnWarnStep) * $TurnWarnStep)
+        for ($turnThreshold = $TurnWarnStep; $turnThreshold -le $highestTurnThreshold; $turnThreshold += $TurnWarnStep) {
+            $turnKey = "${sessionKey}-turns-${turnThreshold}"
+            if (-not $issued.ContainsKey($turnKey)) {
+                [void]$warnings.Add((Get-TurnWarningMessage $turnThreshold))
+                $issued[$turnKey] = $now.ToString('o')
+            }
+        }
+        # '/'resume' keeps the sessionId, so a resumed/abandoned session that is
+        # still over the highest threshold is re-nudged once every TurnWarnReissueHours
+        # (challenge finding 5).
+        $highestTurnKey = "${sessionKey}-turns-${highestTurnThreshold}"
+        if ($issued.ContainsKey($highestTurnKey)) {
+            [datetime]$parsedTurnLast = [datetime]::MinValue
+            if ([datetime]::TryParse([string]$issued[$highestTurnKey], [ref]$parsedTurnLast)) {
+                if (($now - $parsedTurnLast.ToUniversalTime()).TotalHours -ge $TurnWarnReissueHours) {
+                    [void]$warnings.Add((Get-TurnWarningMessage $highestTurnThreshold))
+                    $issued[$highestTurnKey] = $now.ToString('o')
+                }
+            }
+        }
+    }
+} catch { }
+
 $elapsedHours = if ($firstTimestamp) { [math]::Max(0, ($now - $firstTimestamp).TotalHours) } else { $null }
 
 if ($null -ne $elapsedHours) {
@@ -286,7 +446,7 @@ if ($null -ne $elapsedHours) {
                 if ([datetime]::TryParse([string]$issued[$key], [ref]$parsedLast)) { $lastIssued = $parsedLast }
             }
             if ($null -eq $lastIssued -or ($now - $lastIssued.ToUniversalTime()).TotalMinutes -ge 60) {
-                $message = if ($threshold -eq 8) { "Session has been active for $([math]::Round($elapsedHours, 1))h (>=${threshold}h). Consider recording a handoff and starting a new session." } else { "Session has been active for $([math]::Round($elapsedHours, 1))h (>=${threshold}h). Consider a fresh session." }
+                $message = "Session has been active for $([math]::Round($elapsedHours, 1))h (>=${threshold}h). $carryoverGuidance"
                 [void]$warnings.Add($message)
                 $issued[$key] = $now.ToString('o')
             }
@@ -307,7 +467,7 @@ if ($null -ne $lastContextTokens -and $ContextWindowSize -gt 0) {
             if ([datetime]::TryParse([string]$issued[$key], [ref]$parsedLast)) { $lastIssued = $parsedLast }
         }
         if ($null -eq $lastIssued -or ($now - $lastIssued.ToUniversalTime()).TotalMinutes -ge 60) {
-            [void]$warnings.Add("Context usage is at ${usedPercentage}% ($lastContextTokens / $ContextWindowSize tokens). Consider /compact or starting a new session.")
+            [void]$warnings.Add("Context usage is at ${usedPercentage}% ($lastContextTokens / $ContextWindowSize tokens). Consider /compact. $carryoverGuidance")
             $issued[$key] = $now.ToString('o')
         }
         if ($isFirstThisSession) {
@@ -349,16 +509,31 @@ foreach ($k in $reportedHookErrors.Keys) {
     }
     $updatedReportedErrors[$k] = $sub
 }
+# Serialize turnIds with the current session last (most recently used) and keep
+# only the TurnMaxSessions most-recent sessions (A1 state schema).
+$updatedTurnIds = [ordered]@{}
+foreach ($k in $turnIdLists.Keys) {
+    if ($k -eq $sessionId) { continue }
+    $updatedTurnIds[$k] = @($turnIdLists[$k])
+}
+if ($turnIdLists.Contains($sessionId)) {
+    $updatedTurnIds[$sessionId] = @($turnIdLists[$sessionId])
+}
+while ($updatedTurnIds.Count -gt $TurnMaxSessions) {
+    $oldestTurnSession = @($updatedTurnIds.Keys)[0]
+    $updatedTurnIds.Remove($oldestTurnSession)
+}
 
 $stateObj = [ordered]@{
-    schemaVersion = 5;
+    schemaVersion = 6;
     hookSessions = $updatedHookSessions;
     issuedWarnings = $updatedIssued;
     toolReviewOccurrences = $toolReviewOccurrences;
     transcriptScanOffsets = $updatedScanOffsets;
-    reportedHookErrors = $updatedReportedErrors
+    reportedHookErrors = $updatedReportedErrors;
+    turnIds = $updatedTurnIds
 }
-$preservedKeys = @('schemaVersion', 'hookSessions', 'issuedWarnings', 'toolReviewOccurrences', 'transcriptScanOffsets', 'reportedHookErrors')
+$preservedKeys = @('schemaVersion', 'hookSessions', 'issuedWarnings', 'toolReviewOccurrences', 'transcriptScanOffsets', 'reportedHookErrors', 'turnIds')
 if ($state) {
     foreach ($prop in @($state.psobject.Properties)) {
         if ($prop.Name -notin $preservedKeys) {
@@ -375,7 +550,7 @@ if ($warnings.Count -gt 0) {
     $output = "=== Session Health Warning ==="
     foreach ($w in $warnings) { $output += "`n$w" }
     # Context-only warnings were silently absorbed by the model; make it relay them.
-    $output += "`nRelay these warnings to the user at the top of your reply. If a packet just finished, record its Task Handoff Summary and recommend starting a new session for the next packet."
+    $output += "`nRelay these warnings to the user at the top of your reply. For a packetless session use the session-carryover skill to record a carry-over file and recommend starting a new session; do not substitute the remember plugin or auto-memory."
     Write-Output $output
 }
 

@@ -468,11 +468,13 @@ function Get-StageRuntimeIdentity {
     }
     return [pscustomobject]@{ Owner = $RouterOwner; Model = if ($LeaseModel) { $LeaseModel } else { '-' } }
 }
-# .agents/briefs/backlog.md 파서. 이 저장소에 한정된 로컬 파일이라 멀티 프로젝트 순회 불필요.
-# 800ac06(2026-09-09) 재설계로 표가 둘로 나뉘었고 컬럼도 서로 다르다 — '## 미해결' 표(5열:
-# ID/내용/우선순위/최초 발견/관찰 조건)만 읽는다. '## 해결·승격 완료' 표(4열)는 이미 종결된
-# 항목이라 대시보드에 노출할 필요가 없고, 표 자체가 곧 open/closed 판정이라(미해결 표에 있으면
-# open) 예전처럼 상태 문구를 정규식으로 추측할 필요도 없다.
+# .agents/briefs/backlog.md 파서. 프로젝트마다 backlog.md를 가질 수 있어 Get-TaskStatuses가 각 프로젝트를
+# 순회하며 이 함수를 부른다. 두 가지 표 형식을 읽는다(ID는 `<접두사>-BL-NNN`, 접두사는 저장소마다 다르다).
+# (1) 하네스 형식 — 800ac06(2026-09-09) 재설계로 표가 셋으로 나뉘었고 컬럼도 서로 다르다. '## 미해결' 표(5열:
+#     ID/내용/우선순위/최초 발견/관찰 조건)만 읽는다. '해결·승격 완료' 표는 이미 종결된 항목이라 노출할
+#     필요가 없고, 표 자체가 곧 open/closed 판정이라(미해결 표에 있으면 open) 상태 문구를 추측하지 않는다.
+# (2) 상태 열 형식 — 첫 '## ' 헤딩 앞의 단일 표(5열: ID/항목/등록일/상태/근거). 상태 칸이 OPEN으로
+#     시작하는 행만 미해결로 본다('→ ai0076'·'DONE (날짜)'는 종결/승격). 우선순위 칸이 없어 '-'로 채운다.
 function Get-BacklogTasks {
     param([string]$ProjectPath)
     if ([string]::IsNullOrWhiteSpace($ProjectPath)) { return @() }
@@ -480,11 +482,24 @@ function Get-BacklogTasks {
     if (-not (Test-Path -LiteralPath $path)) { return @() }
     $items = @()
     $inOpenSection = $false
+    $inPreamble = $true
     foreach ($line in @(Get-Content -LiteralPath $path -Encoding UTF8)) {
-        if ($line -match '^##\s') { $inOpenSection = ($line -match '미해결'); continue }
-        if (-not $inOpenSection) { continue }
-        if ($line -notmatch '^\|\s*(CFG-BL-\d+)\s*\|') { continue }
+        if ($line -match '^##\s') { $inPreamble = $false; $inOpenSection = ($line -match '미해결'); continue }
+        if (-not ($inOpenSection -or $inPreamble)) { continue }
+        if ($line -notmatch '^\|\s*([A-Za-z][A-Za-z0-9]*-BL-\d+)\s*\|') { continue }
         $parts = $line.Trim() -split '\|'
+        if ($inPreamble) {
+            # [0]/[-1]은 선두/말미 빈 셀. 5열이면 [1..5] = ID/항목/등록일/상태/근거.
+            if ($parts.Count -ne 7 -or $parts[4].Trim() -notmatch '^OPEN\b') { continue }
+            $items += [pscustomobject]@{
+                Id = $parts[1].Trim()
+                Content = $parts[2].Trim()
+                Priority = '-'
+                FirstFound = $parts[3].Trim()
+                ObserveCondition = $parts[5].Trim()
+            }
+            continue
+        }
         # [0]/[-1]은 선두/말미 빈 셀. 끝 4셀이 [우선순위, 최초발견, 관찰 조건, 빈]이다.
         # 내용 셀에 '|'가 섞인 행에 대비해 끝에서 5번째부터 두번째 셀까지 전부 내용으로 합친다.
         if ($parts.Count -lt 7) { continue }
@@ -755,15 +770,14 @@ function Get-RawTaskStates {
     }
     $backlogItems = @()
     if ($ShowAll) {
-        $backlogHost = $null
+        # 프로젝트마다 자기 backlog.md를 가진다 — 첫 하나만 읽으면 나머지 프로젝트의 백로그가 대시보드에서 사라진다.
+        $backlogHosts = @()
         foreach ($p in @(Get-HarnessProjects)) {
-            if (Test-Path -LiteralPath (Join-Path $p '.agents\briefs\backlog.md')) { $backlogHost = $p; break }
+            if (Test-Path -LiteralPath (Join-Path $p '.agents\briefs\backlog.md')) { $backlogHosts += $p }
         }
-        if (-not $backlogHost) {
-            if (Test-Path -LiteralPath (Join-Path $root '.agents\briefs\backlog.md')) { $backlogHost = $root }
-        }
-        if ($backlogHost) {
-            # Get-BacklogTasks가 이미 '미해결' 표만 읽으므로(표 자체가 open 판정) 별도 필터 불필요.
+        if ($backlogHosts.Count -eq 0 -and (Test-Path -LiteralPath (Join-Path $root '.agents\briefs\backlog.md'))) { $backlogHosts += $root }
+        foreach ($backlogHost in $backlogHosts) {
+            # Get-BacklogTasks가 이미 미해결 항목만 읽으므로 별도 필터 불필요.
             foreach ($bl in @(Get-BacklogTasks -ProjectPath $backlogHost)) {
                 $backlogItems += [pscustomobject]@{
                     HostPath = $backlogHost
