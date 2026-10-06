@@ -325,6 +325,9 @@ function Get-FailureClass {
     if ($Outcome -in @('quota', 'billing', 'authentication', 'pollution', 'approval_required', 'config', 'rate_limited')) {
         return 'deterministic'
     }
+    # CFG097: 오염 복원(pollution_restored)은 결정론적 실패가 아니다 — 복원 후 재시도할 수 있어야
+    # 하므로 원장 상한 1회(영구 블록)가 아니라 3회(transient)로 분류한다.
+    if ($Outcome -eq 'pollution_restored') { return 'transient' }
     return 'transient'
 }
 
