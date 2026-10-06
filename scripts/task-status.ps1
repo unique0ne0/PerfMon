@@ -4,7 +4,7 @@
 #>
 param(
     [ValidateRange(1, 3600)]
-    [int]$IntervalSeconds = 5
+    [int]$IntervalSeconds = 10
 )
 # WinForms는 STA 스레드가 필요하다. 사용자가 -sta를 기억하지 않아도 되도록 재실행한다.
 if ($MyInvocation.InvocationName -ne '.' -and ($MyInvocation.Line -notmatch '^\s*\.\s' -or $MyInvocation.Line -eq $null)) {
@@ -65,6 +65,21 @@ function Get-HarnessProjects {
 # 엄격 조건을 그대로 옮긴다(단일 엔트리 + localOverride + 비어 있지 않은 기준 해시 + 정본/사본 존재 +
 # 해시 상이). 대시보드는 읽기 전용 모니터이므로 여기 어긋나게 전시하면 운영자가 어느 쪽을 봐도
 # 같은 결론을 못 낸다 — 세 곳이 항상 같은 판정을 공유해야 한다(CFG042 드리프트 행렬이 이를 강제).
+# SHA-256은 파일 수정시각·크기가 같으면 재계산하지 않는다. 동기화 요약은 자산 수 × 프로젝트 수 × 2회
+# (정본은 프로젝트마다 다시) 해시를 뜨므로 Get-FileHash 호출 자체가 갱신 시간의 대부분이었다.
+if (-not $script:FileParseCache) { $script:FileParseCache = @{} }
+function Get-CachedFileHash {
+    param([string]$Path)
+    $fileInfo = [System.IO.FileInfo]::new($Path)
+    if (-not $fileInfo.Exists) { throw "file not found: $Path" }
+    $hashStamp = "$($fileInfo.LastWriteTimeUtc.Ticks)|$($fileInfo.Length)"
+    $hashKey = "hash|$($fileInfo.FullName)"
+    $hashCached = $script:FileParseCache[$hashKey]
+    if ($hashCached -and $hashCached.Stamp -eq $hashStamp) { return $hashCached.Value }
+    $hashValue = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    $script:FileParseCache[$hashKey] = @{ Stamp = $hashStamp; Value = $hashValue }
+    return $hashValue
+}
 function Test-HarnessOverrideState {
     param([hashtable]$OverrideLookup, [string]$Target, [string]$Asset, [string]$Master)
     $key = "$([System.IO.Path]::GetFullPath($Target))|$Asset"
@@ -72,7 +87,7 @@ function Test-HarnessOverrideState {
     if ($entries.Count -ne 1 -or $entries[0].localOverride -ne $true -or [string]::IsNullOrWhiteSpace([string]$entries[0].lastSyncedHash)) { return $false }
     $copy = Join-Path $Target "scripts\$Asset"
     if (-not (Test-Path -LiteralPath $copy)) { return $false }
-    try { return (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne $Master }
+    try { return (Get-CachedFileHash -Path $copy) -ne $Master }
     catch { return $false }
 }
 $harnessIoModule = $null
@@ -115,11 +130,11 @@ function Get-HarnessSyncSummary {
             # 정상 상황이다. 예외를 삼키고 이번 틱은 건너뛴다 — 5초 뒤 다음 틱에서 락이 풀려 있으면
             # 정상 판정된다. 여기서 죽으면 WinForms Timer.Tick 핸들러까지 예외가 올라가 앱 전체가
             # 크래시한다(2026-09-08 실제 크래시 덤프로 확인: file in use → ActionPreferenceStopException).
-            try { $masterHash = (Get-FileHash -LiteralPath $master -Algorithm SHA256).Hash }
+            try { $masterHash = Get-CachedFileHash -Path $master }
             catch { continue }
             $copy = Join-Path $proj "scripts\$asset"
             if (-not (Test-Path -LiteralPath $copy)) { $drifts += "$proj|$asset (missing)"; continue }
-            try { $copyHash = (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash }
+            try { $copyHash = Get-CachedFileHash -Path $copy }
             catch { continue }
             if ($copyHash -eq $masterHash) { $checked++; continue }
             if (Test-HarnessOverrideState -OverrideLookup $overrideLookup -Target $proj -Asset $asset -Master $masterHash) {
@@ -160,10 +175,21 @@ function Split-NextStage {
     if ($stage -match '^(.*\S)\s*\(([^()]+)\)$') { $owner = $Matches[2].Trim(); $stage = $Matches[1].Trim() }
     return @{ Stage = $stage; Owner = $owner }
 }
+# 갱신마다 같은 파일을 다시 파싱하지 않도록 (경로 → 수정시각·크기 스탬프, 파싱 결과)를 둔다.
+# 스탬프가 같으면 내용도 같다고 보므로 오래된 값이 남지 않는다 — TTL 캐시가 아니다.
+if (-not $script:FileParseCache) { $script:FileParseCache = @{} }
+function Get-FileStamp {
+    param([System.IO.FileInfo]$File)
+    return "$($File.LastWriteTimeUtc.Ticks)|$($File.Length)"
+}
 function Get-RouterTasks {
     param([string]$ProjectPath)
     $routerPath = Join-Path $ProjectPath '.agents\briefs\handoff-log.md'
     if (-not (Test-Path $routerPath)) { return @() }
+    $routerStamp = Get-FileStamp -File (Get-Item -LiteralPath $routerPath)
+    $routerCacheKey = "router|$routerPath"
+    $routerCached = $script:FileParseCache[$routerCacheKey]
+    if ($routerCached -and $routerCached.Stamp -eq $routerStamp) { return $routerCached.Value }
     # 라우터 표는 프로젝트마다 방언이 다르다 — 제목이 '## Router'인 곳과 '## Packets'인 곳,
     # 담당을 별도 칸으로 둔 7컬럼과 '다음 단계(담당)'로 합친 6컬럼이 공존한다. 제목과 컬럼 위치를
     # 고정하면 방언 하나만 읽혀 나머지 프로젝트가 통째로 안 보인다(2026-08-09 AC-II AC007 미표시).
@@ -202,6 +228,7 @@ function Get-RouterTasks {
             UpdatedAt = $updated
         }
     }
+    $script:FileParseCache[$routerCacheKey] = @{ Stamp = $routerStamp; Value = $tasks }
     return $tasks
 }
 # 패킷의 Pipeline Status 섹션만 파싱해 단계별 체크 상태와 첫 미체크 단계를 돌려준다.
@@ -273,7 +300,15 @@ function Get-DispatchApprovals {
     $approvals = @()
     foreach ($recordFile in @(Get-ChildItem -Path $logDir -Filter '*-approval.json' -File -ErrorAction SilentlyContinue)) {
         try {
-            $record = Get-Content $recordFile.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            $recordStamp = Get-FileStamp -File $recordFile
+            $recordCacheKey = "json|$($recordFile.FullName)"
+            $recordCached = $script:FileParseCache[$recordCacheKey]
+            if ($recordCached -and $recordCached.Stamp -eq $recordStamp) {
+                $record = $recordCached.Value
+            } else {
+                $record = Get-Content $recordFile.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+                $script:FileParseCache[$recordCacheKey] = @{ Stamp = $recordStamp; Value = $record }
+            }
         } catch { continue }
         if ($null -eq $record -or $record.status -ne 'pending' -or -not $record.approval_required) { continue }
         $created = [string]$record.timestamp
@@ -300,6 +335,16 @@ function Get-DispatchApprovals {
 # 상대경로로 받아 명령줄에 프로젝트 경로가 남지 않는다. 작업 ID는 라우터마다 고유 프리픽스를
 # 쓰는 것이 규칙(agent-handoff-protocol)이라 ID만으로 사실상 유일하므로 ID로 매칭한다.
 function Get-ChainDispatchers {
+    # WMI 프로세스 조회는 한 번에 ~0.4초라 갱신 주기를 지배한다. 명령줄은 프로세스 생애 동안 변하지
+    # 않으므로, powershell/pwsh 프로세스 집합(PID+시작시각)이 지난번과 같으면 지난 결과를 그대로 쓴다.
+    # 새 디스패처는 새 PID이므로 집합이 바뀌어 즉시 감지된다 — TTL 캐시와 달리 지연이 없다.
+    $psKey = (@(Get-Process -Name powershell, pwsh -ErrorAction SilentlyContinue | ForEach-Object {
+        $started = try { $_.StartTime.Ticks } catch { 0 }
+        "$($_.Id):$started"
+    }) | Sort-Object) -join ','
+    if ($script:ChainDispatcherCache -and $script:ChainDispatcherCache.Key -eq $psKey) {
+        return $script:ChainDispatcherCache.Value
+    }
     $dispatchers = @{}
     $processes = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue)
     foreach ($process in $processes) {
@@ -313,6 +358,7 @@ function Get-ChainDispatchers {
             StartedAt = $process.CreationDate
         }
     }
+    $script:ChainDispatcherCache = @{ Key = $psKey; Value = $dispatchers }
     return $dispatchers
 }
 function Format-Elapsed {
@@ -1188,6 +1234,19 @@ function Update-LongestSessionInfo {
         $Grid.Visible = $false
     }
 }
+# 디스크·프로세스 스캔을 모두 모은다. UI 컨트롤을 건드리지 않으므로 별도 runspace(백그라운드 스레드)에서
+# 돌려도 안전하다 — 화면 스레드는 결과를 그리기만 한다(Update-Dashboard).
+function Get-DashboardData {
+    param([switch]$ShowAll)
+    $projects = @(Get-HarnessProjects)
+    [pscustomobject]@{
+        ShowAll   = [bool]$ShowAll
+        Harness   = Get-HarnessSyncSummary
+        Health    = Get-DefenseHealthSummary -Projects $projects
+        Rows      = @(Get-TaskStatuses -ShowAll:$ShowAll)
+        Approvals = @($projects | ForEach-Object { Get-DispatchApprovals -ProjectPath $_ })
+    }
+}
 function Update-Dashboard {
     param(
         [System.Windows.Forms.DataGridView]$Grid,
@@ -1199,14 +1258,14 @@ function Update-Dashboard {
         [System.Windows.Forms.Label]$HarnessBadge = $null,
         [System.Windows.Forms.DataGridView]$SessionGrid = $null,
         [System.Windows.Forms.ToolTip]$ToolTip = $null,
-        [switch]$ShowAll
+        [Parameter(Mandatory)]$Data
     )
-    $harnessProjects = @(Get-HarnessProjects)
+    $ShowAll = [bool]$Data.ShowAll
     if ($HarnessBadge) {
         # CFG042: 하네스 배포 동기화를 한 번에 보여준다. 드리프트가 있으면 Push가 필요하다는
         # 뜻이므로 가장 강하게, 유효 오버라이드만 있으면 기록된 로컬 예외이므로 그 다음 강도로,
         # 전부 정본과 같으면 동기화 완료로 표시한다. 세부 항목은 툴팁에 담는다.
-        $summary = Get-HarnessSyncSummary
+        $summary = $Data.Harness
         if ($summary.Drifts.Count -gt 0) {
             $HarnessBadge.Text = "🔗 하네스: 드리프트 $($summary.Drifts.Count) · 오버라이드 $($summary.Overrides.Count)"
             $HarnessBadge.ForeColor = [System.Drawing.Color]::Crimson
@@ -1234,7 +1293,7 @@ function Update-Dashboard {
         }
     }
     if ($TierBadge -or $SessionBadge -or $ApprovalBadge) {
-        $health = Get-DefenseHealthSummary -Projects $harnessProjects
+        $health = $Data.Health
         if ($TierBadge) {
             $TierBadge.Text = $health.TierText
             if ($ToolTip) { $ToolTip.SetToolTip($TierBadge, $health.TierToolTip) }
@@ -1249,10 +1308,10 @@ function Update-Dashboard {
     }
     # 디스크 스캔은 매번 수행하지만, 화면 데이터가 같으면 Rows.Clear()를 하지 않는다.
     # DataGridView의 전체 재생성은 행이 적어도 눈에 띄는 깜빡임을 유발한다.
-    $rows = @(Get-TaskStatuses -ShowAll:$ShowAll)
+    $rows = @($Data.Rows)
     if ($ApprovalBadge) {
         $runningCount = @($rows | Where-Object { $_.Status -eq 'RUNNING' }).Count
-        $pendingApprovals = @($harnessProjects | ForEach-Object { Get-DispatchApprovals -ProjectPath $_ })
+        $pendingApprovals = @($Data.Approvals)
         $approvalCount = $pendingApprovals.Count
         $failedCount = @($rows | Where-Object { $_.Status -eq 'FAILED' }).Count
         $ApprovalBadge.Text = "▶ 실행중: $runningCount · ⏳ 승인대기: $approvalCount · ✖ 실패: $failedCount"
@@ -1498,25 +1557,20 @@ $legendLabel.ForeColor = [System.Drawing.Color]::DimGray
 $radioActive.Add_CheckedChanged({
     if ($radioActive.Checked) {
         $script:showAllFilter = $false
-        Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -HarnessBadge $harnessBadge -SessionGrid $sessionGrid -ToolTip $toolTip
+        Request-DashboardRefresh -Queue
     }
 })
 $radioAll.Add_CheckedChanged({
     if ($radioAll.Checked) {
         $script:showAllFilter = $true
-        Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -HarnessBadge $harnessBadge -SessionGrid $sessionGrid -ToolTip $toolTip -ShowAll
+        Request-DashboardRefresh -Queue
     }
 })
 # 강제 새로고침 공통 핸들러 — 버튼 클릭과 F5 모두 이 경로를 탄다.
 $refreshAction = {
-    # 타이머가 Tick 사이에 수동 갱신을 여러 번 눌러도 불필요한 부하만 생긴다.
-    # 버튼을 즉시 비활성화하고 갱신이 끝난 뒤 풀어준다.
+    # 수집이 진행 중이면 끝난 직후 한 번 더 돌도록 예약만 하고, 버튼은 수집이 끝날 때까지 비활성화한다.
     $refreshButton.Enabled = $false
-    try {
-        Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -HarnessBadge $harnessBadge -SessionGrid $sessionGrid -ToolTip $toolTip -ShowAll:$script:showAllFilter
-    } finally {
-        $refreshButton.Enabled = $true
-    }
+    Request-DashboardRefresh -Queue
 }
 $refreshButton.Add_Click($refreshAction)
 $restartDashAction = {
@@ -1566,17 +1620,103 @@ $form.Controls.Add($sessionGrid)
 $form.Controls.Add($summaryPanel)
 $form.Controls.Add($controlPanel)
 $form.Controls.Add($statusStrip)
+# 디스크·프로세스 스캔(갱신 1회 ~1초)은 화면 스레드에서 돌리면 그동안 클릭·마우스 입력이 멈춘다.
+# 그래서 수집은 별도 runspace에서 하고, 화면 스레드는 끝난 결과를 그리기만 한다.
+# runspace는 한 번 만들어 재사용한다 — 파일 파싱 캐시(FileParseCache 등)가 갱신 사이에 유지된다.
+$script:dashRunspace = $null
+$script:dashPs = $null
+$script:dashHandle = $null
+$script:dashQueued = $false
+$script:dashLoaded = $false
+function Request-DashboardRefresh {
+    param([switch]$Queue)
+    if ($script:dashHandle) {
+        # 이미 수집 중이면 겹쳐 돌리지 않는다. 수동 요청만 끝난 직후 한 번 더 돌도록 예약한다.
+        if ($Queue) { $script:dashQueued = $true }
+        return
+    }
+    if (-not $script:dashRunspace) {
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.ApartmentState = [System.Threading.ApartmentState]::MTA
+        $rs.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+        $rs.Open()
+        $script:dashRunspace = $rs
+    }
+    $ps = [powershell]::Create()
+    $ps.Runspace = $script:dashRunspace
+    # 첫 수집에서만 이 스크립트를 dot-source해 함수를 올린다(dot-source 안전 — 본체 GUI는 실행되지 않는다).
+    # 한 스크립트 안에서 dot-source와 호출을 같이 한다. AddStatement로 나누거나 param/AddArgument를 쓰면
+    # runspace가 응답 없이 멈추는 것을 실측했다(2026-10-07) — 플래그는 리터럴로 박아 넣는다.
+    $callText = if ($script:showAllFilter) { 'Get-DashboardData -ShowAll:$true' } else { 'Get-DashboardData -ShowAll:$false' }
+    # 수집은 배경 작업이므로 다른 프로그램과 CPU를 다툴 때 양보한다(ReuseThread라 한 번 낮추면 유지된다).
+    $callText = '[System.Threading.Thread]::CurrentThread.Priority = ''BelowNormal''; ' + $callText
+    if (-not $script:dashLoaded) {
+        $callText = ". '{0}'; {1}" -f ($PSCommandPath -replace "'", "''"), $callText
+    }
+    [void]$ps.AddScript($callText)
+    $script:dashPs = $ps
+    $script:dashHandle = $ps.BeginInvoke()
+}
+function Complete-DashboardRefresh {
+    if (-not $script:dashHandle -or -not $script:dashHandle.IsCompleted) { return }
+    $ps = $script:dashPs
+    $handle = $script:dashHandle
+    $script:dashPs = $null
+    $script:dashHandle = $null
+    $data = $null
+    $errorText = $null
+    try {
+        $data = @($ps.EndInvoke($handle) | Where-Object { $_ -and $_.PSObject.Properties['Rows'] }) | Select-Object -Last 1
+        if (-not $data) {
+            $errorText = if ($ps.Streams.Error.Count -gt 0) { [string]$ps.Streams.Error[0] } else { '결과 없음' }
+        } else {
+            $script:dashLoaded = $true
+        }
+    } catch {
+        $errorText = $_.Exception.Message
+    } finally {
+        $ps.Dispose()
+    }
+    $refreshButton.Enabled = $true
+    if ($errorText) {
+        $updatedLabel.Text = '데이터 갱신 실패: ' + $errorText
+    } elseif ($data.ShowAll -ne $script:showAllFilter) {
+        # 수집 도중 필터가 바뀌었다 — 이 결과는 버리고 현재 필터로 다시 수집한다.
+        $script:dashQueued = $true
+    } else {
+        Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -HarnessBadge $harnessBadge -SessionGrid $sessionGrid -ToolTip $toolTip -Data $data
+    }
+    if ($script:dashQueued) {
+        $script:dashQueued = $false
+        Request-DashboardRefresh
+    }
+}
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = $IntervalSeconds * 1000
-$timer.Add_Tick({ Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -HarnessBadge $harnessBadge -SessionGrid $sessionGrid -ToolTip $toolTip -ShowAll:$script:showAllFilter })
+# 최소화된 창은 아무도 보지 않으므로 갱신하지 않는다. 복원되면 SizeChanged가 즉시 한 번 갱신한다.
+$timer.Add_Tick({ if ($form.WindowState -ne [System.Windows.Forms.FormWindowState]::Minimized) { Request-DashboardRefresh } })
+$script:dashLastWindowState = $form.WindowState
+$form.Add_SizeChanged({
+    $current = $form.WindowState
+    if ($script:dashLastWindowState -eq [System.Windows.Forms.FormWindowState]::Minimized -and $current -ne [System.Windows.Forms.FormWindowState]::Minimized) {
+        Request-DashboardRefresh -Queue
+    }
+    $script:dashLastWindowState = $current
+})
+$pollTimer = New-Object System.Windows.Forms.Timer
+$pollTimer.Interval = 200
+$pollTimer.Add_Tick({ Complete-DashboardRefresh })
 $clockTimer = New-Object System.Windows.Forms.Timer
 $clockTimer.Interval = 1000
 $clockTimer.Add_Tick({ $clockLabel.Text = '현재: ' + (Get-Date).ToString('HH:mm:ss KST') })
-Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -HarnessBadge $harnessBadge -SessionGrid $sessionGrid -ToolTip $toolTip -ShowAll
+$updatedLabel.Text = '데이터 수집 중...'
 $clockLabel.Text = '현재: ' + (Get-Date).ToString('HH:mm:ss KST')
 $timer.Start()
+$pollTimer.Start()
 $clockTimer.Start()
+Request-DashboardRefresh
 [void]$form.ShowDialog()
 $timer.Stop()
+$pollTimer.Stop()
 $clockTimer.Stop()
 }

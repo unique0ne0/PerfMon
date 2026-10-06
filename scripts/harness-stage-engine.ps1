@@ -193,19 +193,111 @@ function Test-StageArtifactFreshlyWritten {
     return $false
 }
 
+# CFG099(CFG-BL-093): 시도 로그·보고서 문자열을 엄격 UTF-8로 정제하는 공통 헬퍼.
+#  - 바이트 입력: 엄격 UTF-8 디코드 → 실패하면 끝부분 불완전 시퀀스를 최대 3바이트 잘라 재시도 →
+#    그래도 실패하면 CP949로 디코드해 한글을 살린다(CP949는 원본 바이트 전체를 쓴다 — 꼬리를 자르면
+#    마지막 한글 음절이 손상되므로 잘라낸 바이트로는 폴백하지 않는다).
+#  - 문자열 입력: 이미 디코드된 값이므로 U+FFFD만 '?'로 치환한다.
+#  - 마지막으로 남은 U+FFFD(엄격 UTF-8을 통과한 리터럴 EF BF BD 포함)를 '?'로 치환한다.
+#  - 끝부분 불완전 멀티바이트는 WARN 없이 제거한다(로그가 중간에 끊긴 경우).
+# 반환: @{ Text; Changed; Replacements; Source }. 디코드 예외는 던지지 않는다 — 보고서 생성 실패가
+#       스테이지를 막지 않는 성질을 유지한다(호출자가 try/catch로 한 번 더 감싼다).
+function ConvertTo-CleanUtf8Text {
+    [CmdletBinding(DefaultParameterSetName = 'Bytes')]
+    param(
+        [Parameter(Mandatory = $true, ParameterSetName = 'Bytes', Position = 0)]
+        [AllowEmptyCollection()][byte[]]$Bytes,
+        [Parameter(Mandatory = $true, ParameterSetName = 'Text', Position = 0)]
+        [AllowEmptyString()][string]$Text
+    )
+
+    $source = 'utf8'
+    $trimmed = $false
+    $decoded = $null
+    if ($PSCmdlet.ParameterSetName -eq 'Bytes') {
+        $work = $Bytes
+        if ($null -eq $work) { $work = New-Object byte[] 0 }
+        $strict = New-Object System.Text.UTF8Encoding($false, $true)
+        if ($work.Length -eq 0) {
+            $decoded = ''
+        } else {
+            try {
+                $decoded = $strict.GetString($work)
+            } catch {
+                # 끝부분이 잘린 불완전 시퀀스(0~3바이트)일 수 있으므로 그만큼 잘라 재시도한다.
+                $trail = 0
+                $len0 = $work.Length
+                for ($k = 1; $k -le [Math]::Min(3, $len0); $k++) {
+                    $b = $work[$len0 - $k]
+                    if ($b -lt 0x80) { break }
+                    if ($b -ge 0xC0) {
+                        if ($b -ge 0xF0) { $need = 4 } elseif ($b -ge 0xE0) { $need = 3 } else { $need = 2 }
+                        if ($need -gt $k) { $trail = $k }
+                        break
+                    }
+                }
+                if ($trail -gt 0) {
+                    $remain = $len0 - $trail
+                    $sliced = if ($remain -le 0) { New-Object byte[] 0 } else { [byte[]]($work[0..($remain - 1)]) }
+                    try {
+                        $decoded = $strict.GetString($sliced)
+                        $trimmed = $true
+                    } catch {
+                        $decoded = $null
+                    }
+                }
+                if ($null -eq $decoded) {
+                    # CP949 폴백: 콘솔이 CP949로 뱉은 한글을 되살린다.
+                    $decoded = [System.Text.Encoding]::GetEncoding(949).GetString($work)
+                    $source = 'cp949'
+                }
+            }
+        }
+    } else {
+        $decoded = $Text
+        if ($null -eq $decoded) { $decoded = '' }
+        $source = 'text'
+    }
+
+    $replacements = 0
+    foreach ($ch in $decoded.ToCharArray()) { if ($ch -eq [char]0xFFFD) { $replacements++ } }
+    $raw = if ($replacements -gt 0) { $decoded.Replace([char]0xFFFD, [char]0x3F) } else { $decoded }
+
+    return [pscustomobject]@{
+        Text = $raw
+        Changed = ($source -eq 'cp949' -or $replacements -gt 0 -or $trimmed)
+        Replacements = $replacements
+        Source = $source
+    }
+}
+
 # CFG091(CFG-BL-070): 어댑터 불문 ReportFile 생산을 위해 시도 로그에서 최종 응답 텍스트를 뽑는다.
 #  - antigravity(agy, stream-json): 마지막 result 이벤트의 result.response
 #  - claude(stream-json): 마지막 result 이벤트의 result
 #  - opencode·gemini(stdout=응답): 시도 로그 원문
 # 구조 포맷이 없는 어댑터는 로그 전체를 그대로 쓴다. 추출 실패 시 $null을 돌려주고 호출자가
 # ReportFile을 만들지 않는다(보고서는 부가 산출물이므로 스테이지를 막지 않는다).
+# CFG099(CFG-BL-093): 로그를 바이트로 읽어 엄격 UTF-8로 정제한 뒤 쓴다. CP949 콘솔 출력이 U+FFFD로
+# 굳어 보고서에 들어가 verify의 'Briefs encoding integrity'가 오탐 FAIL하던 문제를 막는다.
 function Get-AttemptFinalResponse {
     param([string]$Adapter, [string]$AttemptLogAbs)
     if ([string]::IsNullOrWhiteSpace($AttemptLogAbs) -or -not (Test-Path -LiteralPath $AttemptLogAbs)) { return $null }
+    $clean = $null
+    try {
+        $clean = ConvertTo-CleanUtf8Text -Bytes ([System.IO.File]::ReadAllBytes($AttemptLogAbs))
+    } catch {
+        Write-Log "⚠️ 시도 로그 읽기 실패($AttemptLogAbs): $($_.Exception.Message)" WARN
+        return $null
+    }
+    if ($clean.Source -eq 'cp949' -or $clean.Replacements -gt 0) {
+        Write-Log "[$Adapter] 시도 로그 인코딩 정제($($clean.Source), U+FFFD 치환 $($clean.Replacements)건): $AttemptLogAbs" WARN
+    }
     if ($Adapter -eq 'antigravity' -or $Adapter -eq 'claude') {
         # 구조 포맷(stream-json)이면 마지막 result 이벤트의 응답 필드를 뽑는다.
         # BOM 없는 로그는 -Encoding UTF8을 명시하지 않으면 PS 5.1이 ANSI로 읽어 한글이 깨진다.
-        $lines = @(Get-Content -LiteralPath $AttemptLogAbs -Encoding UTF8 -ErrorAction SilentlyContinue)
+        $text = $clean.Text
+        if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+        $lines = @($text -split "`r?`n")
         for ($i = $lines.Count - 1; $i -ge 0; $i--) {
             $line = $lines[$i]
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
@@ -228,7 +320,7 @@ function Get-AttemptFinalResponse {
         return $null
     }
     # opencode·gemini는 stdout 전체가 응답이다.
-    return (Get-Content -LiteralPath $AttemptLogAbs -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+    return $clean.Text
 }
 
 # CFG-BL-073: stream-json 어댑터가 최종 응답 이벤트 없이 끝났을 때(hang 후 정리 등) 쓰는 대체 보고서.
@@ -266,19 +358,41 @@ function New-StageReportFallback {
             $out.Add("verdict 파일을 요약하지 못했다(``$verdictRel``): $($_.Exception.Message)")
         }
     }
-    return ($out -join "`n")
+    # CFG099(CFG-BL-093): verdict 요약에 섞인 U+FFFD도 보고서로 나가기 전에 정제한다.
+    return (ConvertTo-CleanUtf8Text -Text ($out -join "`n")).Text
 }
 
 # CFG091(CFG-BL-070): 시도 종료 후 어댑터 불문 $Config.ReportFile을 생성한다. codex는 argv의
 # `-o $ReportFile`이 이미 최종 응답을 쓰므로 하네스가 덮어쓰지 않는다. 그 외 어댑터는 시도 로그에서
 # 최종 응답을 추출해 ReportFile에 쓴다. 어떤 실패도 스테이지를 막지 않는다(보고서는 부가 산출물).
+# CFG099(CFG-BL-093): 쓰기 직전 문자열에서 U+FFFD를 한 번 더 제거한다. codex `-o` 보고서는 하네스가
+# 쓰지 않으므로, 시도 종료 후 파일 바이트를 재검사해 정제가 필요할 때만 제자리에서 다시 쓴다.
 function Write-StageReportFromAttempt {
     param([string]$Stage, [hashtable]$Config, [string]$AttemptLog)
     if ($null -eq $Config -or -not $Config.ContainsKey('ReportFile')) { return }
     $reportRel = [string]$Config.ReportFile
     if ([string]::IsNullOrWhiteSpace($reportRel)) { return }
     $adapter = if ($Config.ContainsKey('Adapter')) { [string]$Config.Adapter } else { '' }
-    if ($adapter -eq 'codex') { return }
+    $reportAbs = Resolve-RepoPath $reportRel
+    if ($adapter -eq 'codex') {
+        # codex는 argv `-o`가 보고서를 쓰므로 하네스가 내용을 대체하지 않는다. 다만 콘솔 출력이
+        # CP949로 깨져 U+FFFD가 섞였을 수 있으니 바이트를 재검사해 정제가 필요할 때만 다시 쓴다
+        # (깨끗하면 바이트 무변경 — 기존 계약 보존).
+        if (Test-Path -LiteralPath $reportAbs) {
+            try {
+                $clean = ConvertTo-CleanUtf8Text -Bytes ([System.IO.File]::ReadAllBytes($reportAbs))
+                if ($clean.Changed) {
+                    [System.IO.File]::WriteAllText($reportAbs, $clean.Text, (New-Object System.Text.UTF8Encoding($false)))
+                    if ($clean.Source -eq 'cp949' -or $clean.Replacements -gt 0) {
+                        Write-Log "[$Stage] codex ReportFile 인코딩 정제($($clean.Source), U+FFFD 치환 $($clean.Replacements)건) — $reportRel" WARN
+                    }
+                }
+            } catch {
+                Write-Log "⚠️ [$Stage] codex ReportFile 정제 실패($reportRel): $($_.Exception.Message)" WARN
+            }
+        }
+        return
+    }
     $attemptAbs = Resolve-RepoPath $AttemptLog
     $response = Get-AttemptFinalResponse -Adapter $adapter -AttemptLogAbs $attemptAbs
     if ([string]::IsNullOrWhiteSpace($response) -and $adapter -in @('antigravity', 'claude') -and (Test-Path -LiteralPath $attemptAbs)) {
@@ -289,9 +403,12 @@ function Write-StageReportFromAttempt {
         Write-Log "⚠️ [$Stage] 시도 로그에서 최종 응답을 추출하지 못했습니다($AttemptLog) — ReportFile을 생성하지 않습니다" WARN
         return
     }
-    $reportAbs = Resolve-RepoPath $reportRel
     try {
-        [System.IO.File]::WriteAllText($reportAbs, $response, (New-Object System.Text.UTF8Encoding($false)))
+        $writeClean = ConvertTo-CleanUtf8Text -Text $response
+        if ($writeClean.Source -eq 'cp949' -or $writeClean.Replacements -gt 0) {
+            Write-Log "[$Stage] ReportFile 인코딩 정제($($writeClean.Source), U+FFFD 치환 $($writeClean.Replacements)건) — $reportRel" WARN
+        }
+        [System.IO.File]::WriteAllText($reportAbs, $writeClean.Text, (New-Object System.Text.UTF8Encoding($false)))
         Write-Log "[$Stage] ReportFile 생성($adapter 어댑터 → $reportRel)" INFO
     } catch {
         Write-Log "⚠️ [$Stage] ReportFile 쓰기 실패($reportRel): $($_.Exception.Message)" WARN
