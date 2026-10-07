@@ -76,7 +76,7 @@ try {
 
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('=== Session Carry-over ===')
-    [void]$sb.AppendLine('아래는 이 프로젝트의 미소비 인계 파일이다. 미해결 항목을 한 줄씩 확인하고, 사용자 재확인 없이 결정을 번복하지 않는다. 확인 후 각 파일을 .agents/briefs/session-carryover-consumed/ 로 옮기고, 남은 미결 항목은 새 인계 파일로 승계한다. remember 플러그인·auto-memory로 대체하지 않는다.')
+    [void]$sb.AppendLine('아래는 이 프로젝트의 미소비 인계 파일이다. 미해결 항목을 한 줄씩 확인하고, 사용자 재확인 없이 결정을 번복하지 않는다. 시작 시에는 파일을 옮기지 않는다. 세션 종료 시 그 시점의 미소비 파일 전부를 항목 ID 기준으로 병합(해결 기록 우선, 원문 승계)해 새 인계 파일을 쓴 뒤 병합한 원본만 .agents/briefs/session-carryover-consumed/ 로 옮긴다(session-carryover 스킬). remember 플러그인·auto-memory로 대체하지 않는다.')
     [void]$sb.AppendLine('')
 
     # Keep a bounded reserve for the truncation notice, omitted-file paths, and
