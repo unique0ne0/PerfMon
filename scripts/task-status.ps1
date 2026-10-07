@@ -633,14 +633,27 @@ function Get-RawTaskStates {
         $blockedMarkers = @{}
         $approvals = @()
         $scanStages = if ($stages -and $stages.Count -gt 0) { $stages } else { @('impl', 'qa', 'integration') }
+        # 프로젝트당 .dispatch-* 파일 이름을 한 번만 열거하고, 해당 단계 파일이 있을 때만 읽기 함수를 부른다.
+        # (단계 3개 × 락·실패·차단 9회의 개별 디렉터리 조회를 1회로 줄인다 — 읽기 결과는 동일하다.)
+        $dispatchLogDir = Join-Path $projectPath '.agents\briefs\logs'
+        $dispatchNames = @()
+        if (Test-Path -LiteralPath $dispatchLogDir) {
+            $dispatchNames = @(Get-ChildItem -LiteralPath $dispatchLogDir -Filter '.dispatch-*' -Force -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+        }
         foreach ($stage in $scanStages) {
-            $lock = Get-DispatchLock -ProjectPath $projectPath -Stage $stage
-            if ($lock) { $locks[$lock.TaskId] = $lock }
-            foreach ($failure in @(Get-DispatchFailures -ProjectPath $projectPath -Stage $stage)) {
-                if ($failure) { $failures[$failure.TaskId] = $failure }
+            if ($dispatchNames -contains ".dispatch-lock-$stage") {
+                $lock = Get-DispatchLock -ProjectPath $projectPath -Stage $stage
+                if ($lock) { $locks[$lock.TaskId] = $lock }
             }
-            foreach ($blocked in @(Get-DispatchBlocked -ProjectPath $projectPath -Stage $stage)) {
-                if ($blocked) { $blockedMarkers[$blocked.TaskId] = $blocked }
+            if (@($dispatchNames | Where-Object { $_ -like ".dispatch-failed-*$stage" }).Count -gt 0) {
+                foreach ($failure in @(Get-DispatchFailures -ProjectPath $projectPath -Stage $stage)) {
+                    if ($failure) { $failures[$failure.TaskId] = $failure }
+                }
+            }
+            if (@($dispatchNames | Where-Object { $_ -like ".dispatch-blocked-*-$stage" }).Count -gt 0) {
+                foreach ($blocked in @(Get-DispatchBlocked -ProjectPath $projectPath -Stage $stage)) {
+                    if ($blocked) { $blockedMarkers[$blocked.TaskId] = $blocked }
+                }
             }
         }
         $approvals = @(Get-DispatchApprovals -ProjectPath $projectPath)
@@ -1685,6 +1698,11 @@ function Complete-DashboardRefresh {
         $script:dashQueued = $true
     } else {
         Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -HarnessBadge $harnessBadge -SessionGrid $sessionGrid -ToolTip $toolTip -Data $data
+        # 진행 중인 작업이 없으면 갱신 주기를 늘린다(최소 30초). 새 디스패치는 늦어도 한 주기 안에 보이고,
+        # 즉시 확인이 필요하면 F5가 있다. 진행 중 작업이 생기면 다음 갱신부터 원래 주기로 돌아온다.
+        $liveStatuses = @('RUNNING', 'HANG', 'STANDBY', 'STALLED', 'RESUME', 'BLOCKED')
+        $hasLive = @($data.Rows | Where-Object { $liveStatuses -contains $_.Status }).Count -gt 0
+        $timer.Interval = $(if ($hasLive) { $IntervalSeconds } else { [math]::Max($IntervalSeconds * 3, 30) }) * 1000
     }
     if ($script:dashQueued) {
         $script:dashQueued = $false
@@ -1694,7 +1712,16 @@ function Complete-DashboardRefresh {
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = $IntervalSeconds * 1000
 # 최소화된 창은 아무도 보지 않으므로 갱신하지 않는다. 복원되면 SizeChanged가 즉시 한 번 갱신한다.
-$timer.Add_Tick({ if ($form.WindowState -ne [System.Windows.Forms.FormWindowState]::Minimized) { Request-DashboardRefresh } })
+# 최소화되었거나 DWM이 숨김(cloaked: 다른 가상 데스크톱 등)으로 표시한 창은 보는 사람이 없다.
+# 다른 창에 단순히 가려진 경우는 공개 API로 판정할 수 없어 갱신을 유지한다.
+Add-Type -Namespace DashWin32 -Name Dwm -MemberDefinition '[System.Runtime.InteropServices.DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(System.IntPtr hwnd, int attr, out int value, int size);'
+function Test-DashboardHidden {
+    if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) { return $true }
+    $cloaked = 0
+    try { [void][DashWin32.Dwm]::DwmGetWindowAttribute($form.Handle, 14, [ref]$cloaked, 4) } catch { return $false }
+    return ($cloaked -ne 0)
+}
+$timer.Add_Tick({ if (-not (Test-DashboardHidden)) { Request-DashboardRefresh } })
 $script:dashLastWindowState = $form.WindowState
 $form.Add_SizeChanged({
     $current = $form.WindowState
