@@ -97,6 +97,59 @@ if ([string]::IsNullOrWhiteSpace($harnessIoModule) -or -not (Test-Path -LiteralP
 }
 if (-not (Test-Path -LiteralPath $harnessIoModule)) { throw "Required harness I/O module not found: $harnessIoModule" }
 . $harnessIoModule
+# ── CFG100(B): 정본 HEAD 기준 비교용 헬퍼 ────────────────────────────────────
+# 정본 작업 트리에 미커밋 하네스 변경이 있어도 "하류 사본이 정본 HEAD와 같은가"로 판정해
+# "정본 편집 중(미커밋)"을 진짜 드리프트로 오인하지 않는다(CFG-BL-081 (a)). 줄바꿈·BOM을
+# 정규화해 비교한다(WorldSaju 67d7277 선례). 순수 함수라 회귀 테스트가 AST로 직접 부른다.
+function Get-HarnessNormalizedText {
+    param([string]$Text)
+    if ($null -eq $Text) { return $null }
+    $t = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+    if ($t.Length -gt 0 -and $t[0] -eq [char]0xFEFF) { $t = $t.Substring(1) }
+    $list = New-Object System.Collections.ArrayList
+    foreach ($ln in @($t -split "`n")) { [void]$list.Add($ln) }
+    while ($list.Count -gt 0 -and $list[$list.Count - 1] -eq '') { $list.RemoveAt($list.Count - 1) }
+    return ([string]::Join("`n", $list.ToArray()))
+}
+function Get-HarnessContentHash {
+    param([string]$Text)
+    if ($null -eq $Text) { return $null }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text))
+        return ([System.BitConverter]::ToString($bytes)).Replace('-', '').ToUpperInvariant()
+    } finally { $sha.Dispose() }
+}
+function Get-HarnessNormalizedFileHash {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    return (Get-HarnessContentHash -Text (Get-HarnessNormalizedText -Text $text))
+}
+function Get-HarnessHeadBlobHash {
+    param([string]$ConfigRoot, [string]$Asset)
+    try {
+        $text = (& git -C $ConfigRoot show ("HEAD:global/harness/" + $Asset) 2>$null) -join "`n"
+        if ($LASTEXITCODE -ne 0) { return $null }
+    } catch { return $null }
+    return (Get-HarnessContentHash -Text (Get-HarnessNormalizedText -Text $text))
+}
+# 정본 작업 트리에서 미커밋인 하네스 자산 이름 집합을 돌려준다(수정·추가·삭제 포함).
+# git 이 없거나 저장소가 아니면 빈 집합 — 그럼 호출자는 기존 작업 트리 기준으로 판정한다.
+function Get-HarnessDirtyAssets {
+    param([string]$ConfigRoot)
+    $dirty = @{}
+    if (-not (Test-Path (Join-Path $ConfigRoot '.git'))) { return $dirty }
+    try {
+        foreach ($line in @(& git -C $ConfigRoot status --porcelain -- global/harness/ 2>$null)) {
+            if ([string]::IsNullOrWhiteSpace($line) -or $line.Length -lt 4) { continue }
+            $p = $line.Substring(3).Trim().Trim('"') -replace '\\', '/'
+            if ($p -match '^global/harness/(.+)$') { $dirty[$Matches[1]] = $true }
+        }
+    } catch { }
+    return $dirty
+}
+
 # ── CFG042: 하네스 배포 동기화 요약 — 오버라이드(추적 가능한 로컬 예외)와 드리프트 분리 ──
 function Get-HarnessSyncSummary {
     $masterDir = Join-Path $root 'global\harness'
@@ -108,7 +161,7 @@ function Get-HarnessSyncSummary {
         $manifestPath = Join-Path $PSScriptRoot 'harness-assets.txt'
     }
     try { $assets = @(Read-HarnessAssets -ManifestPath $manifestPath) }
-    catch { return [pscustomobject]@{ MasterChecks = 0; Overrides = @(); Drifts = @("manifest ($($_.Exception.Message))"); Projects = @() } }
+    catch { return [pscustomobject]@{ MasterChecks = 0; Overrides = @(); Drifts = @("manifest ($($_.Exception.Message))"); Projects = @(); CanonicalEditing = @() } }
     $harnessProjects = @(Get-HarnessProjects)
     $overrideLookup = @{}
     $statePath = Join-Path $root '.agents\briefs\.harness-sync-state.json'
@@ -122,20 +175,32 @@ function Get-HarnessSyncSummary {
             }
         } catch { $overrideLookup = @{} }
     }
+    # CFG100: 정본이 편집 중인 자산은 HEAD blob 을 기준으로 비교하고 "정본 편집 중"으로 분류한다.
+    $dirtyAssets = Get-HarnessDirtyAssets -ConfigRoot $root
+    $canonicalEditing = @($assets | Where-Object { $dirtyAssets.ContainsKey($_) })
     $overrides = @(); $drifts = @(); $checked = 0
     foreach ($proj in $harnessProjects) {
         foreach ($asset in $assets) {
-            $master = Join-Path $masterDir $asset
-            # 대시보드는 읽기 전용 모니터라 활성 git/디스패치가 이 파일을 쥐고 있는 순간과 겹치는 건
-            # 정상 상황이다. 예외를 삼키고 이번 틱은 건너뛴다 — 5초 뒤 다음 틱에서 락이 풀려 있으면
-            # 정상 판정된다. 여기서 죽으면 WinForms Timer.Tick 핸들러까지 예외가 올라가 앱 전체가
-            # 크래시한다(2026-09-08 실제 크래시 덤프로 확인: file in use → ActionPreferenceStopException).
-            try { $masterHash = Get-CachedFileHash -Path $master }
-            catch { continue }
+            $isDirty = $dirtyAssets.ContainsKey($asset)
+            if ($isDirty) {
+                # 정본 HEAD 에 없는 새 자산이면 하류와 비교할 기준이 없다 — 편집 중으로만 분류한다.
+                $masterHash = Get-HarnessHeadBlobHash -ConfigRoot $root -Asset $asset
+                if (-not $masterHash) { continue }
+            } else {
+                $master = Join-Path $masterDir $asset
+                # 대시보드는 읽기 전용 모니터라 활성 git/디스패치가 이 파일을 쥐고 있는 순간과 겹치는 건
+                # 정상 상황이다. 예외를 삼키고 이번 틱은 건너뛴다 — 5초 뒤 다음 틱에서 락이 풀려 있으면
+                # 정상 판정된다. 여기서 죽으면 WinForms Timer.Tick 핸들러까지 예외가 올라가 앱 전체가
+                # 크래시한다(2026-09-08 실제 크래시 덤프로 확인: file in use → ActionPreferenceStopException).
+                try { $masterHash = Get-CachedFileHash -Path $master }
+                catch { continue }
+            }
             $copy = Join-Path $proj "scripts\$asset"
             if (-not (Test-Path -LiteralPath $copy)) { $drifts += "$proj|$asset (missing)"; continue }
-            try { $copyHash = Get-CachedFileHash -Path $copy }
-            catch { continue }
+            try {
+                if ($isDirty) { $copyHash = Get-HarnessNormalizedFileHash -Path $copy }
+                else { $copyHash = Get-CachedFileHash -Path $copy }
+            } catch { continue }
             if ($copyHash -eq $masterHash) { $checked++; continue }
             if (Test-HarnessOverrideState -OverrideLookup $overrideLookup -Target $proj -Asset $asset -Master $masterHash) {
                 $overrides += "$proj|$asset"
@@ -144,7 +209,7 @@ function Get-HarnessSyncSummary {
             }
         }
     }
-    return [pscustomobject]@{ MasterChecks = $checked; Overrides = @($overrides); Drifts = @($drifts); Projects = @($harnessProjects) }
+    return [pscustomobject]@{ MasterChecks = $checked; Overrides = @($overrides); Drifts = @($drifts); Projects = @($harnessProjects); CanonicalEditing = @($canonicalEditing) }
 }
 # 라우터 표의 헤더 행이면 컬럼 이름 → 인덱스 매핑을 돌려주고, 아니면 $null.
 # 작업 ID와 상태 두 칸이 모두 있어야 라우터 표로 인정한다 — 같은 파일 안의 다른 표

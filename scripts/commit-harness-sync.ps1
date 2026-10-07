@@ -12,6 +12,7 @@ commit-harness-sync.ps1 — sync-configs.ps1 -Push 로 배포된 하네스 사�
   - skipped-no-repo: 대상 저장소에 .git 이 없거나 디렉터리가 존재하지 않음
   - skipped-locked: 살아있는 디스패치 락이 감지됨
   - deferred-busy: sync-configs.ps1 -Push 가 실행 중 체인 때문에 이번 배포를 지연함(CFG089)
+  - skipped-git-inprogress: 대상이 git 작업 중(index.lock·rebase·merge)이거나 detached HEAD(CFG100)
   - nothing-to-commit: 하네스 자산에 변경 없음
   - skipped-unrelated-only: 무관한 파일만 변경됨
 
@@ -291,6 +292,27 @@ foreach ($proj in $targets) {
         continue
     }
 
+    # CFG100: 하류가 git 작업 중(index.lock·rebase·merge)이거나 detached HEAD 면 자동 커밋을
+    # 건너뛴다. pre-push 훅·수동 Push 가 남의 진행 중 작업에 끼어들어 커밋을 깨뜨리거나
+    # 좀비 index.lock 을 만들지 않게 한다(챌린지 Findings 7·11). 지연과 같이 비오류로 보고한다.
+    $gitInProgress = $null
+    if (Test-Path -LiteralPath (Join-Path $gitDir 'index.lock')) {
+        $gitInProgress = 'index.lock 존재(git 작업 중)'
+    } elseif ((Test-Path -LiteralPath (Join-Path $gitDir 'rebase-merge')) -or
+              (Test-Path -LiteralPath (Join-Path $gitDir 'rebase-apply')) -or
+              (Test-Path -LiteralPath (Join-Path $gitDir 'MERGE_HEAD'))) {
+        $gitInProgress = 'rebase/merge 진행 중'
+    } else {
+        Invoke-GitQuiet -ProjRoot $proj -GitArgs @('symbolic-ref', '-q', 'HEAD') | Out-Null
+        if ($LASTEXITCODE -ne 0) { $gitInProgress = 'detached HEAD' }
+    }
+    if ($gitInProgress) {
+        $entry.Status = 'skipped-git-inprogress'
+        $entry.Detail = "자동 커밋 제외: $gitInProgress — 정리 후 재실행"
+        $results += $entry
+        continue
+    }
+
     # 활성 락 검사
     $activeLock = Test-ActiveLock -ProjRoot $proj
     if ($null -ne $activeLock) {
@@ -411,6 +433,7 @@ foreach ($r in $results) {
         'skipped-no-repo'     { 'Yellow' }
         'skipped-locked'      { 'Yellow' }
         'deferred-busy'       { 'Yellow' }
+        'skipped-git-inprogress' { 'Yellow' }
         'skipped-unrelated-only' { 'Yellow' }
         'dry-run'             { 'Cyan' }
         'error'               { 'Red' }
