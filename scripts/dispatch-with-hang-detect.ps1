@@ -813,6 +813,11 @@ function Find-PacketByTaskId {
 
 
 
+# Measure-ContextBytes — 단계 착수 시 컨텍스트 크기를 [context-size] 로그로 남긴다.
+# 로그의 required_reading_max_bytes 값과 bytes=$totalBytes 총합은 모두 "Required Reading에
+# 적힌 백틱 경로 파일들의 전체 바이트 합"이다. 즉 Required Reading 합계는 파일 전체 바이트의
+# 상한이며 실소비량이 아니다(행 범위 표기를 읽지 않는다). 하네스는 파일 내용을 프롬프트에
+# 인라인하지 않으므로, 패킷에 L196~L299 같은 행 범위를 적어도 이 수치는 줄지 않는다.
 function Measure-ContextBytes {
     param([string]$Stage)
 
@@ -878,7 +883,7 @@ function Measure-ContextBytes {
         }
     }
     $parts['packet'] = $packetBytes; $totalBytes += $packetBytes
-    $parts['required_reading'] = $requiredReadingBytes; $totalBytes += $requiredReadingBytes
+    $parts['required_reading_max_bytes'] = $requiredReadingBytes; $totalBytes += $requiredReadingBytes
 
     # DefaultPrompt
     $promptBytes = 0
@@ -886,7 +891,7 @@ function Measure-ContextBytes {
     if ($p) { $promptBytes = [System.Text.Encoding]::UTF8.GetByteCount($p) }
     $parts['default_prompt'] = $promptBytes; $totalBytes += $promptBytes
 
-    Write-Log "[context-size] stage=$Stage bytes=$totalBytes (global_claude=$($parts.global_claude_md) project_claude=$($parts.project_claude_md) router=$($parts.router) packet=$($parts.packet) required_reading=$($parts.required_reading) prompt=$($parts.default_prompt))" INFO
+    Write-Log "[context-size] stage=$Stage bytes=$totalBytes (global_claude=$($parts.global_claude_md) project_claude=$($parts.project_claude_md) router=$($parts.router) packet=$($parts.packet) required_reading_max_bytes=$($parts.required_reading_max_bytes) prompt=$($parts.default_prompt))" INFO
 }
 
 
