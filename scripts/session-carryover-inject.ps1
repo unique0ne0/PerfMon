@@ -67,11 +67,23 @@ function Get-SessionStatePath {
     return Join-Path (Join-Path $LogsDir 'carryover-sessions') "$safeId.json"
 }
 
+# A repository could commit a symlink/junction at .agents\briefs\logs (gitignore
+# does not stop a committed link) and redirect these writes outside the project.
+# Refuse to write through any reparse point.
+function Assert-NotReparsePoint {
+    param([string]$Path)
+    if ((Test-Path -LiteralPath $Path) -and ((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "reparse point refused: $Path"
+    }
+}
+
 function Save-SessionState {
     param([string]$Path, [hashtable]$Seen, [datetime]$NowUtc)
     if (-not $Path) { return }
     $dir = Split-Path -Parent $Path
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Assert-NotReparsePoint $dir
+    Assert-NotReparsePoint $Path
     $body = @{ lastSeenUtc = $NowUtc.ToString('o'); seen = $Seen } | ConvertTo-Json -Depth 4
     $tmp = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
     [System.IO.File]::WriteAllText($tmp, $body, $utf8NoBom)
@@ -84,6 +96,7 @@ function Save-SessionState {
 function Add-ActivityDay {
     param([string]$LogsDir)
     $path = Join-Path $LogsDir 'carryover-activity.log'
+    Assert-NotReparsePoint $path
     $today = (Get-Date).ToString('yyyy-MM-dd')
     if (Test-Path -LiteralPath $path) {
         $known = @([System.IO.File]::ReadAllLines($path))
@@ -143,6 +156,7 @@ try {
     try {
         $logsDir = Join-Path $briefsDir 'logs'
         if (-not (Test-Path -LiteralPath $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
+        Assert-NotReparsePoint $logsDir
         Add-ActivityDay $logsDir
         if ($hookPayload -and $hookPayload.session_id) {
             $statePath = Get-SessionStatePath $logsDir ([string]$hookPayload.session_id)
