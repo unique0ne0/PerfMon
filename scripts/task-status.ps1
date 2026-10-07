@@ -150,6 +150,72 @@ function Get-HarnessDirtyAssets {
     return $dirty
 }
 
+# ── CFG102: 이력 blob·락·배지 분류 — CFG100 판정 기준(정본 HEAD)은 바꾸지 않고 표시 상태만 계산한다 ──
+# 정본 자산의 과거 커밋 blob(정규화 해시) 집합. 사본이 정본 HEAD 와 다르지만 이 집합의 한 원소와
+# 같으면 "배포 대기"(정본 수정 후 아직 하류로 배포되지 않음), 어디에도 없으면 "진짜 드리프트"다.
+# 자산·정본 HEAD 스탬프별로 캐시해 대시보드 갱신(10초)마다 git 이력을 다시 읽지 않는다.
+if (-not $script:HarnessAssetHistoryCache) { $script:HarnessAssetHistoryCache = @{} }
+# 회귀 테스트가 "캐시 히트 시 추가 git 호출 0회"를 셀 수 있게 이력 조회(log·show) 호출 수를 센다.
+# rev-parse(HEAD 스탬프)·status(더티 판정)은 CFG100 이 이미 쓰던 별개 호출이라 세지 않는다.
+$script:HarnessHistoryGitCalls = 0
+function Invoke-HarnessHistoryGit {
+    # 이력 조회 전용 git 실행 래퍼. 빈 출력(파일이 그 커밋에 없음)과 실패를 구분하도록 종료 코드를 함께 준다.
+    param([string]$ConfigRoot, [string[]]$GitArgs)
+    $script:HarnessHistoryGitCalls++
+    $output = @()
+    $code = 1
+    try {
+        $output = @(& git -C $ConfigRoot @GitArgs 2>$null)
+        $code = $LASTEXITCODE
+    } catch { $output = @(); $code = 1 }
+    return [pscustomobject]@{ Output = $output; Code = $code }
+}
+function Get-HarnessHeadCommit {
+    param([string]$ConfigRoot)
+    if ([string]::IsNullOrWhiteSpace($ConfigRoot) -or -not (Test-Path (Join-Path $ConfigRoot '.git'))) { return $null }
+    try {
+        $sha = (@(& git -C $ConfigRoot rev-parse HEAD 2>$null) | Select-Object -First 1)
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$sha)) { return $null }
+        return ([string]$sha).Trim()
+    } catch { return $null }
+}
+function Get-HarnessAssetHistoryHashes {
+    # 해당 자산을 바꾼 정본 커밋들의 blob 을 정규화 해시 집합으로 돌려준다(자산·HEAD 스탬프별 캐시).
+    param([string]$ConfigRoot, [string]$Asset, [string]$HeadStamp)
+    $key = "$Asset|$HeadStamp"
+    if ($script:HarnessAssetHistoryCache.ContainsKey($key)) { return $script:HarnessAssetHistoryCache[$key] }
+    $hashes = @{}
+    if (-not [string]::IsNullOrWhiteSpace($ConfigRoot) -and (Test-Path (Join-Path $ConfigRoot '.git'))) {
+        $rel = 'global/harness/' + $Asset
+        $logResult = Invoke-HarnessHistoryGit -ConfigRoot $ConfigRoot -GitArgs @('log', '--format=%H', '--', $rel)
+        if ($logResult.Code -eq 0) {
+            foreach ($line in $logResult.Output) {
+                $sha = ([string]$line).Trim()
+                if ([string]::IsNullOrWhiteSpace($sha)) { continue }
+                $showResult = Invoke-HarnessHistoryGit -ConfigRoot $ConfigRoot -GitArgs @('show', ($sha + ':' + $rel))
+                if ($showResult.Code -ne 0) { continue }
+                $h = Get-HarnessContentHash -Text (Get-HarnessNormalizedText -Text (($showResult.Output) -join "`n"))
+                if ($h) { $hashes[$h] = $true }
+            }
+        }
+    }
+    $script:HarnessAssetHistoryCache[$key] = $hashes
+    return $hashes
+}
+function Get-HarnessBusyLock {
+    # CFG089 함수(sync-configs.ps1 Get-HarnessBusyLock)와 같은 판정을 공유한다 — 그 저장소에 살아
+    # 있는 디스패치 락(impl/qa/integration)이 있으면 그 정보를, 없거나 전부 스테일이면 $null 을 준다.
+    # 생존 판정은 Read-HarnessLockFile(PID + 프로세스 시작 시각)에 위임하고 여기서 재구현하지 않는다.
+    param([string]$ProjRoot)
+    foreach ($stage in @('impl', 'qa', 'integration')) {
+        $lock = Get-DispatchLock -ProjectPath $ProjRoot -Stage $stage
+        if ($lock -and $lock.Alive) {
+            return [pscustomobject]@{ Stage = $stage; TaskId = $lock.TaskId; ProcessId = $lock.ProcessId }
+        }
+    }
+    return $null
+}
+
 # ── CFG042: 하네스 배포 동기화 요약 — 오버라이드(추적 가능한 로컬 예외)와 드리프트 분리 ──
 function Get-HarnessSyncSummary {
     $masterDir = Join-Path $root 'global\harness'
@@ -161,7 +227,7 @@ function Get-HarnessSyncSummary {
         $manifestPath = Join-Path $PSScriptRoot 'harness-assets.txt'
     }
     try { $assets = @(Read-HarnessAssets -ManifestPath $manifestPath) }
-    catch { return [pscustomobject]@{ MasterChecks = 0; Overrides = @(); Drifts = @("manifest ($($_.Exception.Message))"); Projects = @(); CanonicalEditing = @() } }
+    catch { return [pscustomobject]@{ MasterChecks = 0; Overrides = @(); Drifts = @("manifest ($($_.Exception.Message))"); DeployPending = @(); Projects = @(); CanonicalEditing = @(); CanonicalEditingMinutes = $null; ProjectStates = @() } }
     $harnessProjects = @(Get-HarnessProjects)
     $overrideLookup = @{}
     $statePath = Join-Path $root '.agents\briefs\.harness-sync-state.json'
@@ -178,14 +244,43 @@ function Get-HarnessSyncSummary {
     # CFG100: 정본이 편집 중인 자산은 HEAD blob 을 기준으로 비교하고 "정본 편집 중"으로 분류한다.
     $dirtyAssets = Get-HarnessDirtyAssets -ConfigRoot $root
     $canonicalEditing = @($assets | Where-Object { $dirtyAssets.ContainsKey($_) })
-    $overrides = @(); $drifts = @(); $checked = 0
+    # CFG102: 정본 편집 경과 시간 — 가장 오래된 편집 자산의 mtime 기준. 헤더 배지에 "정본 편집 중 N분"으로 병기.
+    $canonicalEditingMinutes = $null
+    if ($canonicalEditing.Count -gt 0) {
+        $oldestEdit = $null
+        foreach ($editAsset in $canonicalEditing) {
+            $editPath = Join-Path $masterDir $editAsset
+            if (-not (Test-Path -LiteralPath $editPath)) { continue }
+            try { $editMtime = (Get-Item -LiteralPath $editPath).LastWriteTime } catch { continue }
+            if ($null -eq $oldestEdit -or $editMtime -lt $oldestEdit) { $oldestEdit = $editMtime }
+        }
+        if ($null -ne $oldestEdit) {
+            $editMins = [int][math]::Floor(((Get-Date) - $oldestEdit).TotalMinutes)
+            if ($editMins -lt 0) { $editMins = 0 }
+            $canonicalEditingMinutes = $editMins
+        }
+    }
+    # CFG102: 이력 조회는 사본이 다를 때만 필요하다 — 정본 HEAD 스탬프는 지연 계산해 in-sync 틱의 git 호출을 늘리지 않는다.
+    $headStamp = $null
+    $headStampResolved = $false
+    $overrides = @(); $drifts = @(); $deployPending = @(); $checked = 0
+    $projectStates = @()
     foreach ($proj in $harnessProjects) {
+        # 자산별 차이를 모은 뒤 저장소 단위 상태를 정한다(상태는 저장소당 하나 —
+        # CFG102 우선순위: 락 지연 > 오버라이드 > 진짜 드리프트 > 배포 대기).
+        $projDiff = @()      # 정본 HEAD 와 다른 비오버라이드 사본 (@{ Asset; Hash(정규화) })
+        $projMissing = @()   # 사본 없음 — 이력 대조 불가라 항상 진짜 드리프트
+        $projOverride = $false
         foreach ($asset in $assets) {
             $isDirty = $dirtyAssets.ContainsKey($asset)
+            $masterWorkTreeHash = $null
             if ($isDirty) {
                 # 정본 HEAD 에 없는 새 자산이면 하류와 비교할 기준이 없다 — 편집 중으로만 분류한다.
                 $masterHash = Get-HarnessHeadBlobHash -ConfigRoot $root -Asset $asset
                 if (-not $masterHash) { continue }
+                # 정본 미커밋 편집 자체와도 비교한다 — 정본 미러·개발 중(-AllowDirtyCanonical) 배포 사본은
+                # HEAD 가 아니라 이 작업 트리와 같으므로 "정본 편집 중"이지 진짜 드리프트가 아니다.
+                try { $masterWorkTreeHash = Get-HarnessNormalizedFileHash -Path (Join-Path $masterDir $asset) } catch { $masterWorkTreeHash = $null }
             } else {
                 $master = Join-Path $masterDir $asset
                 # 대시보드는 읽기 전용 모니터라 활성 git/디스패치가 이 파일을 쥐고 있는 순간과 겹치는 건
@@ -196,20 +291,113 @@ function Get-HarnessSyncSummary {
                 catch { continue }
             }
             $copy = Join-Path $proj "scripts\$asset"
-            if (-not (Test-Path -LiteralPath $copy)) { $drifts += "$proj|$asset (missing)"; continue }
+            if (-not (Test-Path -LiteralPath $copy)) { $drifts += "$proj|$asset (missing)"; $projMissing += $asset; continue }
             try {
                 if ($isDirty) { $copyHash = Get-HarnessNormalizedFileHash -Path $copy }
                 else { $copyHash = Get-CachedFileHash -Path $copy }
             } catch { continue }
             if ($copyHash -eq $masterHash) { $checked++; continue }
+            if ($isDirty -and $masterWorkTreeHash -and $copyHash -eq $masterWorkTreeHash) { $checked++; continue }
             if (Test-HarnessOverrideState -OverrideLookup $overrideLookup -Target $proj -Asset $asset -Master $masterHash) {
                 $overrides += "$proj|$asset"
+                $projOverride = $true
             } else {
-                $drifts += "$proj|$asset"
+                # 이력 대조는 정규화 해시 기준이다 — HEAD 비교(비더티 때는 원시 해시)와 별개로 계산한다.
+                $normCopyHash = $null
+                try { $normCopyHash = Get-HarnessNormalizedFileHash -Path $copy } catch { $normCopyHash = $null }
+                $projDiff += [pscustomobject]@{ Asset = $asset; Hash = $normCopyHash }
             }
         }
+        $hasAnyDiff = ($projDiff.Count -gt 0) -or ($projMissing.Count -gt 0) -or $projOverride
+        if (-not $hasAnyDiff) { continue }
+        # CFG089 락 판정은 분류 우선순위의 최상단이라 오버라이드만 있는 저장소에도 적용한다.
+        $busy = $null
+        try { $busy = Get-HarnessBusyLock -ProjRoot $proj } catch { $busy = $null }
+        if ($projDiff.Count -eq 0 -and $projMissing.Count -eq 0) {
+            $projStatus = if ($busy) { 'lock-deferred' } else { 'override' }
+            $projectStates += [pscustomobject]@{ Project = $proj; Status = $projStatus; Detail = @($overrides | Where-Object { $_ -like "$proj|*" }) }
+            continue
+        }
+        # 정본 HEAD 와 다른 사본을 정본 이력과 대조해 배포 대기/진짜 드리프트로 가른다. 이력 어디에도
+        # 없는 사본은 진짜 드리프트다. 사본 없음은 대조가 불가능하므로 진짜 드리프트로 센다.
+        if (-not $headStampResolved) { $headStamp = Get-HarnessHeadCommit -ConfigRoot $root; $headStampResolved = $true }
+        $projDrift = ($projMissing.Count -gt 0)
+        foreach ($diff in $projDiff) {
+            $isPending = $false
+            if ($headStamp -and $diff.Hash) {
+                $history = Get-HarnessAssetHistoryHashes -ConfigRoot $root -Asset $diff.Asset -HeadStamp $headStamp
+                if ($history.ContainsKey($diff.Hash)) { $isPending = $true }
+            }
+            if ($isPending) { $deployPending += "$proj|$($diff.Asset)" }
+            else { $drifts += "$proj|$($diff.Asset)"; $projDrift = $true }
+        }
+        $projStatus = if ($busy) { 'lock-deferred' }
+                      elseif ($projOverride) { 'override' }
+                      elseif ($projDrift) { 'real-drift' }
+                      else { 'deploy-pending' }
+        $projectStates += [pscustomobject]@{ Project = $proj; Status = $projStatus; Detail = @($projDiff | ForEach-Object { $_.Asset }) }
     }
-    return [pscustomobject]@{ MasterChecks = $checked; Overrides = @($overrides); Drifts = @($drifts); Projects = @($harnessProjects); CanonicalEditing = @($canonicalEditing) }
+    return [pscustomobject]@{
+        MasterChecks = $checked
+        Overrides = @($overrides)
+        Drifts = @($drifts)
+        DeployPending = @($deployPending)
+        Projects = @($harnessProjects)
+        CanonicalEditing = @($canonicalEditing)
+        CanonicalEditingMinutes = $canonicalEditingMinutes
+        ProjectStates = @($projectStates)
+    }
+}
+# CFG102: 배지 텍스트·색·툴팁을 순수 함수로 분리한다 — WinForms 없이 회귀 테스트가 직접 단언한다.
+# 경고색(Crimson)은 진짜 드리프트에만 준다. 0건 상태는 표시하지 않고 텍스트를 축약하며,
+# 정본 편집 중은 정본의 속성이라 저장소별 상태가 아니라 헤더에 한 번 별도로 표기한다.
+function Format-HarnessBadge {
+    param($Summary)
+    $states = @($Summary.ProjectStates)
+    $drift = @($states | Where-Object { $_.Status -eq 'real-drift' }).Count
+    $lock = @($states | Where-Object { $_.Status -eq 'lock-deferred' }).Count
+    $override = @($states | Where-Object { $_.Status -eq 'override' }).Count
+    $pending = @($states | Where-Object { $_.Status -eq 'deploy-pending' }).Count
+    $editing = @($Summary.CanonicalEditing).Count
+    $parts = @()
+    if ($drift -gt 0) { $parts += "진짜 드리프트 $drift" }
+    if ($lock -gt 0) { $parts += "락 지연 $lock" }
+    if ($override -gt 0) { $parts += "오버라이드 $override" }
+    if ($pending -gt 0) { $parts += "배포 대기 $pending" }
+    $editSuffix = ''
+    if ($editing -gt 0) {
+        if ($null -ne $Summary.CanonicalEditingMinutes) { $editSuffix = " · 정본 편집 중 $($Summary.CanonicalEditingMinutes)분" }
+        else { $editSuffix = ' · 정본 편집 중' }
+    }
+    if ($parts.Count -gt 0) { $text = '🔗 하네스: ' + ($parts -join ' · ') + $editSuffix }
+    else { $text = '🔗 하네스: 동기화됨' + $editSuffix }
+    $fore = if ($drift -gt 0) { 'Crimson' }
+            elseif ($parts.Count -gt 0) { 'DarkSlateGray' }
+            else { 'DarkOliveGreen' }
+    $tipLines = @()
+    if ($drift -gt 0) {
+        $tipLines += '진짜 드리프트 — 정본 이력 어디에도 없는 사본 (Push/수정 필요):'
+        $Summary.Drifts | ForEach-Object { $tipLines += "  $_" }
+    }
+    if ($lock -gt 0) {
+        $tipLines += '락 지연 — 실행 중 체인 때문에 이번 배포가 미뤄진 저장소:'
+        $states | Where-Object { $_.Status -eq 'lock-deferred' } | ForEach-Object { $tipLines += "  $($_.Project)" }
+    }
+    if ($override -gt 0) {
+        $tipLines += '오버라이드 — 기록된 로컬 예외 (동기화 제외 대상):'
+        $Summary.Overrides | ForEach-Object { $tipLines += "  $_" }
+    }
+    if ($pending -gt 0) {
+        $tipLines += '배포 대기 — 정본 수정 후 아직 배포되지 않음:'
+        $Summary.DeployPending | ForEach-Object { $tipLines += "  $_" }
+    }
+    if ($editing -gt 0) {
+        $minsText = if ($null -ne $Summary.CanonicalEditingMinutes) { " · 편집중 $($Summary.CanonicalEditingMinutes)분" } else { '' }
+        $tipLines += "정본 편집 중 — 미커밋 정본 자산 ${editing}개${minsText}:"
+        $Summary.CanonicalEditing | ForEach-Object { $tipLines += "  $_" }
+    }
+    if ($tipLines.Count -eq 0) { $tipLines += "전 대상 자산 $($Summary.MasterChecks)개가 정본과 동기화됨" }
+    return [pscustomobject]@{ Text = $text; Fore = $fore; Tip = ($tipLines -join "`n") }
 }
 # 라우터 표의 헤더 행이면 컬럼 이름 → 인덱스 매핑을 돌려주고, 아니면 $null.
 # 작업 ID와 상태 두 칸이 모두 있어야 라우터 표로 인정한다 — 같은 파일 안의 다른 표
@@ -1340,35 +1528,12 @@ function Update-Dashboard {
     )
     $ShowAll = [bool]$Data.ShowAll
     if ($HarnessBadge) {
-        # CFG042: 하네스 배포 동기화를 한 번에 보여준다. 드리프트가 있으면 Push가 필요하다는
-        # 뜻이므로 가장 강하게, 유효 오버라이드만 있으면 기록된 로컬 예외이므로 그 다음 강도로,
-        # 전부 정본과 같으면 동기화 완료로 표시한다. 세부 항목은 툴팁에 담는다.
-        $summary = $Data.Harness
-        if ($summary.Drifts.Count -gt 0) {
-            $HarnessBadge.Text = "🔗 하네스: 드리프트 $($summary.Drifts.Count) · 오버라이드 $($summary.Overrides.Count)"
-            $HarnessBadge.ForeColor = [System.Drawing.Color]::Crimson
-        } elseif ($summary.Overrides.Count -gt 0) {
-            $HarnessBadge.Text = "🔗 하네스: 오버라이드 $($summary.Overrides.Count)"
-            $HarnessBadge.ForeColor = [System.Drawing.Color]::DarkGoldenrod
-        } else {
-            $HarnessBadge.Text = '🔗 하네스: 동기화됨'
-            $HarnessBadge.ForeColor = [System.Drawing.Color]::DarkOliveGreen
-        }
-        if ($ToolTip) {
-            $tipLines = @()
-            if ($summary.Overrides.Count -gt 0) {
-                $tipLines += "오버라이드 — 기록된 로컬 예외 (동기화 제외 대상):"
-                $summary.Overrides | ForEach-Object { $tipLines += "  $_" }
-            }
-            if ($summary.Drifts.Count -gt 0) {
-                $tipLines += "드리프트 — 미등록·누락·충돌 (Push 필요):"
-                $summary.Drifts | ForEach-Object { $tipLines += "  $_" }
-            }
-            if ($tipLines.Count -eq 0) {
-                $tipLines += "전 대상 자산 $($summary.MasterChecks)개가 정본과 동기화됨"
-            }
-            $ToolTip.SetToolTip($HarnessBadge, ($tipLines -join "`n"))
-        }
+        # CFG102: 상태 분류(진짜 드리프트/락 지연/오버라이드/배포 대기/정본 편집 중)를 배지로 보여준다.
+        # 경고색은 진짜 드리프트에만 — 나머지는 중립색. 렌더 규칙은 Format-HarnessBadge 순수 함수가 SSOT다.
+        $badge = Format-HarnessBadge -Summary $Data.Harness
+        $HarnessBadge.Text = $badge.Text
+        $HarnessBadge.ForeColor = [System.Drawing.Color]::FromName($badge.Fore)
+        if ($ToolTip) { $ToolTip.SetToolTip($HarnessBadge, $badge.Tip) }
     }
     if ($TierBadge -or $SessionBadge -or $ApprovalBadge) {
         $health = $Data.Health
@@ -1561,7 +1726,7 @@ $harnessBadge.Font = New-Object System.Drawing.Font($form.Font.FontFamily, 9, [S
 $harnessBadge.ForeColor = [System.Drawing.Color]::DarkSlateGray
 $harnessBadge.Text = '🔗 하네스: 확인중...'
 $harnessBadge.Cursor = [System.Windows.Forms.Cursors]::Hand
-$harnessBadge.AccessibleName = '하네스 동기화 상태 (오버라이드·드리프트)'
+$harnessBadge.AccessibleName = '하네스 동기화 상태 (진짜 드리프트·배포 대기·락 지연·오버라이드·정본 편집 중)'
 $summaryPanel.Controls.Add($tierBadge)
 $summaryPanel.Controls.Add($sessionBadge)
 $summaryPanel.Controls.Add($approvalBadge)
