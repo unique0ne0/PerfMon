@@ -220,7 +220,7 @@ function Get-FileByteFacts {
     # 제거하므로 BOM 증감을 볼 수 없다 — 첫 3바이트를 직접 검사한다.
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        return @{ Exists = $false; HasBom = $false; Sha256 = $null; Text = '' }
+        return @{ Exists = $false; HasBom = $false; Sha256 = $null; Text = ''; Length = 0 }
     }
     $bytes = [System.IO.File]::ReadAllBytes($Path)
     $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
@@ -235,7 +235,7 @@ function Get-FileByteFacts {
     } elseif (-not $hasBom -and $bytes.Length -gt 0) {
         $text = [System.Text.Encoding]::UTF8.GetString($bytes, 0, $bytes.Length)
     }
-    return @{ Exists = $true; HasBom = $hasBom; Sha256 = $hash; Text = $text }
+    return @{ Exists = $true; HasBom = $hasBom; Sha256 = $hash; Text = $text; Length = $bytes.Length }
 }
 
 function Test-FileEncodingPollution {
@@ -248,7 +248,11 @@ function Test-FileEncodingPollution {
     }
     $ext = [System.IO.Path]::GetExtension($RelPath).ToLowerInvariant()
     if ($ext -eq '.ps1') {
-        if (-not $Current.HasBom) { $reasons.Add('BOM 결손(.ps1 BOM 필수)') }
+        # CFG-BL-095: baseline에도 BOM이 없던 파일의 BOM 부재는 오염 사유에서 제외한다(정상 편집 오탐 방지).
+        # baseline 없음·0바이트는 신규 파일로 보아 BOM 필수 불변식을 유지한다.
+        $baselineHasContent = $Baseline -and $Baseline.Exists -and ($null -eq $Baseline.Length -or $Baseline.Length -gt 0)
+        $baselineNoBom = $baselineHasContent -and (-not $Baseline.HasBom)
+        if (-not $Current.HasBom -and -not $baselineNoBom) { $reasons.Add('BOM 결손(.ps1 BOM 필수)') }
     } elseif ($ext -eq '.md' -or $ext -eq '.json') {
         if ($Current.HasBom) { $reasons.Add('BOM 추가(.md/.json No-BOM 위반)') }
     } elseif ($Baseline -and $Baseline.Exists) {
@@ -347,12 +351,15 @@ function New-ImplPrestageSnapshot {
 }
 
 function Get-RouterRowInfo {
+    # 라우터 표에서 "작업 행"만 반환한다. 첫 칸을 정규화(영숫자만·대문자)한 뒤 `^[A-Z]+\d+$`에
+    # 맞아야 한다 — 팀표 헤더('기본 팀')·구분행(':---')·빈 칸·기타 표는 $null. 정규화가 하이픈
+    # 표기(CS-030 → CS030)를 흡수하므로 과거 작업 ID도 작업 행으로 인식된다(CFG-BL-097).
     param([string]$Line)
-    if ($Line -notmatch '^\s*\|') { return $null }
+    if ([string]::IsNullOrWhiteSpace($Line) -or $Line -notmatch '^\s*\|') { return $null }
     $cells = @($Line.Trim().Trim('|').Split('|') | ForEach-Object { $_.Trim() })
     if ($cells.Count -lt 3) { return $null }
     $tId = $cells[0]
-    if ([string]::IsNullOrWhiteSpace($tId) -or $tId -match '^-+$' -or $tId -eq '작업 ID' -or $tId -eq 'Task ID') { return $null }
+    if ((Get-NormalizedTaskId -TaskId $tId) -notmatch '^[A-Z]+\d+$') { return $null }
     return @{ TaskId = $tId; Status = $cells[2]; Cells = $cells }
 }
 
@@ -366,23 +373,35 @@ function Restore-RouterOutOfScopeRows {
         [string[]]$ExemptTaskIds = @()
     )
     if (-not (Test-Path -LiteralPath $CurrentPath) -or -not (Test-Path -LiteralPath $BaselinePath)) {
-        return @{ Changed = $false; Tasks = @(); OutputLines = @(); ExemptedTasks = @() }
+        return @{ Changed = $false; Tasks = @(); OutputLines = @(); ExemptedTasks = @(); Warnings = @() }
     }
     $normSelf = Get-NormalizedTaskId -TaskId $TaskId
     $baselineLines = @(Get-Content -LiteralPath $BaselinePath -Encoding UTF8)
     $currentLines = @(Get-Content -LiteralPath $CurrentPath -Encoding UTF8)
     $baselineRows = @{}
+    $baselineNonTask = @{}
     foreach ($line in $baselineLines) {
         $info = Get-RouterRowInfo -Line $line
         if ($info) { $baselineRows[(Get-NormalizedTaskId -TaskId $info.TaskId)] = $line }
+        else { $baselineNonTask[$line] = $true }
     }
     $exemptNorm = @($ExemptTaskIds | ForEach-Object { Get-NormalizedTaskId -TaskId $_ })
     $out = New-Object System.Collections.Generic.List[string]
     $offending = New-Object System.Collections.Generic.List[string]
     $exempted = New-Object System.Collections.Generic.List[string]
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $currentNonTask = @{}
     foreach ($line in $currentLines) {
         $info = Get-RouterRowInfo -Line $line
-        if (-not $info) { $out.Add($line); continue }
+        if (-not $info) {
+            # 비작업 행(팀표·구분행 등)은 복원하지 않고 현재 값을 보존한다. baseline과 달라졌으면
+            # 경고만 남긴다 — 오탐 복원으로 라우터 헤더를 손상시키지 않기 위함이다(CFG-BL-097).
+            $currentNonTask[$line] = $true
+            if (-not $baselineNonTask.ContainsKey($line)) {
+                $warnings.Add("라우터 비작업 행 변경 감지(복원하지 않고 보존): $($line.Trim())")
+            }
+            $out.Add($line); continue
+        }
         $norm = Get-NormalizedTaskId -TaskId $info.TaskId
         if ($norm -eq $normSelf) { $out.Add($line); continue }
         if ($exemptNorm -contains $norm) { $out.Add($line); $exempted.Add($info.TaskId); continue }
@@ -395,7 +414,12 @@ function Restore-RouterOutOfScopeRows {
     }
     $original = $currentLines -join "`n"
     $rebuilt = ($out -join "`n")
-    return @{ Changed = ($original -ne $rebuilt); Tasks = @($offending); OutputLines = @($out); ExemptedTasks = @($exempted) }
+    foreach ($bl in $baselineNonTask.Keys) {
+        if (-not $currentNonTask.ContainsKey($bl)) {
+            $warnings.Add("라우터 비작업 행 삭제 감지(복원하지 않음): $($bl.Trim())")
+        }
+    }
+    return @{ Changed = ($original -ne $rebuilt); Tasks = @($offending); OutputLines = @($out); ExemptedTasks = @($exempted); Warnings = @($warnings) }
 }
 
 function Test-PlanningCreatedPacketRow {
@@ -483,6 +507,9 @@ function Invoke-ImplPollutionRestore {
             }
             $sel = Restore-RouterOutOfScopeRows -CurrentPath $routerAbs -BaselinePath $routerBaseAbs -TaskId $TaskId -ExemptTaskIds @($exemptTasks)
             foreach ($et in $sel.ExemptedTasks) { if ($exempted -notcontains $et) { $exempted.Add($et) } }
+            foreach ($w in @($sel.Warnings)) {
+                if ($w -and (Get-Command -Name Write-Log -ErrorAction SilentlyContinue)) { Write-Log $w WARN }
+            }
             if ($sel.Changed) {
                 $null = Copy-ImplFileToQuarantine -SourceAbs $routerAbs -RelPath $routerRel -TaskId $TaskId -Cycle $Cycle
                 [System.IO.File]::WriteAllLines($routerAbs, $sel.OutputLines, (New-Object System.Text.UTF8Encoding($false)))
