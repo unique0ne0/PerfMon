@@ -234,6 +234,14 @@ function Resolve-PipelineRouting {
     $routeName = if ($ImplementationRoute) { $ImplementationRoute } elseif ($Config.roles.impl) { [string]$Config.roles.impl } else { [string]$route.implementationRoute }
 
     if ($null -eq $Config.routes.$routeName) { throw "Unknown implementation route: $routeName" }
+    # CFG096: 라우터 다음 단계 라벨이 구현 담당팀을 유도할 수 있도록 구현 슬롯의 어댑터를
+    # 함께 반환한다. modelCatalog에 adapter가 없으면 하네스 기본 실행 어댑터(opencode)로 둔다.
+    $implModels = @($Config.routes.$routeName)
+    $implFirstModelForAdapter = if ($implModels.Count -gt 0) { [string]$implModels[0] } else { '' }
+    $implAdapter = 'opencode'
+    if ($implFirstModelForAdapter -and $Config.modelCatalog.$implFirstModelForAdapter -and $Config.modelCatalog.$implFirstModelForAdapter.adapter) {
+        $implAdapter = [string]$Config.modelCatalog.$implFirstModelForAdapter.adapter
+    }
     $qa = Resolve-RoleProfile -Role qa -Config $Config -ExplicitProfile $qaProfileName
     $integration = Resolve-RoleProfile -Role integration -Config $Config -ExplicitProfile $integrationProfileName
     if ($QaAdapter -and $qa.Adapter -ne $QaAdapter) {
@@ -252,7 +260,7 @@ function Resolve-PipelineRouting {
     if ($qa.Family -eq $planner.family) {
         Write-Warning "Planner $PlanningAdapter uses same-family QA profile $($qa.Name) (prefer violation)"
     }
-    return [pscustomobject]@{ PlanningProfile = $PlanningProfile; PlanningAdapter = $PlanningAdapter; ImplementationRoute = $routeName; ImplementationModels = @($Config.routes.$routeName); QaProfile = $qa; IntegrationProfile = $integration }
+    return [pscustomobject]@{ PlanningProfile = $PlanningProfile; PlanningAdapter = $PlanningAdapter; ImplementationRoute = $routeName; ImplementationAdapter = $implAdapter; ImplementationModels = @($Config.routes.$routeName); QaProfile = $qa; IntegrationProfile = $integration }
 }
 
 # CFG028 / CFG054: Antigravity 프로젝트 ID 해석 단일 정본 구현.

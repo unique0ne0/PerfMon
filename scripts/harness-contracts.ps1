@@ -7,6 +7,29 @@ function Get-NormalizedTaskId {
     return ($TaskId -replace '[^A-Za-z0-9]', '').ToUpperInvariant()
 }
 
+# CFG096: 어댑터(실행 CLI)→소속 팀 매핑의 단일 정본. 대시보드(task-status.ps1)와 라우터 다음
+# 단계 라벨(harness-ledger.ps1)이 같은 표를 공유한다 — UI 스크립트가 하네스 백엔드 함수를
+# 참조하는 의존성 역전을 없애고, 매핑 중복 드리프트를 막는다.
+# antigravity(agy)는 개발2팀(Gemini)의 실행 레이어다(WorldSaju WS001 실측: gemini-3.8-flash).
+function Get-AdapterTeamMap {
+    return @{
+        opencode    = '개발1팀'
+        codex       = 'QA팀'
+        claude      = '기획팀'
+        gemini      = '개발2팀'
+        antigravity = '개발2팀'
+    }
+}
+
+function Get-TeamByAdapter {
+    param([string]$Adapter)
+    if ([string]::IsNullOrWhiteSpace($Adapter)) { return $null }
+    $map = Get-AdapterTeamMap
+    $key = $Adapter.Trim().ToLowerInvariant()
+    if ($map.ContainsKey($key)) { return $map[$key] }
+    return $null
+}
+
 function Get-PlanningChallengeReviewStatus {
     param([string]$PacketPath)
     $result = [ordered]@{

@@ -1538,7 +1538,8 @@ function Invoke-StageWithLock {
         if ($result.Success) {
             Test-PipelineStageUpdated -Stage $Stage -PacketPath $CheckPipelinePacket
             # CFG079: 단계 성공 시 라우터 행의 "다음 단계"·갱신일을 하네스가 직접 갱신 — 에이전트 기탁 누락 방지.
-            Update-RouterRowAfterStage -Stage $Stage -PacketPath $CheckPipelinePacket
+            # CFG096: 라벨의 담당팀은 해석된 어댑터(런타임 > 정적 라우팅)에서 유도한다.
+            Update-RouterRowAfterStage -Stage $Stage -PacketPath $CheckPipelinePacket -Adapter (Resolve-RouterLabelAdapter -Stage $Stage)
             if ($Stage -ne 'integration') {
                 Clear-FailureMarker -Stage $Stage
             }

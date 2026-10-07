@@ -521,7 +521,7 @@ function Get-StageRuntimeIdentity {
     # 여전히 단계 기본팀 이름에 붙이면 "기획팀 / Codex CLI"처럼 실제로 존재하지 않는 조합이
     # 표시된다. 어댑터가 평소 어느 팀 소속인지 알고 있으면 그 팀 이름을 쓰고, 기본팀과 다르면
     # "대행"을 붙여 조정 사실 자체를 화면에서 알 수 있게 한다.
-    $teamByAdapter = @{ opencode = '개발1팀'; codex = 'QA팀'; claude = '기획팀'; gemini = '개발2팀' }
+    $teamByAdapter = Get-AdapterTeamMap
     if (-not $defaultTeam) { return [pscustomobject]@{ Owner = $RouterOwner; Model = '-' } }
     # CFG079: 하네스가 기록한 chain-runtime.json(단계별 실제 실행 model/adapter)이 최우선 근거다.
     # host 로그 라인 파싱보다 정확하고, 라우터 산문보다 항상 최신이다 — 라우터 갱신이 늦어도
@@ -570,8 +570,8 @@ function Get-StageRuntimeIdentity {
         $adapter = $Matches[1].ToLowerInvariant(); $model = $Matches[2]
         $cli = @{ antigravity = 'Antigravity CLI'; codex = 'Codex CLI'; claude = 'Claude CLI'; gemini = 'Gemini CLI'; opencode = 'OpenCode CLI' }[$adapter]
         if ($cli) {
-            # antigravity는 여러 팀이 공용으로 쓰는 실행 레이어라 소속팀이 고정되지 않는다 — 그런
-            # 어댑터는 대행 여부를 판정할 근거가 없으므로 단계 기본팀 이름을 그대로 쓴다.
+            # 어댑터→팀 매핑은 공용 harness-contracts.ps1(Get-AdapterTeamMap)이 SSOT다(CFG096).
+            # 매핑에 없는 어댑터만 근거가 없으므로 단계 기본팀 이름을 그대로 쓴다.
             $actualTeam = if ($teamByAdapter.ContainsKey($adapter)) { $teamByAdapter[$adapter] } else { $defaultTeam }
             $owner = if ($actualTeam -ne $defaultTeam) { "$actualTeam 대행($defaultTeam) / $cli" } else { "$actualTeam / $cli" }
             return [pscustomobject]@{ Owner = $owner; Model = if ($LeaseModel) { $LeaseModel } else { $model } }

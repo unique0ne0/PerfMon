@@ -231,19 +231,54 @@ function Write-ChainBlockedMarker {
 # 갱신 칸 외의 다른 칸(상태·Blocked by 등)은 절대 손대지 않는다 — 상태 전환 권한은 기획팀에 남는다.
 
 function Get-RouterNextStageLabel {
-    param([string]$Stage)
+    param([string]$Stage, [string]$Adapter)
+    # CFG096: 라벨의 담당팀은 고정 문자열이 아니라 해석된 어댑터에서 유도한다
+    # (예: opencode→개발1팀, antigravity/gemini→개발2팀). 어댑터가 없거나 매핑에 없으면
+    # 기존 고정 문구로 폴백해 회귀를 막는다.
+    $team = $null
+    if ($Adapter -and (Get-Command Get-TeamByAdapter -ErrorAction SilentlyContinue)) {
+        $team = Get-TeamByAdapter -Adapter $Adapter
+    }
     switch ($Stage) {
-        'impl'        { return '③ 자체 리뷰(개발1팀)' }
-        'qa'          { return '⑤ 최종 리뷰 및 Integration(기획팀)' }
+        'impl'        { if ($team) { return "③ 자체 리뷰($team)" } else { return '③ 자체 리뷰(개발1팀)' } }
+        'qa'          { if ($team) { return "⑤ 최종 리뷰 및 Integration($team)" } else { return '⑤ 최종 리뷰 및 Integration(기획팀)' } }
         'integration' { return $null }
     }
     return $null
 }
 
+# CFG096: 완료 단계 뒤 라벨의 담당팀을 정할 어댑터를 해석한다. 우선순위는
+# 실제 실행 어댑터(chain-runtime.json) > 정적 라우팅(PipelineRouting/StageConfig) > $null(고정 문구 폴백).
+# 라벨이 가리키는 담당 단계: impl 완료→③(구현팀), qa 완료→⑤(Integration팀).
+function Resolve-RouterLabelAdapter {
+    param([string]$Stage)
+    $ownerStage = switch ($Stage) { 'impl' { 'impl' } 'qa' { 'integration' } default { $null } }
+    if (-not $ownerStage) { return $null }
+    # 1) 실제 실행 어댑터 — 같은 단계가 이미 돌았으면 그 기록이 가장 정확하다.
+    try {
+        if (Get-Command Read-ChainRuntime -ErrorAction SilentlyContinue) {
+            $runtime = Read-ChainRuntime
+            $entry = $runtime.stages.$ownerStage
+            if ($entry -and [string]$entry.adapter) { return [string]$entry.adapter }
+        }
+    } catch { }
+    # 2) 정적 라우팅 — 아직 실행 전인 다음 단계(예: qa 완료 시 integration)에서 사용.
+    if ($ownerStage -eq 'impl') {
+        if ($script:PipelineRouting -and $script:PipelineRouting.ImplementationAdapter) { return [string]$script:PipelineRouting.ImplementationAdapter }
+        if ($StageConfig -and $StageConfig['impl'] -and $StageConfig['impl'].Adapter) { return [string]$StageConfig['impl'].Adapter }
+    } else {
+        if ($script:PipelineRouting -and $script:PipelineRouting.IntegrationProfile -and $script:PipelineRouting.IntegrationProfile.Adapter) { return [string]$script:PipelineRouting.IntegrationProfile.Adapter }
+        if ($StageConfig -and $StageConfig['integration'] -and $StageConfig['integration'].Adapter) { return [string]$StageConfig['integration'].Adapter }
+    }
+    return $null
+}
+
 function Update-RouterRowAfterStage {
-    param([string]$Stage, [string]$PacketPath)
+    param([string]$Stage, [string]$PacketPath, [string]$Adapter)
     if (-not (Test-Path -LiteralPath (Resolve-RepoPath '.agents/briefs/handoff-log.md'))) { return $false }
-    $next = Get-RouterNextStageLabel -Stage $Stage
+    # CFG096: 호출자가 해석된 어댑터를 넘기지 않으면 여기서 해석한다(직접 호출·레거시 호출 호환).
+    if (-not $Adapter) { $Adapter = Resolve-RouterLabelAdapter -Stage $Stage }
+    $next = Get-RouterNextStageLabel -Stage $Stage -Adapter $Adapter
     if (-not $next) { return $false }
     $routerPath = Resolve-RepoPath '.agents/briefs/handoff-log.md'
     $lines = @(Get-Content -LiteralPath $routerPath -Encoding UTF8)
