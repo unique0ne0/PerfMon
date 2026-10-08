@@ -1522,6 +1522,30 @@ function Invoke-DispatcherCleanup {
     }
 }
 
+# CFG105 Done When 2: 체인이 integration 성공으로 끝난 뒤에도 DONE 패킷이 packets/에 남아 있으면
+# 관찰 경고를 남긴다. 판정·경고 로직은 기존 check-packet-archive.ps1을 재사용하며(게이트를 막지
+# 않도록 관찰 모드로만 실행), 이 경고는 종료 코드에 영향을 주지 않는다(경고 1건).
+function Write-PostChainArchiveWarning {
+    param([string]$RepoRoot, [string]$CheckerPath)
+    if ([string]::IsNullOrWhiteSpace($RepoRoot)) { return }
+    if ([string]::IsNullOrWhiteSpace($CheckerPath)) {
+        foreach ($candidate in @((Join-Path $RepoRoot 'scripts\check-packet-archive.ps1'), (Join-Path $RepoRoot 'global\harness\check-packet-archive.ps1'))) {
+            if (Test-Path -LiteralPath $candidate) { $CheckerPath = $candidate; break }
+        }
+    }
+    if (-not $CheckerPath -or -not (Test-Path -LiteralPath $CheckerPath)) { return }
+    try {
+        $output = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $CheckerPath -RepoRoot $RepoRoot 2>&1)
+    } catch {
+        Write-Log "DONE 패킷 잔존 검사 실행 실패(무시): $($_.Exception.Message)" WARN
+        return
+    }
+    $lines = @($output | ForEach-Object { $_.ToString() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($lines.Count -gt 0) {
+        Write-Log ("⚠️ [integration] 완료 정리 경고 — DONE 패킷이 packets/에 남아 있습니다(archive/로 이동 권장, 관찰 전용; 게이트 비차단): " + ($lines -join ' | ')) WARN
+    }
+}
+
 function Invoke-StageWithLock {
     param([string]$Stage, [string]$PromptOverride, [bool]$CheckPipelineBefore, [string]$CheckPipelinePacket)
     if ($DryRun) { return (Dispatch-Stage -Stage $Stage -PromptOverride $PromptOverride) }
@@ -1536,6 +1560,10 @@ function Invoke-StageWithLock {
         Write-SyntheticQaVerdict -Stage $Stage -Result $result -CycleNumber $cycleId
         Ensure-QaLedger -Stage $Stage -Result $result
         if ($result.Success) {
+            # CFG105: ⑤ Integration이 완료 정리로 패킷을 packets/에서 archive/로 옮겼을 수 있다.
+            # 고정 경로를 재해석해 후처리(⑤ 자동 체크·라우터 행 갱신·Scope 이탈 판정)가 이동 후에도
+            # 같은 패킷을 찾도록 한다.
+            $CheckPipelinePacket = Resolve-PacketPathForPostProcessing -PacketPath $CheckPipelinePacket
             Test-PipelineStageUpdated -Stage $Stage -PacketPath $CheckPipelinePacket
             # CFG079: 단계 성공 시 라우터 행의 "다음 단계"·갱신일을 하네스가 직접 갱신 — 에이전트 기탁 누락 방지.
             # CFG096: 라벨의 담당팀은 해석된 어댑터(런타임 > 정적 라우팅)에서 유도한다.
@@ -2086,6 +2114,11 @@ function Invoke-DispatchChain {
                 Write-Log '📌 [integration] QA verdict pass — 자동 연쇄 진행. 완료 정리는 검증 통과 후에만 허용' INFO
             }
             $result = Invoke-StageWithLock -Stage $stage -PromptOverride '' -CheckPipelineBefore ($stage -eq 'impl') -CheckPipelinePacket $checkPipelinePacket
+            if ($stage -eq 'integration' -and $result.Success) {
+                # CFG105: 완료 정리가 패킷을 archive/로 옮긴 뒤 체인 요약(pipelineStatus.after)이 빈
+                # 목록이 되지 않도록 경로를 재해석한다.
+                $checkPipelinePacket = Resolve-PacketPathForPostProcessing -PacketPath $checkPipelinePacket
+            }
             $chainStages += [ordered]@{ stage = $stage; success = [bool]$result.Success; failureReason = $result.FailureReason; verifyPassed = [bool]$result.Success; logPath = $StageConfig[$stage].LogFile }
             if (-not $result.Success) {
                 $chainState = if ($result.Outcome -eq 'approval_required') { 'approval_required' } else { 'failed' }
@@ -2133,6 +2166,10 @@ function Invoke-DispatchChain {
         }
         Write-ChainSummary -State 'completed' -Stages $chainStages -Warnings @() -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
         Write-Log "🎉 파이프라인 완료 — impl/qa/integration 로그는 $LogDir 참조" SUCCESS
+        # CFG105 Done When 2: integration 성공 종료 후 DONE 패킷이 packets/에 남았는지 관찰 경고(비차단).
+        if (Get-Command Write-PostChainArchiveWarning -ErrorAction SilentlyContinue) {
+            Write-PostChainArchiveWarning -RepoRoot $RepoRoot
+        }
         if (Get-Command Remove-ImplPrestage -ErrorAction SilentlyContinue) { Remove-ImplPrestage -TaskId $TaskId }
         return 0
     } else {
@@ -2165,6 +2202,12 @@ function Invoke-DispatchChain {
             $ok = Test-QaVerdict -QaDispatchedAt $result.QaDispatchedAt -ExpectedCycle $result.CycleId -SealReason $result.SealReason -AbnormalExitCode $result.AbnormalExitCode
             if (-not $ok) { Write-FailureMarker -Stage 'qa' -Reason 'QA verdict 미통과 — ⑤ 진행 중단' }
             if ($ok -and $result.CycleId) { Resolve-ApprovalRecords -Stage 'qa' -ResolvingCycle $result.CycleId }
+        }
+        # CFG105 Done When 2: 단독 integration 성공 후에도 DONE 패킷 packets/ 잔존을 관찰 경고(비차단).
+        if ($ok -and $singleStage -eq 'integration' -and -not $DryRun) {
+            if (Get-Command Write-PostChainArchiveWarning -ErrorAction SilentlyContinue) {
+                Write-PostChainArchiveWarning -RepoRoot $RepoRoot
+            }
         }
         return [int](-not $ok)
     }
