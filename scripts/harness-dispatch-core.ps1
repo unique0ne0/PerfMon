@@ -1188,8 +1188,39 @@ function Dispatch-Stage {
     if ($Stage -eq 'qa' -and [string]::IsNullOrWhiteSpace($PromptOverride)) {
         $PromptOverride = "$($config.DefaultPrompt) 이번 QA verdict JSON의 cycle은 $($cycle.Id)로 기록해."
     }
+    # CFG107: ⑤ Integration이 커밋 범위를 패킷 Scope paths + 하네스 정상 산출물로 한정하도록,
+    # 착수 시점의 작업 트리 변경 중 그 밖의 파일(이번 커밋에서 제외할 대상)을 계산해 프롬프트에 주입한다.
+    # 제외 목록 계산 실패는 단계를 막지 않는다 — 정적 기본 프롬프트의 범위 한정 지시가 남는다.
+    if ($Stage -eq 'integration' -and [string]::IsNullOrWhiteSpace($PromptOverride)) {
+        $commitScopeNotice = ' [커밋 범위] 패킷 Scope paths와 아래 정상 산출물만 커밋하고 그 밖의 변경 파일은 커밋하지 마.'
+        try {
+            $commitPacket = $null
+            if (Get-Command Find-PacketByTaskId -ErrorAction SilentlyContinue) {
+                $commitPacket = Find-PacketByTaskId -SearchTaskId $TaskId -ProjectPath $RepoRoot
+            }
+            if (Get-Command Get-HarnessCommitAllowedArtifacts -ErrorAction SilentlyContinue) {
+                $allowedArtifacts = @(Get-HarnessCommitAllowedArtifacts -TaskId $TaskId)
+                $commitScopeNotice += " 정상 산출물 허용 목록: $($allowedArtifacts -join ', ')."
+            }
+            if (Get-Command Get-IntegrationCommitExclusions -ErrorAction SilentlyContinue) {
+                $exclusions = @(Get-IntegrationCommitExclusions -PacketPath $commitPacket -RepoRoot $RepoRoot -TaskId $TaskId)
+                $exclusionText = if ($exclusions.Count -gt 0) { $exclusions -join ', ' } else { '없음' }
+                $commitScopeNotice += " 이번 커밋에서 제외할 파일: $exclusionText."
+            }
+        } catch {
+            $commitScopeNotice += ' (제외 목록 계산 실패 — Scope paths와 정상 산출물만 커밋하고 그 밖의 변경 파일은 커밋하지 마.)'
+        }
+        $PromptOverride = "$($config.DefaultPrompt)$commitScopeNotice"
+    }
     # CFG087(060c): 재시도 attempt에 맥락 안내를 덧붙일 때 기준이 되는 원본 프롬프트.
     $basePrompt = if ([string]::IsNullOrWhiteSpace($PromptOverride)) { $config.DefaultPrompt } else { $PromptOverride }
+    # CFG108: opencode impl 어댑터가 파일 쓰기마다 BOM을 덧붙이는 오염이 재발한다(CFG104·105·107).
+    # 오염 감지 후 복원·재시도(Invoke-ImplPollutionRestore)와 별개로, 첫 시도부터 기계적 BOM 금지
+    # 지침을 프롬프트에 상시 포함해 재발 자체를 줄인다. 지침 문구는 opencode 조건부에만 넣는다.
+    $bomWriteInstruction = '파일을 쓸 때 BOM 없는 UTF-8로 저장해. .ps1은 BOM이 이미 있으니 그대로 유지하고, 기존 파일은 BOM 유무를 보존.'
+    if ($Stage -eq 'impl' -and $config.Adapter -eq 'opencode') {
+        $basePrompt = "$basePrompt $bomWriteInstruction"
+    }
     $qaDispatchedAt = Clear-QaArtifacts -Stage $Stage -Config $config
     Invoke-SessionHealthCheck -Stage $Stage
     $preflight = Invoke-StagePreflightGate -Stage $Stage -config $config -Cycle $cycle -LogRel $logRel -qaDispatchedAt $qaDispatchedAt
@@ -1231,7 +1262,9 @@ function Dispatch-Stage {
             continue
         }
         # CFG097: 직전 시도가 오염 복원으로 폐기됐으면 같은 모델 재시도 프롬프트에 복원 안내를 덧붙인다.
-        $attemptPrompt = $PromptOverride
+        # CFG108: 첫 시도부터 $basePrompt를 쓰도록 해 opencode impl BOM 금지 지침을 상시 포함한다
+        # (PromptOverride가 비면 기존 Build-ToolCommand 폴백과 동일하게 $config.DefaultPrompt를 쓴다).
+        $attemptPrompt = $basePrompt
         if ($pollutionRetryNotice) {
             $attemptPrompt = "$basePrompt`n`n$pollutionRetryNotice"
             $pollutionRetryNotice = $null
@@ -1619,6 +1652,7 @@ function Resolve-DispatchPlan {
         [Parameter(Mandatory=$false)][string]$ResetReason,
         [Parameter(Mandatory=$false)][switch]$ManualComplete,
         [Parameter(Mandatory=$false)][switch]$ManualAbort,
+        [Parameter(Mandatory=$false)][switch]$ChallengeReview,
         [Parameter(Mandatory=$false)][switch]$ResealQaVerdict,
         # CFG091(CFG-BL-071 (b)): 최초 봉인이 누락된 유효 QA verdict를 사후 봉인하는 관리자 액션.
         [Parameter(Mandatory=$false)][switch]$SealQaVerdict,
@@ -1761,6 +1795,23 @@ function Resolve-DispatchPlan {
     if (-not $Chain -and $Stage -ne 'impl' -and $Model) {
         Write-Log "-Model is ignored for [$Stage]." WARN
     }
+    if ($ChallengeReview) {
+        # CFG109: 챌린지 리뷰 수행용 디스패치 제약 — 단일 Stage만, Chain·QA 관리자 액션과 조합 금지.
+        if ($Chain) {
+            Write-Log '오류: -ChallengeReview는 -Chain과 함께 사용할 수 없습니다.' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'ChallengeReview cannot be combined with Chain' }
+        }
+        if ($ResealQaVerdict -or $SealQaVerdict -or $ManualComplete -or $ManualAbort -or $MarkProviderCooldown -or $ClearProviderCooldown -or $ResetStageLedger) {
+            Write-Log '오류: -ChallengeReview는 다른 관리자 액션 스위치와 조합할 수 없습니다.' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'ChallengeReview cannot be combined with admin-action switches' }
+        }
+        if (-not $Stage) {
+            Write-Log '오류: -ChallengeReview는 -Stage impl|qa|integration 과 함께 사용하세요 (리뷰어 슬롯은 -Stage로 선택).' ERROR
+            return [pscustomobject]@{ EarlyExit = $true; ExitCode = 1; Reason = 'ChallengeReview requires Stage' }
+        }
+        Write-Log 'CFG109: -ChallengeReview 디스패치 — Planning Challenge Review 게이트를 통과합니다(requested 상태에서 리뷰어 수행 허용).' INFO
+    }
+
     if ($Model) {
         Assert-ModelIdentifier -Value $Model -Source '-Model'
     }
@@ -1797,7 +1848,11 @@ function Resolve-DispatchPlan {
     $checkPipelinePacket = if ($packetMatches.Count -eq 1) { $packetMatches[0].FullName } else { $null }
 
     # CFG041: 조건부 기획 챌린지 리뷰 게이트
-    if ($checkPipelinePacket) {
+    # CFG109: -ChallengeReview 디스패치(리뷰어 수행 그 자체)는 게이트를 통과시킨다 — requested 상태에서
+    # 리뷰어를 하네스로 띄우면 "리뷰를 돌려야 completed인데 그 디스패치가 requested로 차단"되는
+    # catch-22(WS013 실측)를 피하기 위함이다. 리뷰 완료(Decision: completed) 전 ② impl 등 일반
+    # 디스패치는 여전히 fail-closed다.
+    if ($checkPipelinePacket -and -not $ChallengeReview) {
         try {
             Assert-PlanningChallengeReviewReady -PacketPath $checkPipelinePacket | Out-Null
         } catch {

@@ -66,6 +66,11 @@ param(
     # 종결된 이전 단계 뒤 첫 미완료 단계부터 안전하게 자동 재개(-Chain)할 수 있게 한다.
     [Parameter(Mandatory=$false)][switch]$ManualComplete,
     [Parameter(Mandatory=$false)][switch]$ManualAbort,
+    # CFG109: 챌린지 리뷰 수행용 디스패치 — Planning Challenge Review 게이트(Assert-PlangingChallengeReviewReady,
+    # requested=planning_challenge_pending fail-closed)를 통과시킨다. requested 상태에서 리뷰어(예: Gemini/agY)를
+    # 하네스로 띄우면 "리뷰를 돌려야 completed인데 그 디스패치가 requested로 차단"되는 catch-22(WS013 실측)를 피한다.
+    # 단일 Stage만 허용(-Chain 불가), 관리자 액션 스위치 조합 금지. 리뷰 완료 전 일반 ② 디스패치는 여전히 차단된다.
+    [Parameter(Mandatory=$false)][switch]$ChallengeReview,
     # CFG083(CFG-BL-056): ④-1(QA 봉인 이후·⑤ 이전에 사람이 만드는 커밋, 예: 마이그레이션 원격 적용)
     # 이후 ⑤ 게이트가 "treeHash mismatch"로 오차단되는 것을 해소하는 관리자 액션. verdict 판정 내용은
     # 건드리지 않고 treeHash 메타데이터만 명시적으로 갱신하며, -Reason을 필수 사유로 남긴다(감사 로그).
@@ -196,7 +201,7 @@ $StageConfig = @{
     }
     'integration' = @{
         Command = ''
-        DefaultPrompt = "작업 $TaskId — 현재 프로세스가 하네스가 시작한 유일한 Integration 본체다. 별도 Integration을 디스패치하거나 PID·락을 감시하거나 프로세스를 종료하지 마. 구현과 QA 리뷰가 완료되었어. 제로베이스에서 문제없는지 리뷰해. scripts/verify.ps1 게이트 통과 + 실동작 E2E 검증까지 마치고, 문제없으면 Integration을 로컬 완료 처리하고 Pipeline Status ⑤와 history.md를 갱신한 뒤, 관련 변경을 커밋하고 원격에 push까지 자동으로 수행해(추가 승인 대기 없음; 정본 하네스를 수정했으면 sync-configs.ps1 -Action Push -CommitTargets -PushTargets 까지 수행해야 배포와 하류 사본 커밋이 완료된다). 패킷 Amendment에 자동 commit/push를 명시적으로 금지하는 지시가 있으면 그 지시를 따르고 사유를 남겨. 만약 QA가 pass를 줬지만 이 Integration 단계에서 새 결함(탈출 결함)을 발견하면, .agents/briefs/logs/$TaskId-integration-findings.json 파일에 schemaVersion 3으로 {taskId, stage:'integration', findings:[{id, severity, confidenceTier, doneWhenItem, description, fixedInQa, evidence}]} 형태로 기록해. confidenceTier는 'RESOLVED'(코드 정적 대조 확정), 'OBSERVED'(테스트/실행 관측), 'CANDIDATE'(미실행 잠재 추론) 중 하나여야 하며, CANDIDATE 단독 지적은 verdict를 blocked로 만들지 않는다(RESOLVED/OBSERVED만 확정 결함으로 blocked 사유가 됨). 빈 findings 배열은 '탈출 결함을 발견하지 못했다'는 적극적 진술이며, 결함을 고쳐 놓고 findings를 비워 두는 것은 기록 위반으로 간주된다. 완료 정리(패킷 아카이브) 경계: 이 단계는 scripts/verify.ps1 게이트를 통과한 뒤에만 완료 정리를 할 수 있다. 순서는 (1) scripts/verify.ps1 게이트 통과 확인 → (2) Pipeline Status ⑤ 체크 → (3) .agents/briefs/archive/ 디렉터리가 없으면 생성 → (4) 대상 파일명을 직접 확인해 개별 git mv 로 패킷을 packets/ 에서 archive/ 로 옮긴다(와일드카드 금지) → (5) 라우터(handoff-log.md) 해당 행의 패킷 링크를 packets/<ID>.md 에서 archive/<ID>.md 로 치환 → (6) 변경을 커밋 → (7) 원격에 push. 검증 통과 전에는 절대 패킷을 옮기지 말 것. 옮긴 뒤에도 체인 요약(chain-summary.json)과 Find-PacketByTaskId 가 패킷을 찾아야 한다(archive 재해석)."
+        DefaultPrompt = "작업 $TaskId — 현재 프로세스가 하네스가 시작한 유일한 Integration 본체다. 별도 Integration을 디스패치하거나 PID·락을 감시하거나 프로세스를 종료하지 마. 구현과 QA 리뷰가 완료되었어. 제로베이스에서 문제없는지 리뷰해. scripts/verify.ps1 게이트 통과 + 실동작 E2E 검증까지 마치고, 문제없으면 Integration을 로컬 완료 처리하고 Pipeline Status ⑤와 history.md를 갱신한 뒤, 커밋 범위는 패킷 Scope paths와 하네스 정상 산출물(라우터·패킷·history.md·archive 이동분)로 한정해 신규 파일은 git add -- <허용 경로> 후 git commit -- <허용 경로>로 커밋하고, 그 밖의 변경 파일은 커밋하지 말고 경로만 보고(경고)해. 커밋하고 원격에 push까지 자동으로 수행해(추가 승인 대기 없음; 정본 하네스를 수정했으면 sync-configs.ps1 -Action Push -CommitTargets -PushTargets 까지 수행해야 배포와 하류 사본 커밋이 완료된다). 패킷 Amendment에 자동 commit/push를 명시적으로 금지하는 지시가 있으면 그 지시를 따르고 사유를 남겨. 만약 QA가 pass를 줬지만 이 Integration 단계에서 새 결함(탈출 결함)을 발견하면, .agents/briefs/logs/$TaskId-integration-findings.json 파일에 schemaVersion 3으로 {taskId, stage:'integration', findings:[{id, severity, confidenceTier, doneWhenItem, description, fixedInQa, evidence}]} 형태로 기록해. confidenceTier는 'RESOLVED'(코드 정적 대조 확정), 'OBSERVED'(테스트/실행 관측), 'CANDIDATE'(미실행 잠재 추론) 중 하나여야 하며, CANDIDATE 단독 지적은 verdict를 blocked로 만들지 않는다(RESOLVED/OBSERVED만 확정 결함으로 blocked 사유가 됨). 빈 findings 배열은 '탈출 결함을 발견하지 못했다'는 적극적 진술이며, 결함을 고쳐 놓고 findings를 비워 두는 것은 기록 위반으로 간주된다. 완료 정리(패킷 아카이브) 경계: 이 단계는 scripts/verify.ps1 게이트를 통과한 뒤에만 완료 정리를 할 수 있다. 순서는 (1) scripts/verify.ps1 게이트 통과 확인 → (2) Pipeline Status ⑤ 체크 → (3) .agents/briefs/archive/ 디렉터리가 없으면 생성 → (4) 대상 파일명을 직접 확인해 개별 git mv 로 패킷을 packets/ 에서 archive/ 로 옮긴다(와일드카드 금지) → (5) 라우터(handoff-log.md) 해당 행의 패킷 링크를 packets/<ID>.md 에서 archive/<ID>.md 로 치환 → (6) 변경을 커밋 → (7) 원격에 push. 검증 통과 전에는 절대 패킷을 옮기지 말 것. 옮긴 뒤에도 체인 요약(chain-summary.json)과 Find-PacketByTaskId 가 패킷을 찾아야 한다(archive 재해석)."
         LogFile = "$TaskLogPrefix-integration.log"
         FindingsFile = "$TaskLogPrefix-integration-findings.json"
         KillOnHang = $false
@@ -944,7 +949,7 @@ if ($MyInvocation.InvocationName -ne '.' -and ($MyInvocation.Line -notmatch '^\s
     $dispatchPlan = Resolve-DispatchPlan -TaskId $TaskId -Stage $Stage -Prompt $Prompt -Model $Model `
         -Chain:$Chain -DryRun:$DryRun -SkipVerdictGate:$SkipVerdictGate -ForceFreeModel:$ForceFreeModel `
         -ResetStageLedger:$ResetStageLedger -ResetReason $ResetReason `
-        -ManualComplete:$ManualComplete -ManualAbort:$ManualAbort -Reason $Reason `
+        -ManualComplete:$ManualComplete -ManualAbort:$ManualAbort -ChallengeReview:$ChallengeReview -Reason $Reason `
         -ResealQaVerdict:$ResealQaVerdict `
         -SealQaVerdict:$SealQaVerdict `
         -MarkProviderCooldown:$MarkProviderCooldown -ClearProviderCooldown:$ClearProviderCooldown `
