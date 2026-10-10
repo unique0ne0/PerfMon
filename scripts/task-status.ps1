@@ -2120,6 +2120,10 @@ $radioAll.Add_CheckedChanged({
 # 강제 새로고침 공통 핸들러 — 버튼 클릭과 F5 모두 이 경로를 탄다.
 $refreshAction = {
     # 수집이 진행 중이면 끝난 직후 한 번 더 돌도록 예약만 하고, 버튼은 수집이 끝날 때까지 비활성화한다.
+    # CR07: F5 명시 재시도 시 연속 타임아웃 카운터를 0으로 초기화한다.
+    if ($script:dashPhase -ne 'fault' -and $script:dashPhase -ne 'stopping') {
+        $script:dashConsecutiveTimeouts = 0
+    }
     $refreshButton.Enabled = $false
     Request-DashboardRefresh -Queue
 }
@@ -2347,8 +2351,8 @@ function Update-DashboardEventSchedule {
                 # heartbeat-only(Changed on lock/stage-state)는 live 중 무시하고 유휴에서만 actionable(CR09).
                 $actionable = $immediate -or (-not $script:dashHasLive)
                 if ($earliest -gt 0 -and $actionable) {
-                    $e = [datetime]::FromFileTimeUtc($earliest)
-                    $l = [datetime]::FromFileTimeUtc($latest)
+                    $e = New-Object System.DateTime($earliest, [System.DateTimeKind]::Utc)
+                    $l = New-Object System.DateTime($latest, [System.DateTimeKind]::Utc)
                     if (-not $script:dashDirtyFirst -or $e -lt $script:dashDirtyFirst) { $script:dashDirtyFirst = $e }
                     if (-not $script:dashDirtyLast -or $l -gt $script:dashDirtyLast) { $script:dashDirtyLast = $l }
                 }
@@ -2364,6 +2368,8 @@ function Update-DashboardEventSchedule {
     if ($visible -and -not $script:dashLastVisible -and $script:dashPhase -eq 'idle') {
         # 복원/가상 데스크톱 복귀 → 1초 이내 한 번 요청.
         $script:dashLastVisible = $visible
+        $script:dashDirtyFirst = $null
+        $script:dashDirtyLast = $null
         Request-DashboardRefresh -Queue
         return
     }
