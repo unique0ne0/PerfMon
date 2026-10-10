@@ -1628,6 +1628,314 @@ function Open-PacketFile {
     $routerPath = Join-Path $Row.ProjectPath '.agents\briefs\handoff-log.md'
     if (Test-Path $routerPath) { Start-Process -FilePath $routerPath | Out-Null }
 }
+# ── CFG111: 이벤트+폴링 혼합 스케줄러의 dot-source 가능한 순수 함수들 ─────────
+# GUI(STA) 밖에서도 테스트할 수 있도록 스케줄 판정·lifecycle을 순수 함수로 분리한다.
+# 시간/수집 경계는 인자로 주입해 30초·5초를 실제로 기다리지 않고 검증한다(설계 §D.2).
+
+function Test-DashboardWatchTarget {
+    # briefs 루트 기준 상대경로를 받아 감시 대상 여부/Changed 한정 heartbeat 여부를 돌려준다.
+    # C# 브리지 DashboardWatcherBridge.IsWatchedPath와 같은 계약이다(파리티는 회귀 테스트가 대조).
+    param([Parameter(Mandatory=$true)][string]$RelativePath)
+    $rel = $RelativePath.Replace('\', '/').TrimStart('/')
+    if ($rel -eq 'handoff-log.md' -or $rel -eq 'backlog.md') { return [pscustomobject]@{ Watched = $true; Heartbeat = $false } }
+    if ($rel -like 'packets/*.md' -or $rel -like 'archive/*.md') { return [pscustomobject]@{ Watched = $true; Heartbeat = $false } }
+    if ($rel -like 'logs/*') {
+        $leaf = $rel.Substring(5)
+        # heartbeat(Changed 한정 live 주기 병합): 락/lease. 나머지 logs 자산은 즉시 경로(CR09).
+        if ($leaf -like '*-stage-state.json' -or $leaf -like '.dispatch-lock-*') { return [pscustomobject]@{ Watched = $true; Heartbeat = $true } }
+        if ($leaf -like '.dispatch-*') { return [pscustomobject]@{ Watched = $true; Heartbeat = $false } }
+        if ($leaf -like '*-approval.json' -or $leaf -like '*-chain-runtime.json') { return [pscustomobject]@{ Watched = $true; Heartbeat = $false } }
+        if ($leaf -eq '.session-health.json') { return [pscustomobject]@{ Watched = $true; Heartbeat = $false } }
+    }
+    return [pscustomobject]@{ Watched = $false; Heartbeat = $false }
+}
+
+function Get-DashboardRefreshDecision {
+    # dirty 이벤트가 있을 때 "지금 수집을 요청해야 하는가"를 판정한다(트레일링 debounce + 최대 대기).
+    # 첫 dirty 이후 500ms가 지나면 요청(1초 이내), 연속 이벤트가 이어져도 2초를 넘기지 않는다.
+    param(
+        [bool]$Dirty,
+        [bool]$Visible,
+        [bool]$Collecting,
+        [datetime]$FirstDirtyAt,
+        [datetime]$LastDirtyAt,
+        [datetime]$Now,
+        [int]$DebounceMs = 500,
+        [int]$MaxWaitMs = 2000
+    )
+    if (-not $Dirty) { return $false }
+    if (-not $Visible) { return $false }
+    if ($Collecting) { return $false }
+    $sinceLast = ($Now - $LastDirtyAt).TotalMilliseconds
+    $sinceFirst = ($Now - $FirstDirtyAt).TotalMilliseconds
+    return (($sinceLast -ge $DebounceMs) -or ($sinceFirst -ge $MaxWaitMs))
+}
+
+function Get-DashboardPollMilliseconds {
+    # RUNNING/live는 기존 주기(기본 10초), 유휴는 90초 폴링(이벤트 유실·lease 만료 보완).
+    param([bool]$HasLive, [int]$IntervalSeconds = 10, [int]$IdleSeconds = 90)
+    if ($HasLive) { return ([math]::Max(1, $IntervalSeconds)) * 1000 }
+    return ([math]::Max(1, $IdleSeconds)) * 1000
+}
+
+function Resolve-DashboardCollectionTimeout {
+    # 수집 lifecycle 판정(순수): 수집 중 30초 초과 → 'timeout', 중단 유예 5초 초과 → 'fault'.
+    param(
+        [string]$Phase,
+        [double]$CollectingMs,
+        [double]$StoppingMs,
+        [int]$TimeoutMs = 30000,
+        [int]$StopGraceMs = 5000
+    )
+    if ($Phase -eq 'collecting' -and $CollectingMs -ge $TimeoutMs) { return 'timeout' }
+    if ($Phase -eq 'stopping' -and $StoppingMs -ge $StopGraceMs) { return 'fault' }
+    return 'none'
+}
+
+function Get-DashboardTimeoutRetryDecision {
+    # 자동 재수집은 연속 타임아웃 1회까지 — 자동 재시도 포함 2회째에서 차단(F5 명시 재시도만 허용).
+    param([int]$ConsecutiveTimeouts, [int]$MaxConsecutive = 2)
+    return ($ConsecutiveTimeouts -lt $MaxConsecutive)
+}
+
+function Resolve-DashboardRequestOutcome {
+    # 수집 요청 판정(순수): idle이면 즉시 수집('start'), 이미 수집 중이면 대기 슬롯 1개만 예약('queue'),
+    # stopping/fault(정리 완료 전)면 수집 불가('blocked' — 재시작만이 복구 수단).
+    param([string]$Phase)
+    if ($Phase -eq 'collecting') { return 'queue' }
+    if ($Phase -eq 'stopping' -or $Phase -eq 'fault') { return 'blocked' }
+    return 'start'
+}
+
+function Test-DashboardStaleResult {
+    # 수집 도중 필터가 바뀌었으면(결과의 ShowAll ≠ 현재 필터) 구결과를 폐기하고 최신 필터로 다시 수집한다.
+    param([bool]$ResultShowAll, [bool]$CurrentShowAll)
+    return ($ResultShowAll -ne $CurrentShowAll)
+}
+
+# C# 브리지 소스 — CLR 파일 감시 콜백이 경로 허용목록을 필터한 뒤 lock 안에서 dirty 상태만
+# 병합한다(CR01: PowerShell scriptblock을 ThreadPool에서 직접 실행하지 않는다). Add-Type은 여기서
+# 하지 않고 GUI 영역에서 형식 존재 검사를 거쳐 한 번만 컴파일한다. 단일 인용 here-string이라
+# PowerShell 5.1에서도 그대로 안전하게 파싱된다.
+$script:DashboardWatcherBridgeSource = @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+
+public class DashboardWatcherBridge
+{
+    private readonly object _lock = new object();
+    private readonly Dictionary<string, FileSystemWatcher> _watchers = new Dictionary<string, FileSystemWatcher>(StringComparer.OrdinalIgnoreCase);
+    private FileSystemWatcher _targetsWatcher = null;
+    private long _earliestTicks = 0;
+    private long _latestTicks = 0;
+    private bool _hasImmediate = false;
+    private bool _overflow = false;
+    private bool _targetsDirty = false;
+    private string _error = null;
+
+    public int WatcherCount
+    {
+        get { lock (_lock) { return _watchers.Count; } }
+    }
+
+    public static bool IsWatchedPath(string relPath, out bool heartbeat)
+    {
+        heartbeat = false;
+        if (string.IsNullOrEmpty(relPath)) { return false; }
+        string rel = relPath.Replace('\\', '/').TrimStart('/');
+        if (rel == "handoff-log.md" || rel == "backlog.md") { return true; }
+        if (rel.StartsWith("packets/", StringComparison.OrdinalIgnoreCase) && rel.EndsWith(".md", StringComparison.OrdinalIgnoreCase)) { return true; }
+        if (rel.StartsWith("archive/", StringComparison.OrdinalIgnoreCase) && rel.EndsWith(".md", StringComparison.OrdinalIgnoreCase)) { return true; }
+        if (rel.StartsWith("logs/", StringComparison.OrdinalIgnoreCase))
+        {
+            string leaf = rel.Substring("logs/".Length);
+            if (leaf.EndsWith("-stage-state.json", StringComparison.OrdinalIgnoreCase)) { heartbeat = true; return true; }
+            if (leaf.StartsWith(".dispatch-lock-", StringComparison.OrdinalIgnoreCase)) { heartbeat = true; return true; }
+            if (leaf.StartsWith(".dispatch-", StringComparison.OrdinalIgnoreCase)) { return true; }
+            if (leaf.EndsWith("-approval.json", StringComparison.OrdinalIgnoreCase)) { return true; }
+            if (leaf.EndsWith("-chain-runtime.json", StringComparison.OrdinalIgnoreCase)) { return true; }
+            if (leaf.Equals(".session-health.json", StringComparison.OrdinalIgnoreCase)) { return true; }
+        }
+        return false;
+    }
+
+    public void Configure(string[] roots)
+    {
+        HashSet<string> desired = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (roots != null) { foreach (string r in roots) { if (!string.IsNullOrEmpty(r)) { desired.Add(r); } } }
+        lock (_lock)
+        {
+            List<string> remove = new List<string>();
+            foreach (KeyValuePair<string, FileSystemWatcher> kv in _watchers) { if (!desired.Contains(kv.Key)) { remove.Add(kv.Key); } }
+            foreach (string key in remove) { RemoveWatcherLocked(key); }
+        }
+        foreach (string root in desired)
+        {
+            lock (_lock) { if (_watchers.ContainsKey(root)) { continue; } }
+            if (!Directory.Exists(root)) { continue; }
+            try
+            {
+                FileSystemWatcher w = new FileSystemWatcher(root);
+                w.Filter = "*";
+                w.IncludeSubdirectories = true;
+                w.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size;
+                w.Created += OnFsEvent;
+                w.Changed += OnFsEvent;
+                w.Deleted += OnFsEvent;
+                w.Renamed += OnRenamed;
+                w.Error += OnError;
+                w.EnableRaisingEvents = true;
+                lock (_lock)
+                {
+                    if (_watchers.ContainsKey(root)) { w.Dispose(); }
+                    else { _watchers[root] = w; }
+                }
+            }
+            catch (Exception ex) { RecordError(ex.Message); }
+        }
+    }
+
+    public void ConfigureTargetsWatch(string filePath)
+    {
+        lock (_lock) { RemoveTargetsWatcherLocked(); }
+        if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath)) { return; }
+        try
+        {
+            string dir = Path.GetDirectoryName(filePath);
+            FileSystemWatcher w = new FileSystemWatcher(dir);
+            w.Filter = Path.GetFileName(filePath);
+            w.IncludeSubdirectories = false;
+            w.NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size;
+            w.Changed += OnTargetsEvent;
+            w.Created += OnTargetsEvent;
+            w.Deleted += OnTargetsEvent;
+            w.Renamed += OnTargetsRenamed;
+            w.Error += OnError;
+            w.EnableRaisingEvents = true;
+            lock (_lock) { _targetsWatcher = w; }
+        }
+        catch (Exception ex) { RecordError(ex.Message); }
+    }
+
+    private void OnTargetsEvent(object sender, FileSystemEventArgs e) { lock (_lock) { _targetsDirty = true; } }
+    private void OnTargetsRenamed(object sender, RenamedEventArgs e) { lock (_lock) { _targetsDirty = true; } }
+
+    private static string RelativeOf(FileSystemWatcher w, string fullPath)
+    {
+        string root = w.Path;
+        if (!root.EndsWith(Path.DirectorySeparatorChar.ToString())) { root += Path.DirectorySeparatorChar; }
+        if (fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase)) { return fullPath.Substring(root.Length); }
+        return fullPath;
+    }
+
+    private void OnFsEvent(object sender, FileSystemEventArgs e)
+    {
+        FileSystemWatcher w = sender as FileSystemWatcher;
+        if (w == null) { return; }
+        bool heartbeat;
+        if (!IsWatchedPath(RelativeOf(w, e.FullPath), out heartbeat)) { return; }
+        bool changed = (e.ChangeType == WatcherChangeTypes.Changed);
+        Record(!(changed && heartbeat));
+    }
+
+    private void OnRenamed(object sender, RenamedEventArgs e)
+    {
+        FileSystemWatcher w = sender as FileSystemWatcher;
+        if (w == null) { return; }
+        bool heartbeat;
+        if (!IsWatchedPath(RelativeOf(w, e.FullPath), out heartbeat)) { return; }
+        Record(true);
+    }
+
+    private void OnError(object sender, ErrorEventArgs e)
+    {
+        Exception ex = e.GetException();
+        lock (_lock)
+        {
+            if (ex is InternalBufferOverflowException) { _overflow = true; }
+            if (ex != null) { _error = ex.Message; }
+        }
+    }
+
+    private void Record(bool immediate)
+    {
+        long now = DateTime.UtcNow.Ticks;
+        lock (_lock)
+        {
+            if (_earliestTicks == 0) { _earliestTicks = now; }
+            _latestTicks = now;
+            if (immediate) { _hasImmediate = true; }
+        }
+    }
+
+    private void RecordError(string message)
+    {
+        lock (_lock) { _error = message; }
+    }
+
+    private void RemoveWatcherLocked(string key)
+    {
+        FileSystemWatcher w;
+        if (!_watchers.TryGetValue(key, out w)) { return; }
+        try
+        {
+            w.EnableRaisingEvents = false;
+            w.Created -= OnFsEvent;
+            w.Changed -= OnFsEvent;
+            w.Deleted -= OnFsEvent;
+            w.Renamed -= OnRenamed;
+            w.Error -= OnError;
+            w.Dispose();
+        }
+        catch { }
+        _watchers.Remove(key);
+    }
+
+    private void RemoveTargetsWatcherLocked()
+    {
+        if (_targetsWatcher == null) { return; }
+        try
+        {
+            _targetsWatcher.EnableRaisingEvents = false;
+            _targetsWatcher.Changed -= OnTargetsEvent;
+            _targetsWatcher.Created -= OnTargetsEvent;
+            _targetsWatcher.Deleted -= OnTargetsEvent;
+            _targetsWatcher.Renamed -= OnTargetsRenamed;
+            _targetsWatcher.Error -= OnError;
+            _targetsWatcher.Dispose();
+        }
+        catch { }
+        _targetsWatcher = null;
+    }
+
+    public object[] SnapshotAndClear()
+    {
+        lock (_lock)
+        {
+            object[] snap = new object[] { _earliestTicks, _latestTicks, _hasImmediate, _overflow, _error, _targetsDirty, _watchers.Count };
+            _earliestTicks = 0;
+            _latestTicks = 0;
+            _hasImmediate = false;
+            _overflow = false;
+            _error = null;
+            _targetsDirty = false;
+            return snap;
+        }
+    }
+
+    public void DisposeAll()
+    {
+        lock (_lock)
+        {
+            List<string> keys = new List<string>(_watchers.Keys);
+            foreach (string key in keys) { RemoveWatcherLocked(key); }
+            RemoveTargetsWatcherLocked();
+        }
+    }
+}
+'@
+
 if ($MyInvocation.InvocationName -ne '.' -and ($MyInvocation.Line -notmatch '^\s*\.\s' -or $MyInvocation.Line -eq $null)) {
 $form = New-Object System.Windows.Forms.Form
 $form.Text = '패킷 상태 대시보드'
@@ -1864,17 +2172,61 @@ $form.Controls.Add($summaryPanel)
 $form.Controls.Add($controlPanel)
 $form.Controls.Add($statusStrip)
 # 디스크·프로세스 스캔(갱신 1회 ~1초)은 화면 스레드에서 돌리면 그동안 클릭·마우스 입력이 멈춘다.
-# 그래서 수집은 별도 runspace에서 하고, 화면 스레드는 끝난 결과를 그리기만 한다.
+# 그래서 수집은 별도 runspace에서 하고, 화면 스레드는 끝난 결과만 그린다.
 # runspace는 한 번 만들어 재사용한다 — 파일 파싱 캐시(FileParseCache 등)가 갱신 사이에 유지된다.
 $script:dashRunspace = $null
 $script:dashPs = $null
 $script:dashHandle = $null
 $script:dashQueued = $false
 $script:dashLoaded = $false
+# CFG111 lifecycle: idle → collecting → (completed | stopping → idle/fault).
+$script:dashPhase = 'idle'
+$script:dashGeneration = 0
+$script:dashStartedAt = $null
+$script:dashStopAsync = $null
+$script:dashStopStartedAt = $null
+$script:dashConsecutiveTimeouts = 0
+$script:dashHasLive = $false
+# CFG111 이벤트 스케줄: 브리지가 회수한 dirty를 PS 쪽에 누적하고 debounce로 요청한다.
+$script:dashDirtyFirst = $null
+$script:dashDirtyLast = $null
+$script:dashLastVisible = $true
+$script:dashWatchError = $null
+$script:dashWatchOverflow = $false
+$script:dashWatchDegraded = $false
+$script:dashWatchLastRecovery = [datetime]::MinValue
+$script:watcherBridge = $null
+
+# CFG111: C# 브리지 컴파일(형식 존재 검사로 중복 로드 방지). PS 5.1 C# 컴파일러 문법만 사용한다.
+if (-not ([System.Management.Automation.PSTypeName]'DashboardWatcherBridge').Type) {
+    try { Add-Type -TypeDefinition $script:DashboardWatcherBridgeSource -ErrorAction Stop } catch { $script:dashWatchError = $_.Exception.Message }
+}
+try { $script:watcherBridge = New-Object DashboardWatcherBridge } catch { $script:watcherBridge = $null; $script:dashWatchError = $_.Exception.Message }
+
+function Update-DashboardWatchers {
+    # briefs 감시 집합을 현재 프로젝트 목록으로 교체하고, harness-targets.txt는 별도 watcher로 감시한다.
+    if (-not $script:watcherBridge) { return }
+    try {
+        $roots = @(Get-HarnessProjects | ForEach-Object { Join-Path $_ '.agents\briefs' })
+        $script:watcherBridge.Configure([string[]]$roots)
+        $script:watcherBridge.ConfigureTargetsWatch((Join-Path $root 'harness-targets.txt'))
+    } catch {
+        $script:dashWatchError = $_.Exception.Message
+        $script:dashWatchDegraded = $true
+    }
+}
+Update-DashboardWatchers
+
 function Request-DashboardRefresh {
     param([switch]$Queue)
-    if ($script:dashHandle) {
-        # 이미 수집 중이면 겹쳐 돌리지 않는다. 수동 요청만 끝난 직후 한 번 더 돌도록 예약한다.
+    $outcome = Resolve-DashboardRequestOutcome -Phase $script:dashPhase
+    if ($outcome -eq 'blocked') {
+        # fault/stopping(정리 완료 전) 상태에서는 수집을 시작할 수 없다 — 재시작만이 복구 수단(CR07).
+        $script:dashQueued = $false
+        return
+    }
+    if ($outcome -eq 'queue') {
+        # 이미 수집 중이면 겹쳐 돌리지 않는다. 수동·이벤트 요청은 끝난 직후 한 번 더 돌도록 예약만 한다.
         if ($Queue) { $script:dashQueued = $true }
         return
     }
@@ -1898,14 +2250,181 @@ function Request-DashboardRefresh {
     }
     [void]$ps.AddScript($callText)
     $script:dashPs = $ps
+    $script:dashGeneration++
+    $script:dashStartedAt = [System.Diagnostics.Stopwatch]::StartNew()
+    $script:dashPhase = 'collecting'
     $script:dashHandle = $ps.BeginInvoke()
 }
+
+function Reset-DashboardRunspace {
+    # CR08: 재생성 때 runspace를 닫고 dashLoaded=false로 초기화한다(다음 수집에서 dot-source+Get-DashboardData 재실행).
+    if ($script:dashRunspace) {
+        try { $script:dashRunspace.Dispose() } catch { }
+        $script:dashRunspace = $null
+    }
+    $script:dashLoaded = $false
+}
+
+function Start-DashboardCollectionStop {
+    # 30초 초과: 기존 결과를 무효화(generation 증가)하고 BeginStop으로 비동기 중단한다(UI 대기 없음).
+    $script:dashGeneration++
+    $script:dashConsecutiveTimeouts++
+    $script:dashPhase = 'stopping'
+    $script:dashStopStartedAt = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $script:dashStopAsync = $script:dashPs.BeginStop($null, $null)
+    } catch {
+        $script:dashStopAsync = $null
+        Enter-DashboardFault -Reason ('수집 중단 요청 실패: ' + $_.Exception.Message)
+    }
+}
+
+function Complete-DashboardStopCleanup {
+    # 중단이 완료됨(IsCompleted) — EndStop·EndInvoke 예외 수거·Dispose 후 runspace 재생성.
+    $ps = $script:dashPs
+    $async = $script:dashStopAsync
+    if ($ps) {
+        try { if ($async) { $ps.EndStop($async) } } catch { }
+        try { [void]$ps.EndInvoke($script:dashHandle) } catch { }
+        try { $ps.Dispose() } catch { }
+    }
+    $script:dashPs = $null
+    $script:dashHandle = $null
+    $script:dashStopAsync = $null
+    $script:dashStopStartedAt = $null
+    Reset-DashboardRunspace
+    $script:dashPhase = 'idle'
+    $refreshButton.Enabled = $true
+    if (Get-DashboardTimeoutRetryDecision -ConsecutiveTimeouts $script:dashConsecutiveTimeouts) {
+        # 중단 유예 5초 이내 정상 정리 → 최신 필터로 자동 재수집 1회.
+        $updatedLabel.Text = '데이터 수집 타임아웃 — 자동 재수집 중...'
+        Request-DashboardRefresh
+    } else {
+        # 연속 타임아웃: 자동 재시도 중지, F5로만 명시 재시도(CR07).
+        $updatedLabel.Text = '데이터 수집 타임아웃이 연속 발생했습니다 — F5로 명시 재시도하세요.'
+    }
+}
+
+function Enter-DashboardFault {
+    # 중단 자체가 5초를 넘거나 중단 요청이 실패: 수집 핸들을 활성 슬롯에서 분리하고 fault로 전환한다.
+    # 기존 화면·시계·재시작 버튼은 유지하고 새 runspace를 계속 만들지 않는다 — 재시작 버튼이 복구 수단이다.
+    param([string]$Reason)
+    $script:dashPs = $null
+    $script:dashHandle = $null
+    $script:dashStopAsync = $null
+    $script:dashStopStartedAt = $null
+    $script:dashRunspace = $null
+    $script:dashLoaded = $false
+    $script:dashPhase = 'fault'
+    $script:dashQueued = $false
+    $refreshButton.Enabled = $false
+    $updatedLabel.Text = '데이터 수집 복구 실패 — [↺ 대시보드 재시작]을 사용하세요.'
+    if ($Reason) { Write-Host $Reason }
+}
+
+function Update-DashboardEventSchedule {
+    # 200ms 틱마다: 브리지 dirty 회수 → debounce 판정 → 요청. heartbeat는 live 중 병합하고
+    # 유휴에서만 즉시 경로를 탄다(CR09).
+    if ($script:watcherBridge) {
+        try {
+            $snap = $script:watcherBridge.SnapshotAndClear()
+            if ($snap) {
+                $earliest = [long]$snap[0]
+                $latest = [long]$snap[1]
+                $immediate = [bool]$snap[2]
+                $overflow = [bool]$snap[3]
+                $err = $snap[4]
+                $targetsDirty = [bool]$snap[5]
+                $script:dashWatchOverflow = $overflow
+                if ($overflow) { $script:dashWatchDegraded = $true }
+                if ($err) { $script:dashWatchError = [string]$err; $script:dashWatchDegraded = $true }
+                if ($targetsDirty) {
+                    # 대상 목록 변경 → 감시 집합 재구성 + 즉시 갱신.
+                    Update-DashboardWatchers
+                    if (-not $script:dashDirtyFirst) { $script:dashDirtyFirst = [datetime]::UtcNow }
+                    $script:dashDirtyLast = [datetime]::UtcNow
+                }
+                # heartbeat-only(Changed on lock/stage-state)는 live 중 무시하고 유휴에서만 actionable(CR09).
+                $actionable = $immediate -or (-not $script:dashHasLive)
+                if ($earliest -gt 0 -and $actionable) {
+                    $e = [datetime]::FromFileTimeUtc($earliest)
+                    $l = [datetime]::FromFileTimeUtc($latest)
+                    if (-not $script:dashDirtyFirst -or $e -lt $script:dashDirtyFirst) { $script:dashDirtyFirst = $e }
+                    if (-not $script:dashDirtyLast -or $l -gt $script:dashDirtyLast) { $script:dashDirtyLast = $l }
+                }
+            }
+        } catch {
+            $script:dashWatchError = $_.Exception.Message
+            $script:dashWatchDegraded = $true
+        }
+    }
+
+    # 가시성 전환 감지 — SizeChanged만으로 cloaked 해제를 놓치지 않도록 pollTimer에서 비교한다.
+    $visible = -not (Test-DashboardHidden)
+    if ($visible -and -not $script:dashLastVisible -and $script:dashPhase -eq 'idle') {
+        # 복원/가상 데스크톱 복귀 → 1초 이내 한 번 요청.
+        $script:dashLastVisible = $visible
+        Request-DashboardRefresh -Queue
+        return
+    }
+    $script:dashLastVisible = $visible
+
+    if ($script:dashWatchDegraded) {
+        # 감시가 불완전한 동안에는 폴링을 기존 주기로 되돌리고(빠른 보완), 90초마다 watcher 복구를 시도한다.
+        $timer.Interval = ([math]::Max(1, $IntervalSeconds)) * 1000
+        $suffix = if ($script:dashWatchOverflow) { ' · 감시 버퍼 overflow(폴링 복구)' } else { ' · 감시 열화' }
+        if ($updatedLabel.Text -notlike ('*' + $suffix + '*')) { $updatedLabel.Text = $updatedLabel.Text + $suffix }
+        if (([datetime]::UtcNow - $script:dashWatchLastRecovery).TotalSeconds -ge 90) {
+            if ($script:dashWatchOverflow -and $script:watcherBridge) { try { $script:watcherBridge.DisposeAll() } catch { } }
+            Update-DashboardWatchers
+            $script:dashWatchLastRecovery = [datetime]::UtcNow
+            if (-not $script:dashWatchError) { $script:dashWatchDegraded = $false; $script:dashWatchOverflow = $false }
+        }
+    }
+
+    if ($null -eq $script:dashDirtyFirst) { return }
+    if ($script:dashPhase -eq 'collecting') {
+        # 수집 중이면 끝난 뒤 한 번 더 돌도록 예약만 한다(대기 요청 최대 1개).
+        $script:dashQueued = $true
+        $script:dashDirtyFirst = $null
+        $script:dashDirtyLast = $null
+        return
+    }
+    if ($script:dashPhase -ne 'idle') { return }   # stopping/fault: 수집 불가 — dirty를 유지해 복구 후 반영한다.
+    if (Get-DashboardRefreshDecision -Dirty $true -Visible $visible -Collecting $false -FirstDirtyAt $script:dashDirtyFirst -LastDirtyAt $script:dashDirtyLast -Now ([datetime]::UtcNow)) {
+        $script:dashDirtyFirst = $null
+        $script:dashDirtyLast = $null
+        Request-DashboardRefresh
+    }
+}
+
 function Complete-DashboardRefresh {
+    # stopping: 완료/유예만 확인한다(비동기 — UI 블로킹 없음).
+    if ($script:dashPhase -eq 'stopping') {
+        if ($script:dashStopAsync -and $script:dashStopAsync.IsCompleted) {
+            Complete-DashboardStopCleanup
+        } elseif ($script:dashStopStartedAt -and (Resolve-DashboardCollectionTimeout -Phase 'stopping' -CollectingMs 0 -StoppingMs $script:dashStopStartedAt.Elapsed.TotalMilliseconds) -eq 'fault') {
+            Enter-DashboardFault -Reason '수집 중단이 5초를 넘겨 정리하지 못했습니다.'
+        }
+        return
+    }
+    if ($script:dashPhase -eq 'fault') { return }
+
+    # collecting: 30초 초과면 중단 시작.
+    if ($script:dashPhase -eq 'collecting' -and $script:dashHandle -and $script:dashStartedAt) {
+        if ((Resolve-DashboardCollectionTimeout -Phase 'collecting' -CollectingMs $script:dashStartedAt.Elapsed.TotalMilliseconds -StoppingMs 0) -eq 'timeout') {
+            Start-DashboardCollectionStop
+            return
+        }
+    }
+
     if (-not $script:dashHandle -or -not $script:dashHandle.IsCompleted) { return }
     $ps = $script:dashPs
     $handle = $script:dashHandle
     $script:dashPs = $null
     $script:dashHandle = $null
+    $script:dashStartedAt = $null
+    $script:dashPhase = 'idle'
     $data = $null
     $errorText = $null
     try {
@@ -1914,6 +2433,7 @@ function Complete-DashboardRefresh {
             $errorText = if ($ps.Streams.Error.Count -gt 0) { [string]$ps.Streams.Error[0] } else { '결과 없음' }
         } else {
             $script:dashLoaded = $true
+            $script:dashConsecutiveTimeouts = 0   # 정상 수집 성공 → 타임아웃 카운터 초기화(CR07).
         }
     } catch {
         $errorText = $_.Exception.Message
@@ -1923,16 +2443,16 @@ function Complete-DashboardRefresh {
     $refreshButton.Enabled = $true
     if ($errorText) {
         $updatedLabel.Text = '데이터 갱신 실패: ' + $errorText
-    } elseif ($data.ShowAll -ne $script:showAllFilter) {
+    } elseif (Test-DashboardStaleResult -ResultShowAll $data.ShowAll -CurrentShowAll $script:showAllFilter) {
         # 수집 도중 필터가 바뀌었다 — 이 결과는 버리고 현재 필터로 다시 수집한다.
         $script:dashQueued = $true
     } else {
         Update-Dashboard -Grid $grid -EmptyLabel $emptyLabel -UpdatedLabel $updatedLabel -TierBadge $tierBadge -SessionBadge $sessionBadge -ApprovalBadge $approvalBadge -HarnessBadge $harnessBadge -SessionGrid $sessionGrid -ToolTip $toolTip -Data $data
-        # 진행 중인 작업이 없으면 갱신 주기를 늘린다(최소 30초). 새 디스패치는 늦어도 한 주기 안에 보이고,
-        # 즉시 확인이 필요하면 F5가 있다. 진행 중 작업이 생기면 다음 갱신부터 원래 주기로 돌아온다.
+        # RUNNING/live 면 기존 주기(기본 10초), 유휴면 90초 폴링으로 늘린다(CFG111).
         $liveStatuses = @('RUNNING', 'HANG', 'STANDBY', 'STALLED', 'RESUME', 'BLOCKED')
         $hasLive = @($data.Rows | Where-Object { $liveStatuses -contains $_.Status }).Count -gt 0
-        $timer.Interval = $(if ($hasLive) { $IntervalSeconds } else { [math]::Max($IntervalSeconds * 3, 30) }) * 1000
+        $script:dashHasLive = $hasLive
+        $timer.Interval = Get-DashboardPollMilliseconds -HasLive $hasLive -IntervalSeconds $IntervalSeconds -IdleSeconds 90
     }
     if ($script:dashQueued) {
         $script:dashQueued = $false
@@ -1940,8 +2460,8 @@ function Complete-DashboardRefresh {
     }
 }
 $timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = $IntervalSeconds * 1000
-# 최소화된 창은 아무도 보지 않으므로 갱신하지 않는다. 복원되면 SizeChanged가 즉시 한 번 갱신한다.
+$timer.Interval = Get-DashboardPollMilliseconds -HasLive $false -IntervalSeconds $IntervalSeconds -IdleSeconds 90
+# 최소화된 창은 아무도 보지 않으므로 갱신하지 않는다. 복원되면 pollTimer가 가시성 전환을 잡아 갱신한다.
 # 최소화되었거나 DWM이 숨김(cloaked: 다른 가상 데스크톱 등)으로 표시한 창은 보는 사람이 없다.
 # 다른 창에 단순히 가려진 경우는 공개 API로 판정할 수 없어 갱신을 유지한다.
 Add-Type -Namespace DashWin32 -Name Dwm -MemberDefinition '[System.Runtime.InteropServices.DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(System.IntPtr hwnd, int attr, out int value, int size);'
@@ -1951,6 +2471,7 @@ function Test-DashboardHidden {
     try { [void][DashWin32.Dwm]::DwmGetWindowAttribute($form.Handle, 14, [ref]$cloaked, 4) } catch { return $false }
     return ($cloaked -ne 0)
 }
+# 주기 폴링: live는 기존 주기, 유휴는 90초. hidden이면 새 수집은 보류한다(타임아웃/정리는 pollTimer가 계속 처리).
 $timer.Add_Tick({ if (-not (Test-DashboardHidden)) { Request-DashboardRefresh } })
 $script:dashLastWindowState = $form.WindowState
 $form.Add_SizeChanged({
@@ -1960,9 +2481,10 @@ $form.Add_SizeChanged({
     }
     $script:dashLastWindowState = $current
 })
+# 200ms 폴링 틱: 이벤트 스케줄 + 완료/오류/타임아웃 처리(CFG111 — 고정 30초 단조 증가 Stopwatch).
 $pollTimer = New-Object System.Windows.Forms.Timer
 $pollTimer.Interval = 200
-$pollTimer.Add_Tick({ Complete-DashboardRefresh })
+$pollTimer.Add_Tick({ Update-DashboardEventSchedule; Complete-DashboardRefresh })
 $clockTimer = New-Object System.Windows.Forms.Timer
 $clockTimer.Interval = 1000
 $clockTimer.Add_Tick({ $clockLabel.Text = '현재: ' + (Get-Date).ToString('HH:mm:ss KST') })
@@ -1973,7 +2495,16 @@ $pollTimer.Start()
 $clockTimer.Start()
 Request-DashboardRefresh
 [void]$form.ShowDialog()
+# 종료: 새 수집을 막기 위해 phase를 fault로 전환하고 timer 정지·watcher 해제/Dispose.
+# 수집 정리가 지연돼도 폼 종료를 무기한 기다리지 않는다(정상 정리는 비동기 — FormClosed가 기다리지 않음).
+$script:dashPhase = 'fault'
 $timer.Stop()
 $pollTimer.Stop()
 $clockTimer.Stop()
+if ($script:watcherBridge) { try { $script:watcherBridge.DisposeAll() } catch { } }
+if ($script:dashPs) { try { $script:dashPs.Dispose() } catch { } }
+if ($script:dashRunspace) { try { $script:dashRunspace.Dispose() } catch { } }
+$script:dashPs = $null
+$script:dashHandle = $null
+$script:dashQueued = $false
 }
