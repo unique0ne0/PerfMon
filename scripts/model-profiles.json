@@ -43,7 +43,7 @@
   },
   "plannerRouting": {
     "claude": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "claude-integration" },
-    "codex": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "codex-integration" },
+    "codex": { "implementationRoute": "independent-planned", "qaProfile": "gemini-qa", "integrationProfile": "codex-integration" },
     "antigravity": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "gemini-integration" },
     "opencode": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "claude-integration" },
     "gemini": { "implementationRoute": "gemini-implementation", "qaProfile": "codex-qa", "integrationProfile": "gemini-integration" }
