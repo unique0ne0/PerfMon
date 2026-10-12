@@ -39,6 +39,15 @@ $ContextWarnTokens = 150000
 $ContextStrongWarnTokens = 200000
 $ContextWarnReissueMinutes = 60
 $ContextStrongWarnReissueMinutes = 20
+# CFG116: the 4/6/8h time warning is a secondary "forgotten session" nudge, but a
+# long session whose context stays small costs almost nothing to keep re-reading,
+# so the time warning is noise there.  It fires only once the last context has
+# grown to this many tokens.  100K is the start of the measured cost band (the
+# backlog draft used 60K, but the first-response baseline is already ~43-67K with
+# a ~50K median, so 60K would never filter anything).  When the token count is
+# unknown ($lastContextTokens $null or <= 0) the gate is skipped -- losing the
+# warning is worse than an over-warning (design 3).
+$TimeWarnMinContextTokens = 100000
 
 function Exit-Silent { exit 0 }
 
@@ -450,7 +459,16 @@ try {
 
 $elapsedHours = if ($firstTimestamp) { [math]::Max(0, ($now - $firstTimestamp).TotalHours) } else { $null }
 
-if ($null -ne $elapsedHours) {
+# CFG116 gate: a small context (below $TimeWarnMinContextTokens) suppresses the
+# time warning without touching the issued keys, so when the context later grows
+# past the gate the still-due 4/6/8h thresholds can fire then.  Unknown tokens
+# ($null or <= 0) skip the gate -- the safety net (design 3).
+$timeWarnGateActive = ($null -ne $lastContextTokens -and $lastContextTokens -gt 0 -and $lastContextTokens -lt $TimeWarnMinContextTokens)
+
+if ($null -ne $elapsedHours -and -not $timeWarnGateActive) {
+    # Collect the thresholds that are due AND would fire right now (no prior
+    # issuance, or the 60-min cooldown has elapsed), in ascending order.
+    $dueTimeThresholds = New-Object System.Collections.ArrayList
     foreach ($threshold in @(4, 6, 8)) {
         if ($elapsedHours -ge $threshold) {
             $key = "${sessionKey}-activity-$threshold"
@@ -460,10 +478,22 @@ if ($null -ne $elapsedHours) {
                 if ([datetime]::TryParse([string]$issued[$key], [ref]$parsedLast)) { $lastIssued = $parsedLast }
             }
             if ($null -eq $lastIssued -or ($now - $lastIssued.ToUniversalTime()).TotalMinutes -ge 60) {
+                [void]$dueTimeThresholds.Add($threshold)
+            }
+        }
+    }
+    if ($dueTimeThresholds.Count -gt 0) {
+        # Warning-burst guard (design 2b): a long low-context session crossing the
+        # gate can have several thresholds due at once.  Fire only the highest and
+        # record the lower ones (without emitting) so they do not re-fire later.
+        $fireThreshold = $dueTimeThresholds[$dueTimeThresholds.Count - 1]
+        foreach ($threshold in $dueTimeThresholds) {
+            $key = "${sessionKey}-activity-$threshold"
+            if ($threshold -eq $fireThreshold) {
                 $message = "Session has been active for $([math]::Round($elapsedHours, 1))h (>=${threshold}h). $carryoverGuidance"
                 [void]$warnings.Add($message)
-                $issued[$key] = $now.ToString('o')
             }
+            $issued[$key] = $now.ToString('o')
         }
     }
 }
