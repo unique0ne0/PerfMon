@@ -52,9 +52,10 @@ function Get-FileStamp {
 # 토큰이다: [다음순서], [사용자결정대기: …], [시간경과: …], [지금처리], [승인대기].
 $script:CarryoverKnownTags = @('지금처리', '사용자결정대기', '승인대기', '시간경과', '다음순서')
 
-# 버킷 출력 순서(우선순위 높음 → 낮음).
+# 버킷 출력 순서(우선순위 높음 → 낮음).  지금처리=즉시 실행 대상이라 최상위,
+# 승인대기는 사용자 응답을 기다리는 점에서 사용자결정대기 바로 뒤에 둔다.
 $script:CarryoverBucketOrder = @(
-    '사용자결정대기', '다음순서',
+    '지금처리', '사용자결정대기', '승인대기', '다음순서',
     '시간경과·도래', '시간경과·미도래', '시간경과·날짜 미상',
     '기타', '태그 없음'
 )
@@ -82,17 +83,21 @@ function Get-CarryoverTimeStatus {
 }
 
 function Get-CarryoverBucket {
-    # 한 줄에 태그가 여럿이면 우선순위 사용자결정대기 > 다음순서 > 시간경과 >
-    # 기타 태그 > 태그 없음으로 한 버킷에만 넣는다.
+    # 한 줄에 태그가 여럿이면 우선순위 지금처리 > 사용자결정대기 > 승인대기 >
+    # 다음순서 > 시간경과 > 태그 없음으로 한 버킷에만 넣는다.
     param([string]$Line)
     $found = @()
     foreach ($m in [regex]::Matches($Line, '\[([^\]]*)\]')) {
         $name = ($m.Groups[1].Value -split '[:\(]', 2)[0].Trim()
         if (($script:CarryoverKnownTags -contains $name) -and ($found -notcontains $name)) { $found += $name }
     }
+    if ($found -contains '지금처리') { return '지금처리' }
     if ($found -contains '사용자결정대기') { return '사용자결정대기' }
+    if ($found -contains '승인대기') { return '승인대기' }
     if ($found -contains '다음순서') { return '다음순서' }
     if ($found -contains '시간경과') { return "시간경과·$(Get-CarryoverTimeStatus $Line)" }
+    # 기타: CarryoverKnownTags의 모든 태그가 전용 버킷을 가져 현재는 도달 불가.
+    # 향후 태그만 추가하고 분기를 빠뜨릴 때를 위한 안전망으로 유지한다.
     if ($found.Count -gt 0) { return '기타' }
     return '태그 없음'
 }
