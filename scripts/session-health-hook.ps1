@@ -1,6 +1,11 @@
 ﻿param(
     [string]$ProjectRoot,
-    [int]$ContextWindowSize = 200000
+    # Deprecated (CFG112): the context warning now uses the absolute token
+    # thresholds below, not a 200K-relative ratio.  Kept as an ignored
+    # compatibility parameter (default 0) so older callers that still pass
+    # -ContextWindowSize <N> do not hit a parameter-binding error that would
+    # silence the whole hook (challenge finding 2).
+    [int]$ContextWindowSize = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,6 +31,14 @@ $TurnMaxSessions = 10
 # Cap a *fresh* scan of a huge transcript to the trailing 8MB (challenge finding 2):
 # the turn count is then a lower bound (undercount allowed) but the hook never times out.
 $TurnScanByteCap = 8MB
+# CFG112: context usage warnings use absolute token thresholds, not a fixed
+# 200K-denominator ratio (a model with a 1M window would otherwise show 177K as
+# 88.8%).  100K = general warning; 150K = strong warning and the only level that
+# advances the tool/MCP review counter.  The strong warning re-fires sooner.
+$ContextWarnTokens = 100000
+$ContextStrongWarnTokens = 150000
+$ContextWarnReissueMinutes = 60
+$ContextStrongWarnReissueMinutes = 20
 
 function Exit-Silent { exit 0 }
 
@@ -171,12 +184,13 @@ if (-not $turnIdLists.Contains($sessionId)) {
 }
 
 # Project-scoped (not session-scoped) counter: how many distinct sessions have
-# hit the context-70 threshold since the last tool/MCP review suggestion was
-# emitted. Mirrors the orchestration-runbook §7 idiom — observe, then only
-# propose after 5 cumulative occurrences, never auto-apply. (5, not §7's 2:
-# context-70 crossings have many innocent causes — long sessions, large file
-# reads — so this needs a higher bar than the concurrency-observation idiom
-# it borrows the cadence pattern from.)
+# hit the context-150k (strong) threshold since the last tool/MCP review
+# suggestion was emitted. Mirrors the orchestration-runbook §7 idiom — observe,
+# then only propose after 5 cumulative occurrences, never auto-apply. (5, not
+# §7's 2: context-150k crossings have many innocent causes — long sessions,
+# large file reads — so this needs a higher bar than the concurrency-observation
+# idiom it borrows the cadence pattern from.  Only 150K crossings advance it,
+# not 100K, to keep the original ~140K crossing frequency.)
 $toolReviewOccurrences = 0
 if ($state -and $state.toolReviewOccurrences) {
     try { $toolReviewOccurrences = [int]$state.toolReviewOccurrences } catch { $toolReviewOccurrences = 0 }
@@ -456,18 +470,22 @@ if ($null -ne $elapsedHours) {
 
 $toolReviewSuggestion = $null
 
-if ($null -ne $lastContextTokens -and $ContextWindowSize -gt 0) {
-    $usedPercentage = [math]::Round(($lastContextTokens / $ContextWindowSize) * 100, 1)
-    if ($usedPercentage -ge 70) {
-        $key = "${sessionKey}-context-70"
+# CFG112: two mutually exclusive absolute-token levels.  A session at/above the
+# strong threshold emits ONLY the strong warning (never both); if the strong
+# warning is inside its 20-min cooldown the block stays silent rather than
+# falling back to the 100K general warning.  $ContextWindowSize is intentionally
+# unused here (deprecated compatibility parameter — see the param block).
+if ($null -ne $lastContextTokens -and $lastContextTokens -gt 0) {
+    if ($lastContextTokens -ge $ContextStrongWarnTokens) {
+        $key = "${sessionKey}-context-150k"
         $isFirstThisSession = -not $issued.ContainsKey($key)
         $lastIssued = $null
         if ($issued.ContainsKey($key)) {
             [datetime]$parsedLast = [datetime]::MinValue
             if ([datetime]::TryParse([string]$issued[$key], [ref]$parsedLast)) { $lastIssued = $parsedLast }
         }
-        if ($null -eq $lastIssued -or ($now - $lastIssued.ToUniversalTime()).TotalMinutes -ge 60) {
-            [void]$warnings.Add("Context usage is at ${usedPercentage}% ($lastContextTokens / $ContextWindowSize tokens). Consider /compact. $carryoverGuidance")
+        if ($null -eq $lastIssued -or ($now - $lastIssued.ToUniversalTime()).TotalMinutes -ge $ContextStrongWarnReissueMinutes) {
+            [void]$warnings.Add("Context usage is at $lastContextTokens tokens (>=150K). [강한 경고] 진행 중인 단계가 끝나는 지점에서 handoff 후 새 세션을 시작하라. $carryoverGuidance")
             $issued[$key] = $now.ToString('o')
         }
         if ($isFirstThisSession) {
@@ -475,7 +493,7 @@ if ($null -ne $lastContextTokens -and $ContextWindowSize -gt 0) {
             if ($toolReviewOccurrences -ge 5) {
                 $toolReviewSuggestion = @'
 === Tool/MCP Review Suggested ===
-이 프로젝트에서 컨텍스트 사용률이 여러 세션에 걸쳐 반복적으로 70%를 넘었습니다.
+이 프로젝트에서 컨텍스트 사용량이 여러 세션에 걸쳐 반복적으로 150K 토큰을 넘었습니다.
 다음 세션 유휴 시점에:
 1. 이 프로젝트의 .claude/settings.local.json permissions.deny와 현재 로드된 MCP/내장 도구 목록을 대조한다.
 2. deny되지 않은 도구 중 이 프로젝트의 실제 코드/문서/패킷에서 사용 근거가 없는 것을 grep으로 확인한다
@@ -486,6 +504,17 @@ if ($null -ne $lastContextTokens -and $ContextWindowSize -gt 0) {
 '@
                 $toolReviewOccurrences = 0
             }
+        }
+    } elseif ($lastContextTokens -ge $ContextWarnTokens) {
+        $key = "${sessionKey}-context-100k"
+        $lastIssued = $null
+        if ($issued.ContainsKey($key)) {
+            [datetime]$parsedLast = [datetime]::MinValue
+            if ([datetime]::TryParse([string]$issued[$key], [ref]$parsedLast)) { $lastIssued = $parsedLast }
+        }
+        if ($null -eq $lastIssued -or ($now - $lastIssued.ToUniversalTime()).TotalMinutes -ge $ContextWarnReissueMinutes) {
+            [void]$warnings.Add("Context usage is at $lastContextTokens tokens (>=100K). $carryoverGuidance")
+            $issued[$key] = $now.ToString('o')
         }
     }
 }
