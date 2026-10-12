@@ -6,9 +6,11 @@
     #          silent unless another session added/changed/consumed a carry-over file since
     #          this session last looked, or the session resumes after IdleHours of no prompts.
     [ValidateSet('Start', 'Prompt')][string]$Event = 'Start',
-    # text = plain stdout (Claude, Codex).  gemini = hookSpecificOutput.additionalContext JSON,
-    # because Gemini CLI rejects plain-text stdout.
-    [ValidateSet('text', 'gemini')][string]$Format = 'text',
+    # text   = plain stdout (Claude, Codex).  gemini = hookSpecificOutput.additionalContext JSON,
+    #          because Gemini CLI rejects plain-text stdout.
+    # claude = SessionStart JSON carrying both the user-facing "처리 대기 목록" (systemMessage)
+    #          and the existing carry-over body (hookSpecificOutput.additionalContext).
+    [ValidateSet('text', 'gemini', 'claude')][string]$Format = 'text',
     [double]$IdleHours = 2
 )
 
@@ -45,12 +47,179 @@ function Get-FileStamp {
     return "$($File.LastWriteTimeUtc.Ticks):$($File.Length)"
 }
 
+# ── 처리 대기 목록 (사용자 화면 systemMessage, CFG113) ────────────────────────
+# carry-over 상태 태그(session-carryover SKILL.md).  태그는 미결 줄 끝의 대괄호
+# 토큰이다: [다음순서], [사용자결정대기: …], [시간경과: …], [지금처리], [승인대기].
+$script:CarryoverKnownTags = @('지금처리', '사용자결정대기', '승인대기', '시간경과', '다음순서')
+
+# 버킷 출력 순서(우선순위 높음 → 낮음).
+$script:CarryoverBucketOrder = @(
+    '사용자결정대기', '다음순서',
+    '시간경과·도래', '시간경과·미도래', '시간경과·날짜 미상',
+    '기타', '태그 없음'
+)
+
+function Get-CarryoverItemId {
+    param([string]$Line)
+    $m = [regex]::Match($Line, 'CO-\d{4}-\d{4}-\d{2}')
+    if ($m.Success) { return $m.Value }
+    return $null
+}
+
+function Get-CarryoverTimeStatus {
+    # [시간경과: 2026-10-14경] → 도래(오늘 포함)/미도래.  날짜가 없거나 잘못된
+    # 날짜(예: 2026-02-31)면 날짜 미상.  예외가 훅 전체를 침묵시키지 않도록 try/catch.
+    param([string]$Line)
+    $m = [regex]::Match($Line, '\[시간경과[^\]]*?(\d{4})-(\d{2})-(\d{2})')
+    if (-not $m.Success) { return '날짜 미상' }
+    try {
+        $date = [datetime]::new([int]$m.Groups[1].Value, [int]$m.Groups[2].Value, [int]$m.Groups[3].Value)
+    } catch {
+        return '날짜 미상'
+    }
+    if ($date -le (Get-Date).Date) { return '도래' }
+    return '미도래'
+}
+
+function Get-CarryoverBucket {
+    # 한 줄에 태그가 여럿이면 우선순위 사용자결정대기 > 다음순서 > 시간경과 >
+    # 기타 태그 > 태그 없음으로 한 버킷에만 넣는다.
+    param([string]$Line)
+    $found = @()
+    foreach ($m in [regex]::Matches($Line, '\[([^\]]*)\]')) {
+        $name = ($m.Groups[1].Value -split '[:\(]', 2)[0].Trim()
+        if (($script:CarryoverKnownTags -contains $name) -and ($found -notcontains $name)) { $found += $name }
+    }
+    if ($found -contains '사용자결정대기') { return '사용자결정대기' }
+    if ($found -contains '다음순서') { return '다음순서' }
+    if ($found -contains '시간경과') { return "시간경과·$(Get-CarryoverTimeStatus $Line)" }
+    if ($found.Count -gt 0) { return '기타' }
+    return '태그 없음'
+}
+
+function Get-CarryoverPendingMessage {
+    # 미소비 인계 파일들에서 미체크 `- [ ]` 항목만 추려 사용자 화면용 한 줄
+    # 목록(systemMessage)을 만든다.  항목이 0건이면 $null을 돌려 systemMessage
+    # 키 자체를 만들지 않는다.  실패는 호출자가 삼킨다(세션 시작을 막지 않는다).
+    param([System.IO.FileInfo[]]$Files, [int]$MaxBytes = 4096)
+
+    $allFiles = @($Files)
+    $resolvedIds = @{}
+    $seenIds = @{}
+    $items = New-Object System.Collections.ArrayList
+
+    # 1차: 해결된 ID 수집(해결 기록 우선).  `- [x]`는 어디서든, `- CO-…` 줄은
+    # `해결·폐기` 절 안에서만 해결로 본다.  코드 펜스 안은 제외한다.
+    foreach ($file in $allFiles) {
+        $lines = $null
+        try { $lines = @(Get-Content -LiteralPath $file.FullName -Encoding UTF8) } catch { continue }
+        $inFence = $false
+        $inResolvedSection = $false
+        foreach ($line in $lines) {
+            if ($line -match '^\s*```') { $inFence = -not $inFence; continue }
+            if ($inFence) { continue }
+            if ($line -match '^\s*#{1,6}\s') {
+                $inResolvedSection = ($line -match '^\s*#{1,6}\s*해결')
+                continue
+            }
+            $id = Get-CarryoverItemId $line
+            if (($line -match '^\s*- \[x\]') -or ($inResolvedSection -and $id)) {
+                if ($id) { $resolvedIds[$id] = $true }
+            }
+        }
+    }
+
+    # 2차: 미체크 항목 수집.  최상위 `- [ ]` 줄만, 코드 펜스·인용문(`>`) 제외,
+    # 해결된 ID·중복 ID는 1회만.
+    foreach ($file in $allFiles) {
+        $lines = $null
+        try { $lines = @(Get-Content -LiteralPath $file.FullName -Encoding UTF8) } catch { continue }
+        $inFence = $false
+        foreach ($line in $lines) {
+            if ($line -match '^\s*```') { $inFence = -not $inFence; continue }
+            if ($inFence) { continue }
+            if ($line -match '^\s*>') { continue }
+            if ($line -notmatch '^- \[ \]') { continue }
+            $id = Get-CarryoverItemId $line
+            if ($id) {
+                if ($resolvedIds.ContainsKey($id)) { continue }
+                if ($seenIds.ContainsKey($id)) { continue }
+                $seenIds[$id] = $true
+            }
+            [void]$items.Add($line)
+        }
+    }
+
+    if ($items.Count -eq 0) { return $null }
+
+    # 3차: 태그별 분류.
+    $buckets = @{}
+    foreach ($key in $script:CarryoverBucketOrder) { $buckets[$key] = New-Object System.Collections.ArrayList }
+    foreach ($item in $items) {
+        $bucket = Get-CarryoverBucket $item
+        if (-not $buckets.ContainsKey($bucket)) { $buckets[$bucket] = New-Object System.Collections.ArrayList }
+        [void]$buckets[$bucket].Add($item)
+    }
+
+    $allLines = New-Object System.Collections.ArrayList
+    [void]$allLines.Add("== 처리 대기 목록: 인계 파일 $($allFiles.Count)개 · 미체크 $($items.Count)건 ==")
+    foreach ($key in $script:CarryoverBucketOrder) {
+        if ($buckets[$key].Count -eq 0) { continue }
+        [void]$allLines.Add("[$key]")
+        foreach ($l in $buckets[$key]) { [void]$allLines.Add($l) }
+    }
+
+    # 4차: 4096바이트 상한 — 줄 단위로만 자른다(UTF-8 코드포인트·줄 분할 금지).
+    # `…외 N건` 접미 바이트를 예산에 포함한다.
+    $totalItems = $items.Count
+    $reserve = $utf8NoBom.GetByteCount("`r`n…외 ${totalItems}건")
+    $kept = New-Object System.Collections.ArrayList
+    $used = 0
+    $fitsAll = $true
+    foreach ($l in $allLines) {
+        $add = $utf8NoBom.GetByteCount($l)
+        if ($kept.Count -gt 0) { $add += 2 }
+        if (($used + $add) -gt ($MaxBytes - $reserve)) { $fitsAll = $false; break }
+        [void]$kept.Add($l)
+        $used += $add
+    }
+    if ($fitsAll) { return ($kept -join "`r`n") }
+
+    while ($kept.Count -gt 0 -and $kept[$kept.Count - 1] -match '^\[.*\]$') {
+        [void]$kept.RemoveAt($kept.Count - 1)
+    }
+    $keptItems = @($kept | Where-Object { $_ -match '^- ' }).Count
+    $omitted = $totalItems - $keptItems
+    if ($omitted -lt 1) { return ($kept -join "`r`n") }
+    $suffix = "`r`n…외 ${omitted}건"
+    while ($kept.Count -gt 0 -and ($utf8NoBom.GetByteCount((($kept -join "`r`n") + $suffix)) -gt $MaxBytes)) {
+        [void]$kept.RemoveAt($kept.Count - 1)
+        while ($kept.Count -gt 0 -and $kept[$kept.Count - 1] -match '^\[.*\]$') { [void]$kept.RemoveAt($kept.Count - 1) }
+        $keptItems = @($kept | Where-Object { $_ -match '^- ' }).Count
+        $omitted = $totalItems - $keptItems
+        $suffix = "`r`n…외 ${omitted}건"
+    }
+    return (($kept -join "`r`n") + $suffix)
+}
+
 function Write-HookOutput {
-    param([string]$Text)
-    if ([string]::IsNullOrEmpty($Text)) { return }
+    param([string]$Text, [string]$PendingMessage)
+    if ([string]::IsNullOrEmpty($Text) -and [string]::IsNullOrEmpty($PendingMessage)) { return }
     if ($Format -eq 'gemini') {
         $eventName = if ($Event -eq 'Start') { 'SessionStart' } else { 'BeforeAgent' }
         $payload = @{ hookSpecificOutput = @{ hookEventName = $eventName; additionalContext = $Text } }
+        [Console]::Out.Write(($payload | ConvertTo-Json -Depth 4 -Compress))
+    } elseif ($Format -eq 'claude') {
+        # SessionStart 사용자 표시용 처리 대기 목록은 systemMessage로, 인계 전문은
+        # hookSpecificOutput.additionalContext로 내보낸다.  대기 항목이 0건이면
+        # systemMessage 키를 아예 두지 않는다(스키마 유지, 소음 방지).
+        $eventName = if ($Event -eq 'Start') { 'SessionStart' } else { 'BeforeAgent' }
+        $hookOutput = @{ hookEventName = $eventName; additionalContext = $Text }
+        if ([string]::IsNullOrEmpty($PendingMessage)) {
+            $payload = @{ hookSpecificOutput = $hookOutput }
+        } else {
+            $payload = @{ systemMessage = $PendingMessage; hookSpecificOutput = $hookOutput }
+        }
         [Console]::Out.Write(($payload | ConvertTo-Json -Depth 4 -Compress))
     } else {
         [Console]::Out.Write($Text)
@@ -294,7 +463,15 @@ try {
         }
         $output = $bounded.ToString()
     }
-    Write-HookOutput $output
+
+    # -Format claude only: the user-facing pending list is built on its own
+    # 4096-byte budget, then both strings are serialised once at the very end.
+    # List-generation failure degrades to context injection only.
+    $pendingMessage = $null
+    if ($Format -eq 'claude') {
+        try { $pendingMessage = Get-CarryoverPendingMessage -Files $sorted } catch { $pendingMessage = $null }
+    }
+    Write-HookOutput -Text $output -PendingMessage $pendingMessage
 } catch {
     Exit-Silent
 }
