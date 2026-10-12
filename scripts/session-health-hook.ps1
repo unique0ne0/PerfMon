@@ -33,10 +33,10 @@ $TurnMaxSessions = 10
 $TurnScanByteCap = 8MB
 # CFG112: context usage warnings use absolute token thresholds, not a fixed
 # 200K-denominator ratio (a model with a 1M window would otherwise show 177K as
-# 88.8%).  100K = general warning; 150K = strong warning and the only level that
+# 88.8%).  150K = general warning; 200K = strong warning and the only level that
 # advances the tool/MCP review counter.  The strong warning re-fires sooner.
-$ContextWarnTokens = 100000
-$ContextStrongWarnTokens = 150000
+$ContextWarnTokens = 150000
+$ContextStrongWarnTokens = 200000
 $ContextWarnReissueMinutes = 60
 $ContextStrongWarnReissueMinutes = 20
 
@@ -184,13 +184,13 @@ if (-not $turnIdLists.Contains($sessionId)) {
 }
 
 # Project-scoped (not session-scoped) counter: how many distinct sessions have
-# hit the context-150k (strong) threshold since the last tool/MCP review
+# hit the context-200k (strong) threshold since the last tool/MCP review
 # suggestion was emitted. Mirrors the orchestration-runbook §7 idiom — observe,
 # then only propose after 5 cumulative occurrences, never auto-apply. (5, not
-# §7's 2: context-150k crossings have many innocent causes — long sessions,
+# §7's 2: context-200k crossings have many innocent causes — long sessions,
 # large file reads — so this needs a higher bar than the concurrency-observation
-# idiom it borrows the cadence pattern from.  Only 150K crossings advance it,
-# not 100K, to keep the original ~140K crossing frequency.)
+# idiom it borrows the cadence pattern from.  Only 200K crossings advance it,
+# not 150K, to keep the original ~140K crossing frequency.)
 $toolReviewOccurrences = 0
 if ($state -and $state.toolReviewOccurrences) {
     try { $toolReviewOccurrences = [int]$state.toolReviewOccurrences } catch { $toolReviewOccurrences = 0 }
@@ -473,11 +473,11 @@ $toolReviewSuggestion = $null
 # CFG112: two mutually exclusive absolute-token levels.  A session at/above the
 # strong threshold emits ONLY the strong warning (never both); if the strong
 # warning is inside its 20-min cooldown the block stays silent rather than
-# falling back to the 100K general warning.  $ContextWindowSize is intentionally
+# falling back to the 150K general warning.  $ContextWindowSize is intentionally
 # unused here (deprecated compatibility parameter — see the param block).
 if ($null -ne $lastContextTokens -and $lastContextTokens -gt 0) {
     if ($lastContextTokens -ge $ContextStrongWarnTokens) {
-        $key = "${sessionKey}-context-150k"
+        $key = "${sessionKey}-context-200k"
         $isFirstThisSession = -not $issued.ContainsKey($key)
         $lastIssued = $null
         if ($issued.ContainsKey($key)) {
@@ -485,7 +485,7 @@ if ($null -ne $lastContextTokens -and $lastContextTokens -gt 0) {
             if ([datetime]::TryParse([string]$issued[$key], [ref]$parsedLast)) { $lastIssued = $parsedLast }
         }
         if ($null -eq $lastIssued -or ($now - $lastIssued.ToUniversalTime()).TotalMinutes -ge $ContextStrongWarnReissueMinutes) {
-            [void]$warnings.Add("Context usage is at $lastContextTokens tokens (>=150K). [강한 경고] 진행 중인 단계가 끝나는 지점에서 handoff 후 새 세션을 시작하라. $carryoverGuidance")
+            [void]$warnings.Add("Context usage is at $lastContextTokens tokens (>=200K). [강한 경고] 진행 중인 단계가 끝나는 지점에서 handoff 후 새 세션을 시작하라. $carryoverGuidance")
             $issued[$key] = $now.ToString('o')
         }
         if ($isFirstThisSession) {
@@ -493,7 +493,7 @@ if ($null -ne $lastContextTokens -and $lastContextTokens -gt 0) {
             if ($toolReviewOccurrences -ge 5) {
                 $toolReviewSuggestion = @'
 === Tool/MCP Review Suggested ===
-이 프로젝트에서 컨텍스트 사용량이 여러 세션에 걸쳐 반복적으로 150K 토큰을 넘었습니다.
+이 프로젝트에서 컨텍스트 사용량이 여러 세션에 걸쳐 반복적으로 200K 토큰을 넘었습니다.
 다음 세션 유휴 시점에:
 1. 이 프로젝트의 .claude/settings.local.json permissions.deny와 현재 로드된 MCP/내장 도구 목록을 대조한다.
 2. deny되지 않은 도구 중 이 프로젝트의 실제 코드/문서/패킷에서 사용 근거가 없는 것을 grep으로 확인한다
@@ -506,14 +506,14 @@ if ($null -ne $lastContextTokens -and $lastContextTokens -gt 0) {
             }
         }
     } elseif ($lastContextTokens -ge $ContextWarnTokens) {
-        $key = "${sessionKey}-context-100k"
+        $key = "${sessionKey}-context-150k"
         $lastIssued = $null
         if ($issued.ContainsKey($key)) {
             [datetime]$parsedLast = [datetime]::MinValue
             if ([datetime]::TryParse([string]$issued[$key], [ref]$parsedLast)) { $lastIssued = $parsedLast }
         }
         if ($null -eq $lastIssued -or ($now - $lastIssued.ToUniversalTime()).TotalMinutes -ge $ContextWarnReissueMinutes) {
-            [void]$warnings.Add("Context usage is at $lastContextTokens tokens (>=100K). $carryoverGuidance")
+            [void]$warnings.Add("Context usage is at $lastContextTokens tokens (>=150K). $carryoverGuidance")
             $issued[$key] = $now.ToString('o')
         }
     }
