@@ -207,6 +207,41 @@ function Get-CarryoverPendingMessage {
     return (($kept -join "`r`n") + $suffix)
 }
 
+# ── VSCode 확장 첫 응답 표시 지시 (CFG115) ───────────────────────────────────
+function Test-CarryoverExtensionMode {
+    # The VSCode extension does not render SessionStart systemMessage, so the model
+    # is told to print the pending list itself.  Detection uses CLAUDE_CODE_ENTRYPOINT
+    # alone: a VSCode integrated-terminal CLI can also expose VSCODE_PID, which would
+    # cause a false positive.  Scope is the Claude SessionStart path only.
+    # NOTE: whether the hook process inherits CLAUDE_CODE_ENTRYPOINT is UNVERIFIED;
+    # Save-SessionState records diag.entrypoint as objective evidence for a later
+    # check.  Any failure here degrades silently to the terminal (non-extension) output.
+    param([string]$Event, [string]$Format)
+    if ($Event -ne 'Start' -or $Format -ne 'claude') { return $false }
+    try {
+        $value = [Environment]::GetEnvironmentVariable('CLAUDE_CODE_ENTRYPOINT')
+        if ([string]::IsNullOrWhiteSpace($value)) { return $false }
+        return ($value.Trim().ToLowerInvariant() -eq 'claude-vscode')
+    } catch { return $false }
+}
+
+function Get-CarryoverDisplayInstruction {
+    # Instruction appended to additionalContext in extension mode, telling the model
+    # to show the pending list verbatim at the top of its first response.  The block
+    # is NEVER truncated (the model must receive it whole); the caller reserves its
+    # exact UTF-8 size out of the carry-over body budget.  A leading CRLF separates it
+    # from the body.
+    param([string]$PendingMessage)
+    $nl = "`r`n"
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append($nl)
+    [void]$sb.Append('=== 처리 대기 목록 표시 지시 ==='); [void]$sb.Append($nl)
+    [void]$sb.Append('이 클라이언트(VSCode 확장)는 SessionStart의 사용자 표시 메시지를 보여 주지 못한다. 세션 첫 응답에서 반드시, 아래 처리 대기 목록을 요약·변형 없이 원문 그대로 사용자에게 보여 준 뒤 사용자의 요청에 답한다. 전역 지침(응답 시각 접두, 한국어 존댓말)은 그대로 적용하고, 시각 접두는 응답 맨 앞에 둔다.'); [void]$sb.Append($nl)
+    [void]$sb.Append($PendingMessage); [void]$sb.Append($nl)
+    [void]$sb.Append('=== End 처리 대기 목록 표시 지시 ==='); [void]$sb.Append($nl)
+    return $sb.ToString()
+}
+
 function Write-HookOutput {
     param([string]$Text, [string]$PendingMessage)
     if ([string]::IsNullOrEmpty($Text) -and [string]::IsNullOrEmpty($PendingMessage)) { return }
@@ -258,7 +293,16 @@ function Save-SessionState {
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     Assert-NotReparsePoint $dir
     Assert-NotReparsePoint $Path
-    $body = @{ lastSeenUtc = $NowUtc.ToString('o'); seen = $Seen } | ConvertTo-Json -Depth 4
+    # CFG115 design 4: whether the hook process actually inherits CLAUDE_CODE_ENTRYPOINT
+    # is UNVERIFIED.  Record value-only diagnostic signals (no secrets) so the mode can
+    # be judged objectively from this file after the next /clear in VSCode.  This write
+    # is best-effort and never blocks the hook.
+    $diag = @{
+        entrypoint  = [Environment]::GetEnvironmentVariable('CLAUDE_CODE_ENTRYPOINT')
+        vscodePid   = [bool]([Environment]::GetEnvironmentVariable('VSCODE_PID'))
+        termProgram = [Environment]::GetEnvironmentVariable('TERM_PROGRAM')
+    }
+    $body = @{ lastSeenUtc = $NowUtc.ToString('o'); seen = $Seen; diag = $diag } | ConvertTo-Json -Depth 4
     $tmp = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
     [System.IO.File]::WriteAllText($tmp, $body, $utf8NoBom)
     Move-Item -LiteralPath $tmp -Destination $Path -Force
@@ -388,6 +432,20 @@ try {
 
     $sorted = @($files | Sort-Object -Property @{ Expression = { Get-CarryoverSortTime $_ }; Ascending = $true })
 
+    # CFG115: the user-facing pending list (systemMessage) and, in VSCode-extension
+    # mode, its display-instruction block are built once here — BEFORE the carry-over
+    # body loop so their exact UTF-8 size can be reserved out of the body budget.
+    # The block must never be truncated by the body.  List-generation failure degrades
+    # to context injection only (never blocks the session).
+    $pendingMessage = $null
+    if ($Format -eq 'claude') {
+        try { $pendingMessage = Get-CarryoverPendingMessage -Files $sorted } catch { $pendingMessage = $null }
+    }
+    $displayBlock = $null
+    if (-not [string]::IsNullOrEmpty($pendingMessage) -and (Test-CarryoverExtensionMode -Event $Event -Format $Format)) {
+        $displayBlock = Get-CarryoverDisplayInstruction -PendingMessage $pendingMessage
+    }
+
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('=== Session Carry-over ===')
     if ($idleLine) { [void]$sb.AppendLine($idleLine) }
@@ -399,6 +457,10 @@ try {
     # when an unusual number of paths exceeds this reserve.
     $trailerReserveBytes = 1024
     $budget = $MaxTotalBytes - $utf8NoBom.GetByteCount($sb.ToString()) - $trailerReserveBytes
+    # Reserve the display-instruction block up front so the body loop cannot consume
+    # its space (extension mode only).  This shrinks the carry-over body budget in
+    # extension mode (accepted trade-off); the terminal CLI (env unset) is unaffected.
+    if ($displayBlock) { $budget -= $utf8NoBom.GetByteCount($displayBlock) }
     $skippedNames = @()
     $budgetExhausted = $false
 
@@ -458,24 +520,22 @@ try {
     # can nevertheless push the final payload over MaxTotalBytes.  Enforce the
     # cap on the complete UTF-8 payload too, retaining whole lines only so a
     # multibyte character or a Markdown line is never split at the boundary.
+    # The reserved display block is excluded from this cap and appended after it,
+    # so body+block stays within MaxTotalBytes without ever truncating the block.
     $output = $sb.ToString()
-    if ($utf8NoBom.GetByteCount($output) -gt $MaxTotalBytes) {
+    $outputCap = $MaxTotalBytes
+    if ($displayBlock) { $outputCap -= $utf8NoBom.GetByteCount($displayBlock) }
+    if ($utf8NoBom.GetByteCount($output) -gt $outputCap) {
         $bounded = New-Object System.Text.StringBuilder
         foreach ($outputLine in ($output -split "`r?`n")) {
             $candidate = $bounded.ToString() + $outputLine + [Environment]::NewLine
-            if ($utf8NoBom.GetByteCount($candidate) -gt $MaxTotalBytes) { break }
+            if ($utf8NoBom.GetByteCount($candidate) -gt $outputCap) { break }
             [void]$bounded.AppendLine($outputLine)
         }
         $output = $bounded.ToString()
     }
+    if ($displayBlock) { $output += $displayBlock }
 
-    # -Format claude only: the user-facing pending list is built on its own
-    # 4096-byte budget, then both strings are serialised once at the very end.
-    # List-generation failure degrades to context injection only.
-    $pendingMessage = $null
-    if ($Format -eq 'claude') {
-        try { $pendingMessage = Get-CarryoverPendingMessage -Files $sorted } catch { $pendingMessage = $null }
-    }
     Write-HookOutput -Text $output -PendingMessage $pendingMessage
 } catch {
     Exit-Silent
