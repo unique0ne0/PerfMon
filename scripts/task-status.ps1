@@ -815,6 +815,19 @@ function Get-BacklogTasks {
 }
 # '최초 발견' 칸은 자유 텍스트(예: '기획팀 CFG062 ⑤ Integration 독립 검증 (2026-09-06)')다.
 # 그 안의 날짜만 뽑아 관찰 시작일로 삼고 오늘까지 경과 일수를 보여준다 — 날짜가 없으면 '-'.
+# 패킷 총 소요: 구현(impl) 첫 사이클 할당 시각부터 지금까지. 단계별 Elapsed와 달리 사이클·단계 전환을 넘어
+# 누적된다. 구현 기록이 없으면(기획 단계 등) '-'.
+function Get-PacketTotalElapsed {
+    param([string]$ProjectPath, [string]$TaskId)
+    $cyclesPath = Join-Path $ProjectPath ".agents\briefs\logs\$TaskId-impl-cycles.json"
+    if (-not (Test-Path -LiteralPath $cyclesPath)) { return '-' }
+    try {
+        $doc = Get-Content -LiteralPath $cyclesPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $first = @($doc.cycles | Where-Object { $_.allocatedAt } | ForEach-Object { [datetime]::Parse([string]$_.allocatedAt, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind).ToLocalTime() } | Sort-Object | Select-Object -First 1)
+        if ($first.Count -eq 0) { return '-' }
+        return Format-Elapsed -StartedAt $first[0]
+    } catch { return '-' }
+}
 function Format-BacklogElapsedDays {
     param([string]$FirstFoundText)
     if ($FirstFoundText -notmatch '(\d{4}-\d{2}-\d{2})') { return '-' }
@@ -1277,6 +1290,7 @@ function Format-TaskStatusRow {
         Status = $status
         PID = $ReducedState.PID
         Elapsed = $ReducedState.Elapsed
+        TotalElapsed = if ($task.Status -eq 'ACTIVE') { Get-PacketTotalElapsed -ProjectPath $projectPath -TaskId $task.TaskId } else { '-' }
         LastActivity = $ReducedState.LastActivity
         LastActivityFull = $ReducedState.LastActivityFull
         # 6컬럼 방언은 '다음 단계' 칸이 문장이라 Stage 칸에는 압축본만 들어간다. 원문은 툴팁에 남긴다.
@@ -1306,6 +1320,7 @@ function Get-TaskStatuses {
             Status = '장기보류'
             PID = '-'
             Elapsed = Format-BacklogElapsedDays -FirstFoundText $task.FirstFound
+            TotalElapsed = '-'
             LastActivity = Get-BacklogObserveSummary -ObserveCondition $task.ObserveCondition
             LastActivityFull = $task.ObserveCondition
             StageFull = $task.Content
@@ -1565,7 +1580,7 @@ function Update-Dashboard {
     }
     $snapshot = @(
         $rows | ForEach-Object {
-            @($_.Project, $_.Task, $_.Stage, $_.Owner, $_.Model, $_.Status, $_.PID, $_.Elapsed, $_.LastActivity, $_.LastActivityFull, $_.StageFull) -join [char]31
+            @($_.Project, $_.Task, $_.Stage, $_.Owner, $_.Model, $_.Status, $_.PID, $_.Elapsed, $_.TotalElapsed, $_.LastActivity, $_.LastActivityFull, $_.StageFull) -join [char]31
         }
     ) -join [char]30
     if ($snapshot -eq $script:dashboardSnapshot) {
@@ -1584,7 +1599,7 @@ function Update-Dashboard {
     foreach ($row in $rows) {
         $style = $statusStyles[$row.Status]
         if (-not $style) { $style = $statusStyles['IDLE'] }
-        $index = $Grid.Rows.Add($row.Project, $row.Task, $row.Stage, $row.Owner, $row.Model, $style.Text, $row.PID, $row.Elapsed, $row.LastActivity)
+        $index = $Grid.Rows.Add($row.Project, $row.Task, $row.Stage, $row.Owner, $row.Model, $style.Text, $row.PID, $row.Elapsed, $row.TotalElapsed, $row.LastActivity)
         $Grid.Rows[$index].Tag = $row
         $Grid.Rows[$index].Cells['LastActivity'].ToolTipText = $row.LastActivityFull
         $Grid.Rows[$index].Cells['Stage'].ToolTipText = $row.StageFull
@@ -2090,6 +2105,7 @@ $columnLayout = @(
     @{ Name = 'Status';       Weight = 100; Min = 86 },
     @{ Name = 'PID';          Weight = 42;  Min = 38 },
     @{ Name = 'Elapsed';      Weight = 62;  Min = 55 },
+    @{ Name = 'TotalElapsed'; Weight = 62;  Min = 55 },
     @{ Name = 'LastActivity'; Weight = 400; Min = 160 }
 )
 foreach ($column in $columnLayout) {
