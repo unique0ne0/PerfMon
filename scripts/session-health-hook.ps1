@@ -528,7 +528,7 @@ if ($null -ne $lastContextTokens -and $lastContextTokens -gt 0) {
 1. 이 프로젝트의 .claude/settings.local.json permissions.deny와 현재 로드된 MCP/내장 도구 목록을 대조한다.
 2. deny되지 않은 도구 중 이 프로젝트의 실제 코드/문서/패킷에서 사용 근거가 없는 것을 grep으로 확인한다
    (판단 기준은 프로젝트 스택에 따라 다르다 -- 고정 목록을 적용하지 말 것).
-3. 근거가 있으면 .agents/briefs/backlog.md의 "## 미해결 (관찰 중)" 표에 CFG-BL-NNN 행을 추가해 건의한다.
+3. 근거가 있으면 사용자에게 패킷으로 제안한다.
    settings.local.json은 직접 수정하지 않는다 -- 건의만 하고 사용자 승인 후 반영한다.
 4. 건의 행에는 재활성화 방법(해당 도구를 permissions.deny 배열에서 제거)을 명시한다.
 '@
