@@ -14,7 +14,7 @@ commit-harness-sync.ps1 — sync-configs.ps1 -Push 로 배포된 하네스 사�
   - deferred-busy: sync-configs.ps1 -Push 가 실행 중 체인 때문에 이번 배포를 지연함(CFG089)
   - skipped-git-inprogress: 대상이 git 작업 중(index.lock·rebase·merge)이거나 detached HEAD(CFG100)
   - nothing-to-commit: 하네스 자산에 변경 없음
-  - skipped-unrelated-only: 무관한 파일만 변경됨
+  - skipped-unrelated-only: 하네스 자산은 최신(커밋할 변경 없음), 무관한 파일만 변경됨
 
 출력: 결과 테이블 + JSON 리포트 (global/harness/logs/sync-commit/ 또는 상대 로그 경로)
 
@@ -360,7 +360,7 @@ foreach ($proj in $targets) {
     if ([string]::IsNullOrWhiteSpace($statusText) -and -not $gaDecision.Include) {
         if (@($allStatusOutput | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
             $entry.Status = 'skipped-unrelated-only'
-            $entry.Detail = if ($gaWarning) { "무관한 파일만 변경됨 — $gaWarning" } else { '무관한 파일만 변경됨' }
+            $entry.Detail = if ($gaWarning) { "하네스 자산은 최신(커밋할 변경 없음), 무관한 파일만 변경됨 — $gaWarning" } else { '하네스 자산은 최신(커밋할 변경 없음), 무관한 파일만 변경됨' }
         } else {
             $entry.Status = 'nothing-to-commit'
             $entry.Detail = '하네스 자산에 변경 없음'
@@ -375,7 +375,7 @@ foreach ($proj in $targets) {
 
     if ($commitPaths.Count -eq 0) {
         $entry.Status = 'skipped-unrelated-only'
-        $entry.Detail = if ($gaWarning) { "무관한 파일만 변경됨 — $gaWarning" } else { '무관한 파일만 변경됨' }
+        $entry.Detail = if ($gaWarning) { "하네스 자산은 최신(커밋할 변경 없음), 무관한 파일만 변경됨 — $gaWarning" } else { '하네스 자산은 최신(커밋할 변경 없음), 무관한 파일만 변경됨' }
         $results += $entry
         continue
     }
