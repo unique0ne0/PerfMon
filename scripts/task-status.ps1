@@ -828,6 +828,29 @@ function Get-PacketTotalElapsed {
         return Format-Elapsed -StartedAt $first[0]
     } catch { return '-' }
 }
+# 패킷 제목: 패킷 Transition의 '- Title:' 줄을 우선하고, 없으면 파일명 slug(CFG116-<slug>.md)를 쓴다.
+# 라우터·패킷 H1에는 목적을 알려주는 문구가 없어 Task ID만으로는 무슨 작업인지 알 수 없었다.
+function Get-PacketTitle {
+    param([string]$ProjectPath, [string]$TaskId)
+    foreach ($dir in @((Join-Path $ProjectPath '.agents\briefs\packets'), (Join-Path $ProjectPath '.agents\briefs\archive'))) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        $pk = @(Get-ChildItem -Path $dir -Filter "$TaskId-*.md" -File -ErrorAction SilentlyContinue)
+        if ($pk.Count -ne 1) { continue }
+        $cacheKey = "title|$($pk[0].FullName)"
+        $stamp = Get-FileStamp -File $pk[0]
+        $cached = $script:FileParseCache[$cacheKey]
+        if ($cached -and $cached.Stamp -eq $stamp) { return $cached.Value }
+        $title = ''
+        try {
+            $head = @(Get-Content -LiteralPath $pk[0].FullName -Encoding UTF8 -TotalCount 40 | Where-Object { $_ -match '^\s*-\s*Title\s*:\s*\S' } | Select-Object -First 1)
+            if ($head.Count -gt 0) { $title = ($head[0] -replace '^\s*-\s*Title\s*:\s*', '').Trim() }
+        } catch { }
+        if (-not $title) { $title = [regex]::Replace([System.IO.Path]::GetFileNameWithoutExtension($pk[0].Name), '^' + [regex]::Escape($TaskId) + '-', '') }
+        $script:FileParseCache[$cacheKey] = @{ Stamp = $stamp; Value = $title }
+        return $title
+    }
+    return '-'
+}
 function Format-BacklogElapsedDays {
     param([string]$FirstFoundText)
     if ($FirstFoundText -notmatch '(\d{4}-\d{2}-\d{2})') { return '-' }
@@ -1285,6 +1308,7 @@ function Format-TaskStatusRow {
         Project = Split-Path $projectPath -Leaf
         ProjectPath = $projectPath
         Task = $task.TaskId
+        Title = Get-PacketTitle -ProjectPath $projectPath -TaskId $task.TaskId
         Stage = $displayStage
         StageKey = $stageKey
         Status = $status
@@ -1315,6 +1339,7 @@ function Get-TaskStatuses {
             Project = Split-Path -Leaf $hostPath
             ProjectPath = $hostPath
             Task = $task.Id
+            Title = ([string]$task.Content -replace '\s+', ' ').Trim()
             Stage = '백로그'
             StageKey = 'backlog'
             Status = '장기보류'
@@ -1580,7 +1605,7 @@ function Update-Dashboard {
     }
     $snapshot = @(
         $rows | ForEach-Object {
-            @($_.Project, $_.Task, $_.Stage, $_.Owner, $_.Model, $_.Status, $_.PID, $_.Elapsed, $_.TotalElapsed, $_.LastActivity, $_.LastActivityFull, $_.StageFull) -join [char]31
+            @($_.Project, $_.Task, $_.Title, $_.Stage, $_.Owner, $_.Model, $_.Status, $_.PID, $_.Elapsed, $_.TotalElapsed, $_.LastActivity, $_.LastActivityFull, $_.StageFull) -join [char]31
         }
     ) -join [char]30
     if ($snapshot -eq $script:dashboardSnapshot) {
@@ -1599,7 +1624,7 @@ function Update-Dashboard {
     foreach ($row in $rows) {
         $style = $statusStyles[$row.Status]
         if (-not $style) { $style = $statusStyles['IDLE'] }
-        $index = $Grid.Rows.Add($row.Project, $row.Task, $row.Stage, $row.Owner, $row.Model, $style.Text, $row.PID, $row.Elapsed, $row.TotalElapsed, $row.LastActivity)
+        $index = $Grid.Rows.Add($row.Project, $row.Task, $row.Title, $row.Stage, $row.Owner, $row.Model, $style.Text, $row.PID, $row.Elapsed, $row.TotalElapsed, $row.LastActivity)
         $Grid.Rows[$index].Tag = $row
         $Grid.Rows[$index].Cells['LastActivity'].ToolTipText = $row.LastActivityFull
         $Grid.Rows[$index].Cells['Stage'].ToolTipText = $row.StageFull
@@ -1953,7 +1978,7 @@ public class DashboardWatcherBridge
 
 if ($MyInvocation.InvocationName -ne '.' -and ($MyInvocation.Line -notmatch '^\s*\.\s' -or $MyInvocation.Line -eq $null)) {
 $form = New-Object System.Windows.Forms.Form
-$form.Text = '패킷 상태 대시보드'
+$form.Text = '패킷 대시보드'
 $form.ClientSize = New-Object System.Drawing.Size(1280, 430)
 $form.MinimumSize = New-Object System.Drawing.Size(700, 280)
 $form.StartPosition = 'CenterScreen'
@@ -2099,6 +2124,7 @@ $grid.AccessibleName = '활성 패킷 상태 표'
 $columnLayout = @(
     @{ Name = 'Project';      Weight = 105; Min = 80 },
     @{ Name = 'Task';         Weight = 55;  Min = 50 },
+    @{ Name = 'Title';        Weight = 150; Min = 100 },
     @{ Name = 'Stage';        Weight = 58;  Min = 50 },
     @{ Name = 'Owner';        Weight = 105; Min = 86 },
     @{ Name = 'Model';        Weight = 115; Min = 96 },
@@ -2106,10 +2132,11 @@ $columnLayout = @(
     @{ Name = 'PID';          Weight = 42;  Min = 38 },
     @{ Name = 'Elapsed';      Weight = 62;  Min = 55 },
     @{ Name = 'TotalElapsed'; Weight = 62;  Min = 55 },
-    @{ Name = 'LastActivity'; Weight = 400; Min = 160 }
+    @{ Name = 'LastActivity'; Weight = 300; Min = 160 }
 )
 foreach ($column in $columnLayout) {
-    $index = $grid.Columns.Add($column.Name, $column.Name)
+    $headerText = if ($column.Name -eq 'TotalElapsed') { 'T.Elapsed' } else { $column.Name }
+    $index = $grid.Columns.Add($column.Name, $headerText)
     $grid.Columns[$index].FillWeight = $column.Weight
     $grid.Columns[$index].MinimumWidth = $column.Min
 }
