@@ -404,7 +404,11 @@ foreach ($proj in $targets) {
         Invoke-GitQuiet -ProjRoot $proj -GitArgs $commitArgs | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "git commit 실패 (exit $LASTEXITCODE)" }
 
-        if ($PushTargets) {
+        $hasRemote = [bool](Invoke-GitQuiet -ProjRoot $proj -GitArgs @('remote'))
+        if ($PushTargets -and -not $hasRemote) {
+            $entry.Status = 'committed'
+            $entry.Detail = "커밋 완료(원격 없음 — 푸시 생략): $($commitPaths -join ', ')"
+        } elseif ($PushTargets) {
             Invoke-GitQuiet -ProjRoot $proj -GitArgs @('push') | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "git push 실패 (exit $LASTEXITCODE)" }
             $entry.Status = 'committed'
