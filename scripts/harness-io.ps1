@@ -229,7 +229,13 @@ function Invoke-GitPathList {
             $encodingSwitched = $true
         } catch { }
         $ErrorActionPreference = 'Continue'
-        $lines = @(& git -C $RepoRoot -c core.quotepath=false @GitArgs 2>$null)
+        # -NullDelimited면 헬퍼가 직접 -z를 붙인다(첫 인자=서브커맨드 바로 뒤). 호출부가 빠뜨리면
+        # 개행 구분 출력이 NUL 분리에서 한 덩어리로 합쳐져 경로가 1개로 보인다(보안 리뷰 지적).
+        $effectiveArgs = @($GitArgs)
+        if ($NullDelimited -and $effectiveArgs -notcontains '-z') {
+            $effectiveArgs = @($effectiveArgs[0], '-z') + @($effectiveArgs | Select-Object -Skip 1)
+        }
+        $lines = @(& git -C $RepoRoot -c core.quotepath=false @effectiveArgs 2>$null)
     } finally {
         if ($encodingSwitched) { try { [Console]::OutputEncoding = $prevEncoding } catch { } }
         $ErrorActionPreference = $prevEap
