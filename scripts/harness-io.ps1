@@ -204,3 +204,39 @@ function Read-HarnessAssets {
     }
     return $assets
 }
+
+function Invoke-GitPathList {
+    # CFG117(BL-112): 경로를 파싱하는 모든 git 호출의 공용 창구.
+    #  (1) `-c core.quotepath=false` — 한글 등 비ASCII 경로를 8진 이스케이프·따옴표 없이 낸다.
+    #  (2) 호출 구간만 [Console]::OutputEncoding을 UTF-8로 바꾸고 finally에서 복원한다. PS 5.1은
+    #      native stdout을 OutputEncoding(기본 CP949)으로 디코드하므로 quotepath=false여도 한글이
+    #      깨진다(Test-PacketCorruption과 동일 방식).
+    # -NullDelimited: `ls-files --others`·`diff --name-only`처럼 레코드가 단일 토큰인 호출에만 쓴다.
+    #   `git status --porcelain`에는 쓰지 않는다 — rename이 'XY new\0old\0' 2토큰이라 파서가 깨진다.
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoRoot,
+        [Parameter(Mandatory = $true)][string[]]$GitArgs,
+        [switch]$NullDelimited
+    )
+    $prevEap = $ErrorActionPreference
+    $prevEncoding = $null
+    $encodingSwitched = $false
+    $lines = @()
+    try {
+        try {
+            $prevEncoding = [Console]::OutputEncoding
+            [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+            $encodingSwitched = $true
+        } catch { }
+        $ErrorActionPreference = 'Continue'
+        $lines = @(& git -C $RepoRoot -c core.quotepath=false @GitArgs 2>$null)
+    } finally {
+        if ($encodingSwitched) { try { [Console]::OutputEncoding = $prevEncoding } catch { } }
+        $ErrorActionPreference = $prevEap
+    }
+    if ($NullDelimited) {
+        $joined = ($lines -join "`n")
+        return @($joined -split "`0" | ForEach-Object { $_.TrimEnd("`r", "`n") } | Where-Object { $_ -ne '' })
+    }
+    return @($lines)
+}

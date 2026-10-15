@@ -189,17 +189,13 @@ function Get-ImplLogRel {
 function Get-DirtyRepoFiles {
     # impl 단계 시작 시점의 더티 파일(미추적 포함) 상대 경로. 로그·휘발성 산출물은
     # Get-TreeState와 동일하게 제외해 디스패치 자체가 만든 파일이 판정을 오염시키지 않게 한다.
+    # CFG117(BL-112): 경로 파싱 git 호출은 Invoke-GitPathList로 통일한다(quotepath=false + UTF-8
+    # 콘솔 디코드). status --porcelain에는 -z를 쓰지 않는다 — rename이 2토큰이라 텍스트 파싱을 유지한다.
     $repo = Resolve-RepoPath '.'
     $logPrefix = (Get-ImplLogRel) + '/'
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        # --untracked-files=all: 기본 모드는 미추적 디렉터리를 '?? src/'처럼 접어서 보고해
-        # 디렉터리 안 파일이 스냅샷·오염 판정에서 누락된다.
-        $lines = @(& git -C $repo status --porcelain --untracked-files=all 2>$null)
-    } finally {
-        $ErrorActionPreference = $prev
-    }
+    # --untracked-files=all: 기본 모드는 미추적 디렉터리를 '?? src/'처럼 접어서 보고해
+    # 디렉터리 안 파일이 스냅샷·오염 판정에서 누락된다.
+    $lines = @(Invoke-GitPathList -RepoRoot $repo -GitArgs @('status', '--porcelain', '--untracked-files=all'))
     $out = @()
     foreach ($line in $lines) {
         if ([string]::IsNullOrWhiteSpace($line) -or $line.Length -le 3) { continue }
@@ -215,27 +211,75 @@ function Get-DirtyRepoFiles {
     return @($out | Sort-Object -Unique)
 }
 
+function Get-ByteFacts {
+    # CFG117: 바이트에서 BOM·SHA256·본문을 한 번에 계산한다(작업트리 파일·HEAD blob 공용).
+    # ReadAllText/Get-Content는 BOM을 제거하므로 BOM 증감을 볼 수 없다 — 첫 3바이트를 직접 본다.
+    param([byte[]]$Bytes)
+    if ($null -eq $Bytes) {
+        return @{ Exists = $false; HasBom = $false; Sha256 = $null; Text = ''; Length = 0 }
+    }
+    $hasBom = ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = ([System.BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '')
+    } finally { $sha.Dispose() }
+    $text = ''
+    if ($Bytes.Length -gt 3) {
+        $offset = if ($hasBom) { 3 } else { 0 }
+        $text = [System.Text.Encoding]::UTF8.GetString($Bytes, $offset, $Bytes.Length - $offset)
+    } elseif (-not $hasBom -and $Bytes.Length -gt 0) {
+        $text = [System.Text.Encoding]::UTF8.GetString($Bytes, 0, $Bytes.Length)
+    }
+    return @{ Exists = $true; HasBom = $hasBom; Sha256 = $hash; Text = $text; Length = $Bytes.Length }
+}
+
 function Get-FileByteFacts {
-    # BOM·본문을 한 번에 읽어 바이트 기준 판정 근거를 만든다. ReadAllText/Get-Content는 BOM을
-    # 제거하므로 BOM 증감을 볼 수 없다 — 첫 3바이트를 직접 검사한다.
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return @{ Exists = $false; HasBom = $false; Sha256 = $null; Text = ''; Length = 0 }
     }
-    $bytes = [System.IO.File]::ReadAllBytes($Path)
-    $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
-    $sha = [System.Security.Cryptography.SHA256]::Create()
+    return Get-ByteFacts -Bytes ([System.IO.File]::ReadAllBytes($Path))
+}
+
+function Get-HeadBlobBytes {
+    # CFG117(BL-113): HEAD:<rel> blob의 원시 바이트를 반환한다(HEAD에 없으면 $null).
+    # PS 5.1에서 `git show` 파이프 출력은 문자열로 변환되어(콘솔 인코딩·개행) 바이트가 변형되므로,
+    # System.Diagnostics.Process로 stdout의 BaseStream을 직접 읽어 바이트를 그대로 보존한다.
+    # 비ASCII 경로는 double-quote로 감싸 argv로 전달한다. 빈 blob은 byte[0]으로 반환해
+    # "HEAD에 없음($null)"과 구분한다(단항 콤마로 파이프라인 열거를 막는다).
+    param([string]$RelPath)
+    if ([string]::IsNullOrWhiteSpace($RelPath)) { return $null }
+    $repo = Resolve-RepoPath '.'
+    $gitRel = $RelPath -replace '\\', '/'
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'git'
+    $psi.Arguments = '-C "{0}" show "HEAD:{1}"' -f $repo, $gitRel
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $process = $null
+    $stream = $null
     try {
-        $hash = ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '')
-    } finally { $sha.Dispose() }
-    $text = ''
-    if ($bytes.Length -gt 3) {
-        $offset = if ($hasBom) { 3 } else { 0 }
-        $text = [System.Text.Encoding]::UTF8.GetString($bytes, $offset, $bytes.Length - $offset)
-    } elseif (-not $hasBom -and $bytes.Length -gt 0) {
-        $text = [System.Text.Encoding]::UTF8.GetString($bytes, 0, $bytes.Length)
+        $process = [System.Diagnostics.Process]::Start($psi)
+        $stream = New-Object System.IO.MemoryStream
+        $process.StandardOutput.BaseStream.CopyTo($stream)
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) { return $null }
+        return , $stream.ToArray()
+    } catch {
+        return $null
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        if ($null -ne $process) { $process.Dispose() }
     }
-    return @{ Exists = $true; HasBom = $hasBom; Sha256 = $hash; Text = $text; Length = $bytes.Length }
+}
+
+function Get-HeadFileByteFacts {
+    # CFG117(BL-113): HEAD에 추적된 파일이면 HEAD 바이트 기준 facts를, 아니면 Exists=$false facts를
+    # 돌려준다. prestage baseline이 없는 추적 파일(시작 시 깨끗했던 파일)의 대체 baseline이다.
+    param([string]$RelPath)
+    return Get-ByteFacts -Bytes (Get-HeadBlobBytes -RelPath $RelPath)
 }
 
 function Test-FileEncodingPollution {
@@ -299,21 +343,32 @@ function Move-ImplFileToQuarantine {
 
 function Restore-ImplFileFromPrestage {
     # prestage에 있던 파일이면 오염본을 quarantine에 복사 보관한 뒤 원본 바이트로 되돌린다.
-    # prestage에 없던 신규 파일이면 quarantine으로 이동한다(삭제 금지 — 권한 분류기가 삭제를 거부한 이력).
+    # CFG117(BL-113): prestage에 없지만 HEAD에 추적된 파일(시작 시 깨끗했던 추적 파일)이면 오염본을
+    # quarantine에 복사 보관한 뒤 HEAD 바이트로 덮어쓴다 — 파일을 트리에서 치우지 않는다. prestage에도
+    # HEAD에도 없는 신규 파일만 quarantine으로 이동한다(삭제 금지 — 권한 분류기가 삭제를 거부한 이력).
     param([string]$RelPath, [hashtable]$Prestage, [string]$TaskId, [int]$Cycle)
     $repo = Resolve-RepoPath '.'
     $abs = Join-Path $repo ($RelPath -replace '/', '\')
     $baseAbs = Join-Path $Prestage.Root ($RelPath -replace '/', '\')
+    $restoreBytes = $null
+    $hasRestoreBytes = $false
     if (Test-Path -LiteralPath $baseAbs -PathType Leaf) {
-        if (Test-Path -LiteralPath $abs -PathType Leaf) {
-            $null = Copy-ImplFileToQuarantine -SourceAbs $abs -RelPath $RelPath -TaskId $TaskId -Cycle $Cycle
-        }
-        $destDir = Split-Path -Parent $abs
-        if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
-        Copy-Item -LiteralPath $baseAbs -Destination $abs -Force
+        $restoreBytes = [System.IO.File]::ReadAllBytes($baseAbs)
+        $hasRestoreBytes = $true
     } else {
-        $null = Move-ImplFileToQuarantine -SourceAbs $abs -RelPath $RelPath -TaskId $TaskId -Cycle $Cycle
+        $headBytes = Get-HeadBlobBytes -RelPath $RelPath
+        if ($null -ne $headBytes) { $restoreBytes = $headBytes; $hasRestoreBytes = $true }
     }
+    if (-not $hasRestoreBytes) {
+        $null = Move-ImplFileToQuarantine -SourceAbs $abs -RelPath $RelPath -TaskId $TaskId -Cycle $Cycle
+        return
+    }
+    if (Test-Path -LiteralPath $abs -PathType Leaf) {
+        $null = Copy-ImplFileToQuarantine -SourceAbs $abs -RelPath $RelPath -TaskId $TaskId -Cycle $Cycle
+    }
+    $destDir = Split-Path -Parent $abs
+    if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
+    [System.IO.File]::WriteAllBytes($abs, $restoreBytes)
 }
 
 function New-ImplPrestageSnapshot {
@@ -579,6 +634,7 @@ function Invoke-ImplPollutionRestore {
     $changed = New-Object System.Collections.Generic.List[string]
     $pollutedSources = New-Object System.Collections.Generic.List[string]
     $sourceDetails = @{}
+    $existedBefore = @{}
     foreach ($rel in $candidates) {
         if ([string]::IsNullOrWhiteSpace($rel)) { continue }
         if ($rel -eq $routerRel -or $rel.StartsWith($packetPrefix)) { continue }
@@ -586,6 +642,15 @@ function Invoke-ImplPollutionRestore {
         $baseAbs = Join-Path $Prestage.Root ($rel -replace '/', '\')
         $cur = Get-FileByteFacts -Path $abs
         $base = Get-FileByteFacts -Path $baseAbs
+        if (-not $base.Exists) {
+            # CFG117(BL-113): prestage는 시작 시 더티였던 파일만 담는다. 시작 시 깨끗했던 추적 파일은
+            # prestage baseline이 없으므로 HEAD 바이트를 baseline으로 삼는다 — 그래야 HEAD에 원래
+            # 있던 U+FFFD를 신규 오염으로 오판하지 않고, 시작 시 깨끗했던 추적 파일을 삭제한 경우도
+            # differs=true가 되어 롤백 시 HEAD 바이트로 되살아난다. $differs 판정 이전에 대체한다.
+            $headFacts = Get-HeadFileByteFacts -RelPath $rel
+            if ($headFacts.Exists) { $base = $headFacts }
+        }
+        if ($base.Exists) { $existedBefore[$rel] = $true }
         $differs = $false
         if ($cur.Exists -ne $base.Exists) { $differs = $true }
         elseif ($cur.Exists -and $base.Exists -and $cur.Sha256 -ne $base.Sha256) { $differs = $true }
@@ -600,6 +665,17 @@ function Invoke-ImplPollutionRestore {
         foreach ($rel in $changed) {
             Restore-ImplFileFromPrestage -RelPath $rel -Prestage $Prestage -TaskId $TaskId -Cycle $Cycle
             $restored.Add($rel); $quarantined.Add($rel)
+        }
+        # CFG117 설계3(롤백 후 트리 불변식): 롤백 전에 존재하던(추적/prestage) 파일이 롤백 후
+        # 트리에서 사라지면 안 된다. 결손이 있으면 HEAD 바이트로 재복원하고 WARN을 남긴다.
+        $missingAfterRollback = @($changed | Where-Object {
+                $existedBefore[$_] -and -not (Test-Path -LiteralPath (Join-Path $repo ($_ -replace '/', '\')) -PathType Leaf)
+            })
+        if ($missingAfterRollback.Count -gt 0) {
+            Write-Log "⚠️ 롤백 후 소스 파일 결손 감지 — HEAD 바이트로 재복원: $($missingAfterRollback -join ', ')" WARN
+            foreach ($rel in $missingAfterRollback) {
+                Restore-ImplFileFromPrestage -RelPath $rel -Prestage $Prestage -TaskId $TaskId -Cycle $Cycle
+            }
         }
         $kinds.Add('source')
         $reasons.Add("소스 인코딩 오염 — 시도 전체 일괄 롤백: $($pollutedSources -join ', ')")

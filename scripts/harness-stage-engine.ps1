@@ -431,7 +431,7 @@ function Get-ChangedFilesNewerThan {
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            $porcelain = @(git status --porcelain 2>$null)
+            $porcelain = @(Invoke-GitPathList -RepoRoot $RepoRoot -GitArgs @('status', '--porcelain'))
             $gitOk = ($LASTEXITCODE -eq 0)
         } finally {
             $ErrorActionPreference = $prevEap

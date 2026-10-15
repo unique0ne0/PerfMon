@@ -510,7 +510,7 @@ function Get-TreeState {
         # 무관하게 계속 재기록하는 휘발성 산출물 디렉터리. 프로젝트가 gitignore에 등재하지
         # 않아도 치명 지문에서 원천 제외한다. 실증된 패턴만 추가한다(ai0072, 2026-09-13).
         $script:VolatileTreeStatePrefixes = @('.codebase-memory/')
-        $dirty = (@(& git status --porcelain 2>$null |
+        $dirty = (@(Invoke-GitPathList -RepoRoot $RepoRoot -GitArgs @('status', '--porcelain') |
             Where-Object {
                 if ($_.Length -le 3) { return $true }
                 $statusPath = $_.Substring(3).Trim('"').Replace('\','/')
@@ -536,7 +536,7 @@ function Get-TreeState {
         # the fingerprint is invalid.
         & git diff --binary HEAD -- . 2>$null | ForEach-Object { & $hashText ($_ + "`n") }
         if ($LASTEXITCODE -ne 0) { throw 'git diff failed' }
-        $untracked = @(& git ls-files --others --exclude-standard 2>$null |
+        $untracked = @(Invoke-GitPathList -RepoRoot $RepoRoot -GitArgs @('ls-files', '--others', '--exclude-standard') -NullDelimited |
             Where-Object {
                 $untrackedPath = $_.Replace('\','/')
                 if ($untrackedPath.StartsWith($logPrefix)) { return $false }
@@ -589,20 +589,23 @@ function Get-TreeState {
 
 function Get-ChangedFileSnapshot {
     $snapshot = @{ Head = $null; Files = @{} }
+    $repo = Resolve-RepoPath '.'
     try {
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            $snapshot.Head = (git -C (Resolve-RepoPath '.') rev-parse HEAD 2>$null | Out-String).Trim()
+            $snapshot.Head = (git -C $repo rev-parse HEAD 2>$null | Out-String).Trim()
+            # CFG117(BL-112): 경로 목록은 Invoke-GitPathList(-z + quotepath=false + UTF-8 디코드)로
+            # 받는다 — 한글 경로가 8진 이스케이프/따옴표로 깨지지 않게 한다.
             $files = @(
-                git -C (Resolve-RepoPath '.') diff --name-only HEAD 2>$null
-                git -C (Resolve-RepoPath '.') ls-files --others --exclude-standard 2>$null
+                Invoke-GitPathList -RepoRoot $repo -GitArgs @('diff', '--name-only', 'HEAD') -NullDelimited
+                Invoke-GitPathList -RepoRoot $repo -GitArgs @('ls-files', '--others', '--exclude-standard') -NullDelimited
             ) | Where-Object { $_ }
         } finally {
             $ErrorActionPreference = $prevEap
         }
         foreach ($file in ($files | Sort-Object -Unique)) {
-            $path = Join-Path (Resolve-RepoPath '.') $file
+            $path = Join-Path $repo $file
             $snapshot.Files[$file -replace '\\', '/'] = if (Test-Path -LiteralPath $path -PathType Leaf) { (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash } else { $null }
         }
     } catch { }
@@ -628,7 +631,7 @@ function Get-ScopeDriftWarnings {
                 if ($beforeHash -ne $afterHash) { $changedFiles += $file }
             }
             if ($BeforeSnapshot.Head -and $afterSnapshot.Head -and $BeforeSnapshot.Head -ne $afterSnapshot.Head) {
-                $changedFiles += @(git -C (Resolve-RepoPath '.') diff --name-only $BeforeSnapshot.Head $afterSnapshot.Head 2>$null)
+                $changedFiles += @(Invoke-GitPathList -RepoRoot (Resolve-RepoPath '.') -GitArgs @('diff', '--name-only', $BeforeSnapshot.Head, $afterSnapshot.Head) -NullDelimited)
             }
         } else {
             $changedFiles = @($afterSnapshot.Files.Keys)
