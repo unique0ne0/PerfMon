@@ -48,6 +48,15 @@ $ContextStrongWarnReissueMinutes = 20
 # unknown ($lastContextTokens $null or <= 0) the gate is skipped -- losing the
 # warning is worse than an over-warning (design 3).
 $TimeWarnMinContextTokens = 100000
+# CFG118: the time warning counts *working* time, not wall-clock time since the first
+# prompt.  Adjacent transcript events (user/assistant/tool records alike) closer than
+# $ActiveGapMinutes add to the session's active seconds; a longer gap is idle and is
+# skipped.  Counting transcript events (not prompts) keeps a long tool run or a long
+# implementation turn counted, since those keep emitting events.  Limitation: a single
+# tool call that is silent for more than $ActiveGapMinutes is treated as idle.
+# Thresholds were raised from 4/6/8h to 8/12/24h because the nudge was firing too often.
+$TimeWarnThresholdsHours = @(8, 12, 24)
+$ActiveGapMinutes = 30
 
 function Exit-Silent { exit 0 }
 
@@ -205,6 +214,24 @@ if ($state -and $state.toolReviewOccurrences) {
     try { $toolReviewOccurrences = [int]$state.toolReviewOccurrences } catch { $toolReviewOccurrences = 0 }
 }
 
+# CFG118 active-time state: activeTime[sessionId] = @{ seconds; lastUtc }.  Only the
+# trailing TurnMaxSessions sessions are kept (same bound as turnIds).
+$activeTimes = [ordered]@{}
+if ($state -and $state.activeTime) {
+    foreach ($sessionProp in @($state.activeTime.psobject.Properties)) {
+        $entrySeconds = 0.0; $entryLast = $null
+        try { $entrySeconds = [double]$sessionProp.Value.seconds } catch { $entrySeconds = 0.0 }
+        if ($sessionProp.Value.lastUtc) {
+            [datetime]$parsedEntry = [datetime]::MinValue
+            if ([datetime]::TryParse([string]$sessionProp.Value.lastUtc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsedEntry)) { $entryLast = $parsedEntry.ToUniversalTime() }
+        }
+        $activeTimes[$sessionProp.Name] = @{ seconds = $entrySeconds; last = $entryLast }
+    }
+}
+if (-not $activeTimes.Contains($sessionId)) { $activeTimes[$sessionId] = @{ seconds = 0.0; last = $null } }
+$activeEntry = $activeTimes[$sessionId]
+$activeGapSeconds = $ActiveGapMinutes * 60
+
 $sessionKey = "hook-$sessionId"
 $firstTimestamp = $null
 if ($hookSessions.ContainsKey($sessionKey)) {
@@ -357,6 +384,30 @@ try {
                     foreach ($line in $lines) {
                         if ([string]::IsNullOrWhiteSpace($line)) { continue }
 
+                        # CFG118: accumulate working time from the gap between adjacent
+                        # transcript events.  Compaction re-records old records late, so
+                        # a timestamp that is not newer than the last one is ignored.
+                        try {
+                            $tsIdx = $line.IndexOf('"timestamp":"', [System.StringComparison]::Ordinal)
+                            if ($tsIdx -ge 0) {
+                                $tsStart = $tsIdx + 13
+                                $tsEnd = $line.IndexOf('"', $tsStart)
+                                if ($tsEnd -gt $tsStart) {
+                                    [datetime]$evTime = [datetime]::MinValue
+                                    if ([datetime]::TryParse($line.Substring($tsStart, $tsEnd - $tsStart), [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$evTime)) {
+                                        $evTime = $evTime.ToUniversalTime()
+                                        if ($null -eq $activeEntry.last) {
+                                            $activeEntry.last = $evTime
+                                        } elseif ($evTime -gt $activeEntry.last) {
+                                            $gapSeconds = ($evTime - $activeEntry.last).TotalSeconds
+                                            if ($gapSeconds -le $activeGapSeconds) { $activeEntry.seconds += $gapSeconds }
+                                            $activeEntry.last = $evTime
+                                        }
+                                    }
+                                }
+                            }
+                        } catch { }
+
                         # Turn counting (A1): count assistant records that carry
                         # message.usage and a claude* model, deduped by the set of
                         # message.id (uuid fallback) prefixes seen this session --
@@ -457,11 +508,12 @@ try {
     }
 } catch { }
 
-$elapsedHours = if ($firstTimestamp) { [math]::Max(0, ($now - $firstTimestamp).TotalHours) } else { $null }
+# CFG118: working hours = accumulated active seconds (idle gaps excluded), not wall clock.
+$elapsedHours = [math]::Max(0, $activeEntry.seconds / 3600)
 
 # CFG116 gate: a small context (below $TimeWarnMinContextTokens) suppresses the
 # time warning without touching the issued keys, so when the context later grows
-# past the gate the still-due 4/6/8h thresholds can fire then.  Unknown tokens
+# past the gate the still-due thresholds can fire then.  Unknown tokens
 # ($null or <= 0) skip the gate -- the safety net (design 3).
 $timeWarnGateActive = ($null -ne $lastContextTokens -and $lastContextTokens -gt 0 -and $lastContextTokens -lt $TimeWarnMinContextTokens)
 
@@ -469,7 +521,7 @@ if ($null -ne $elapsedHours -and -not $timeWarnGateActive) {
     # Collect the thresholds that are due AND would fire right now (no prior
     # issuance, or the 60-min cooldown has elapsed), in ascending order.
     $dueTimeThresholds = New-Object System.Collections.ArrayList
-    foreach ($threshold in @(4, 6, 8)) {
+    foreach ($threshold in $TimeWarnThresholdsHours) {
         if ($elapsedHours -ge $threshold) {
             $key = "${sessionKey}-activity-$threshold"
             $lastIssued = $null
@@ -490,7 +542,7 @@ if ($null -ne $elapsedHours -and -not $timeWarnGateActive) {
         foreach ($threshold in $dueTimeThresholds) {
             $key = "${sessionKey}-activity-$threshold"
             if ($threshold -eq $fireThreshold) {
-                $message = "Session has been active for $([math]::Round($elapsedHours, 1))h (>=${threshold}h). $carryoverGuidance"
+                $message = "Session has been active for $([math]::Round($elapsedHours, 1))h of working time (idle gaps over ${ActiveGapMinutes} min excluded) (>=${threshold}h). $carryoverGuidance"
                 [void]$warnings.Add($message)
             }
             $issued[$key] = $now.ToString('o')
@@ -583,6 +635,18 @@ while ($updatedTurnIds.Count -gt $TurnMaxSessions) {
     $updatedTurnIds.Remove($oldestTurnSession)
 }
 
+# CFG118: persist active time; current session last (most recently used), bounded.
+$updatedActive = [ordered]@{}
+foreach ($k in $activeTimes.Keys) {
+    if ($k -eq $sessionId) { continue }
+    $updatedActive[$k] = [ordered]@{ seconds = [math]::Round($activeTimes[$k].seconds, 1); lastUtc = $(if ($activeTimes[$k].last) { $activeTimes[$k].last.ToString('o') } else { $null }) }
+}
+$updatedActive[$sessionId] = [ordered]@{ seconds = [math]::Round($activeEntry.seconds, 1); lastUtc = $(if ($activeEntry.last) { $activeEntry.last.ToString('o') } else { $null }) }
+while ($updatedActive.Count -gt $TurnMaxSessions) {
+    $oldestActive = @($updatedActive.Keys)[0]
+    $updatedActive.Remove($oldestActive)
+}
+
 $stateObj = [ordered]@{
     schemaVersion = 6;
     hookSessions = $updatedHookSessions;
@@ -590,9 +654,10 @@ $stateObj = [ordered]@{
     toolReviewOccurrences = $toolReviewOccurrences;
     transcriptScanOffsets = $updatedScanOffsets;
     reportedHookErrors = $updatedReportedErrors;
-    turnIds = $updatedTurnIds
+    turnIds = $updatedTurnIds;
+    activeTime = $updatedActive
 }
-$preservedKeys = @('schemaVersion', 'hookSessions', 'issuedWarnings', 'toolReviewOccurrences', 'transcriptScanOffsets', 'reportedHookErrors', 'turnIds')
+$preservedKeys = @('schemaVersion', 'hookSessions', 'issuedWarnings', 'toolReviewOccurrences', 'transcriptScanOffsets', 'reportedHookErrors', 'turnIds', 'activeTime')
 if ($state) {
     foreach ($prop in @($state.psobject.Properties)) {
         if ($prop.Name -notin $preservedKeys) {
