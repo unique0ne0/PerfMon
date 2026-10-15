@@ -5,7 +5,9 @@
     # Prompt = per-prompt hook (Claude/Codex UserPromptSubmit, Gemini BeforeAgent): stay
     #          silent unless another session added/changed/consumed a carry-over file since
     #          this session last looked, or the session resumes after IdleHours of no prompts.
-    [ValidateSet('Start', 'Prompt')][string]$Event = 'Start',
+    # List   = /0 command: print the numbered one-line pending list to stdout and exit
+    #          (no session-state writes).
+    [ValidateSet('Start', 'Prompt', 'List')][string]$Event = 'Start',
     # text   = plain stdout (Claude, Codex).  gemini = hookSpecificOutput.additionalContext JSON,
     #          because Gemini CLI rejects plain-text stdout.
     # claude = SessionStart JSON carrying both the user-facing "처리 대기 목록" (systemMessage)
@@ -102,11 +104,9 @@ function Get-CarryoverBucket {
     return '태그 없음'
 }
 
-function Get-CarryoverPendingMessage {
-    # 미소비 인계 파일들에서 미체크 `- [ ]` 항목만 추려 사용자 화면용 한 줄
-    # 목록(systemMessage)을 만든다.  항목이 0건이면 $null을 돌려 systemMessage
-    # 키 자체를 만들지 않는다.  실패는 호출자가 삼킨다(세션 시작을 막지 않는다).
-    param([System.IO.FileInfo[]]$Files, [int]$MaxBytes = 4096)
+function Get-CarryoverPendingItems {
+    # 미소비 인계 파일들에서 미체크 `- [ ]` 항목 줄만 추려 돌려준다.
+    param([System.IO.FileInfo[]]$Files)
 
     $allFiles = @($Files)
     $resolvedIds = @{}
@@ -155,6 +155,17 @@ function Get-CarryoverPendingMessage {
         }
     }
 
+    return ,$items
+}
+
+function Get-CarryoverPendingMessage {
+    # 미체크 항목을 사용자 화면용 목록(systemMessage)으로 만든다.  항목이 0건이면
+    # $null을 돌려 systemMessage 키 자체를 만들지 않는다.  실패는 호출자가 삼킨다
+    # (세션 시작을 막지 않는다).
+    param([System.IO.FileInfo[]]$Files, [int]$MaxBytes = 4096)
+
+    $allFiles = @($Files)
+    $items = Get-CarryoverPendingItems -Files $allFiles
     if ($items.Count -eq 0) { return $null }
 
     # 3차: 태그별 분류.
@@ -205,6 +216,41 @@ function Get-CarryoverPendingMessage {
         $suffix = "`r`n…외 ${omitted}건"
     }
     return (($kept -join "`r`n") + $suffix)
+}
+
+function Get-CarryoverCompactList {
+    # /0 명령용.  한 줄 = 연번. [분류] ID 제목 — 간략설명.  연번은 표시 시점의 순번이고
+    # 안정 식별자는 CO- ID다(세션 간에 연번이 바뀔 수 있다).
+    param([System.IO.FileInfo[]]$Files, [int]$DescMax = 70)
+    $items = Get-CarryoverPendingItems -Files @($Files)
+    if ($items.Count -eq 0) { return '처리 대기 항목이 없습니다.' }
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($key in $script:CarryoverBucketOrder) {
+        foreach ($line in $items) {
+            if ((Get-CarryoverBucket $line) -ne $key) { continue }
+            $id = Get-CarryoverItemId $line
+            $title = ''
+            $m = [regex]::Match($line, '\*\*(.+?)\*\*')
+            if ($m.Success) { $title = $m.Groups[1].Value }
+            $rest = $line
+            if ($m.Success) { $rest = $line.Substring($m.Index + $m.Length) }
+            $rest = ($rest -replace '^\s*[—–-]\s*', '') -replace '(\s*\[[^\]]*\])+\s*$', ''
+            $rest = ($rest -replace '`', '').Trim()
+            if ($rest.Length -gt $DescMax) { $rest = $rest.Substring(0, $DescMax).TrimEnd() + '…' }
+            if (-not $title) { $title = ($line -replace '^- \[ \]\s*', ''); if ($title.Length -gt 40) { $title = $title.Substring(0, 40) + '…' } }
+            [void]$rows.Add(@{ Bucket = $key; Id = $id; Title = $title; Desc = $rest })
+        }
+    }
+    $out = New-Object System.Collections.ArrayList
+    [void]$out.Add("처리 대기 $($rows.Count)건")
+    $n = 0
+    foreach ($r in $rows) {
+        $n++
+        $idText = if ($r.Id) { $r.Id } else { '-' }
+        $descText = if ($r.Desc) { " — $($r.Desc)" } else { '' }
+        [void]$out.Add("$n. [$($r.Bucket)] $idText $($r.Title)$descText")
+    }
+    return ($out -join "`n")
 }
 
 # ── VSCode 확장 첫 응답 표시 지시 (CFG115) ───────────────────────────────────
@@ -362,6 +408,11 @@ try {
     # Unconsumed carry-over files only.  The consumed/ folder is a directory, so
     # -File excludes it; the hook never moves, edits, or deletes carry-over files.
     $files = @(Get-ChildItem -LiteralPath $briefsDir -Filter 'session-carryover-*.md' -File -ErrorAction SilentlyContinue)
+
+    if ($Event -eq 'List') {
+        [Console]::Out.Write((Get-CarryoverCompactList -Files @($files | Sort-Object -Property @{ Expression = { Get-CarryoverSortTime $_ } })))
+        exit 0
+    }
 
     $nowUtc = [datetime]::UtcNow
     $currentSeen = @{}
