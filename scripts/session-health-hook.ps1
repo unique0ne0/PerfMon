@@ -266,7 +266,7 @@ try {
     try {
         $tailFs = [System.IO.File]::Open($transcriptPath, 'Open', 'Read', 'ReadWrite')
         try {
-            $tailStart = [math]::Max(0, $tailFs.Length - 1MB)
+            $tailStart = [math]::Max([long]0, [long]($tailFs.Length - 1MB))
             [void]$tailFs.Seek($tailStart, 'Begin')
             $tailBytes = New-Object byte[] ($tailFs.Length - $tailStart)
             $tailRead = 0

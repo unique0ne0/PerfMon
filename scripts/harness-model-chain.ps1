@@ -42,7 +42,7 @@ function Get-SwitchableFailureClass {
 
     # The no-output guard measures bytes written by this attempt, not historical log size.
     # Attempt logs start at zero today; retaining the offset keeps this contract safe if that changes.
-    $logGrowth = [math]::Max(0, $LogBytes - $LogStartBytes)
+    $logGrowth = [math]::Max([long]0, [long]($LogBytes - $LogStartBytes))
     if ($logGrowth -lt 2KB -and $ElapsedSeconds -lt 60 -and -not $TreeChanged) {
         return 'noop'
     }

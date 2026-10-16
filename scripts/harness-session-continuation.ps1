@@ -164,7 +164,7 @@ function Test-AntigravityContinuationActivity {
     $logAbs = Resolve-RepoPath $AttemptLog
     if (-not (Test-Path -LiteralPath $logAbs)) { return $false }
     $logItem = Get-Item -LiteralPath $logAbs
-    $growth = [math]::Max(0, $logItem.Length - $LogStartBytes)
+    $growth = [math]::Max([long]0, [long]($logItem.Length - $LogStartBytes))
     # 실행 중인 프로세스의 유연 연장과 같은 창을 사용한다. 종료된 provider CLI에는
     # CPU/I/O를 다시 관찰할 수 없으므로, 마지막 stream-json 기록 시점이 이 창 안에
     # 있어야 한다. 초반 출력만 남기고 오래 멈춘 세션은 누적 바이트가 커도 재개하지 않는다.

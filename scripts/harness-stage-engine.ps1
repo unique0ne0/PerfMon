@@ -157,7 +157,7 @@ function Advance-StageWindow {
     param([hashtable]$Monitor, [long]$LogSize, [double]$ExtendStep)
 
     if (((Get-Date) - $Monitor.WindowStartAt).TotalMinutes -ge $ExtendStep) {
-        $Monitor.LastWindowGrowth = [math]::Max(0, $LogSize - $Monitor.WindowStartSize)
+        $Monitor.LastWindowGrowth = [math]::Max([long]0, [long]($LogSize - $Monitor.WindowStartSize))
         $Monitor.WindowStartAt = Get-Date; $Monitor.WindowStartSize = $LogSize
     }
 }
@@ -167,8 +167,8 @@ function Write-StageHeartbeat {
 
     if (((Get-Date) - $Monitor.LastHeartbeatAt).TotalSeconds -lt 300) { return }
     $elapsed = [math]::Floor(((Get-Date) - $StartedAt).TotalMinutes)
-    $logDelta = [math]::Max(0, $LogSize - $Monitor.LastHeartbeatSize)
-    $cpuDelta = [math]::Max(0, [math]::Round(($CpuNow - $Monitor.LastHeartbeatCpu).TotalSeconds, 2))
+    $logDelta = [math]::Max([long]0, [long]($LogSize - $Monitor.LastHeartbeatSize))
+    $cpuDelta = [math]::Max([double]0, [math]::Round(($CpuNow - $Monitor.LastHeartbeatCpu).TotalSeconds, 2))
     Write-Log "진행중 [$Stage] 경과 ${elapsed}분 · 로그 +${logDelta}B · 트리 CPU +${cpuDelta}s · CIM $($metricsNow.QueryMs)ms · CIM 실패 $($metricsNow.CimFailures)회" INFO
     $Monitor.LastHeartbeatAt = Get-Date; $Monitor.LastHeartbeatSize = $LogSize; $Monitor.LastHeartbeatCpu = $CpuNow
 }
@@ -514,7 +514,7 @@ function Test-QaTerminalArtifactsComplete {
 function Test-StageHangProgress {
     param([string]$Stage, [hashtable]$Monitor, $metricsNow, [double]$noChange, [double]$noChangeText, [hashtable]$Config)
 
-    $idleCpuDelta = [math]::Max(0, [math]::Round(($metricsNow.Cpu - $Monitor.IdleStartedMetrics.Cpu).TotalSeconds, 2))
+    $idleCpuDelta = [math]::Max([double]0, [math]::Round(($metricsNow.Cpu - $Monitor.IdleStartedMetrics.Cpu).TotalSeconds, 2))
     $idleIoDelta = [math]::Max([long]0, [long]($metricsNow.Io - $Monitor.IdleStartedMetrics.Io))
     $ratePct = [math]::Round(($idleCpuDelta / $noChange) * 100, 1)
     $ioRate = [math]::Round($idleIoDelta / $noChange, 0)
@@ -572,7 +572,7 @@ function Test-StageDeadlineElapsed {
 
     if ((Get-Date) -le $Monitor.Deadline) { return @{ Action = 'continue' } }
     # 창 경계 직후에 상한이 걸려 진행 중인 프로세스가 "이번 창은 아직 0B"라는 이유로 죽는 일을 막는다.
-    $growth = [math]::Max($Monitor.LastWindowGrowth, [math]::Max(0, $LogSize - $Monitor.WindowStartSize))
+    $growth = [math]::Max($Monitor.LastWindowGrowth, [math]::Max([long]0, [long]($LogSize - $Monitor.WindowStartSize)))
     if ($growth -ge $HardTimeoutProgressBytes -and $Monitor.Deadline -lt $Monitor.AbsoluteDeadline) {
         $repeatedError = Get-RepeatedErrorObservation -LogPath $logAbs
         if ($repeatedError.Repeated) {
@@ -675,7 +675,7 @@ function Invoke-StageProcess {
             $sz = if (Test-Path $logAbs) { (Get-Item $logAbs).Length } else { 0 }
             $logChanged = $sz -ne $monitor.LastSize
             if ($logChanged) { $monitor.LastLogChangedAt = Get-Date; $monitor.LastSize = $sz; $monitor.HangReported = $false }
-            $noChange = [math]::Max(0, ((Get-Date) - $monitor.LastLogChangedAt).TotalSeconds)
+            $noChange = [math]::Max([double]0, ((Get-Date) - $monitor.LastLogChangedAt).TotalSeconds)
             # 아래에서 $noChange를 증가율의 '분모'로 그대로 쓰므로 값 자체를 반올림하지 않는다.
             # 사람이 읽는 로그 문구에만 반올림한 별도 변수를 쓴다.
             $noChangeText = [math]::Round($noChange)
