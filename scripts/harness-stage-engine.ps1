@@ -515,7 +515,7 @@ function Test-StageHangProgress {
     param([string]$Stage, [hashtable]$Monitor, $metricsNow, [double]$noChange, [double]$noChangeText, [hashtable]$Config)
 
     $idleCpuDelta = [math]::Max(0, [math]::Round(($metricsNow.Cpu - $Monitor.IdleStartedMetrics.Cpu).TotalSeconds, 2))
-    $idleIoDelta = [math]::Max(0, $metricsNow.Io - $Monitor.IdleStartedMetrics.Io)
+    $idleIoDelta = [math]::Max([long]0, [long]($metricsNow.Io - $Monitor.IdleStartedMetrics.Io))
     $ratePct = [math]::Round(($idleCpuDelta / $noChange) * 100, 1)
     $ioRate = [math]::Round($idleIoDelta / $noChange, 0)
     $thresholdPct = [math]::Round($BusyCpuRate * 100, 1)
