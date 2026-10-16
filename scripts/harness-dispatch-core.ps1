@@ -405,6 +405,74 @@ function New-ImplPrestageSnapshot {
     return @{ Root = $cycleDir; TaskRoot = (Get-ImplPrestageRoot -TaskId $TaskId); Files = $manifest }
 }
 
+# ── CFG119(BL-114): ② 착수 시점 커밋 기준선(선행 더티 vs 파이프라인 이탈 구분) ──────────────
+# ⑤ Integration이 "시작 전부터 더티였던 무관 파일"과 "②~④ 중 파이프라인이 바꾼 Scope 밖 파일"을
+# 구분하려면 ② 최초 착수 시점의 더티 집합과 내용 해시가 필요하다. 기준선은 리포 밖($env:TEMP)에
+# 두어 git이 추적·표시하지 않게 하고, 커밋 허용 산출물 목록에 등록하지 않는다. 한 번 쓰면
+# 덮어쓰지 않는다 — 재시도·QA 반려 후 ② 재진입에도 최초 시작 시점을 가리켜야 한다(idempotent).
+function Get-ImplCommitBaselinePath {
+    param([string]$TaskId)
+    return (Join-Path ([System.IO.Path]::GetTempPath()) "$TaskId-commit-baseline\baseline.json")
+}
+
+function New-ImplCommitBaseline {
+    param([string]$TaskId)
+    if ([string]::IsNullOrWhiteSpace($TaskId)) { return $null }
+    $path = Get-ImplCommitBaselinePath -TaskId $TaskId
+    if (Test-Path -LiteralPath $path) { return $path }
+    $repo = Resolve-RepoPath '.'
+    $files = [ordered]@{}
+    foreach ($rel in @(Get-DirtyRepoFiles)) {
+        $abs = Join-Path $repo ($rel -replace '/', '\')
+        $facts = Get-FileByteFacts -Path $abs
+        $files[$rel] = if ($facts.Exists) { $facts.Sha256 } else { $null }
+    }
+    $value = [ordered]@{
+        schemaVersion = 1
+        taskId = $TaskId
+        createdAt = [datetime]::UtcNow.ToString('o')
+        files = $files
+    }
+    $dir = Split-Path -Parent $path
+    if (-not (Test-Path -LiteralPath $dir)) { $null = New-Item -ItemType Directory -Path $dir -Force }
+    $json = $value | ConvertTo-Json -Depth 6
+    [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding($false)))
+    return $path
+}
+
+function Read-ImplCommitBaseline {
+    # 기준선 파일이 없거나 읽지 못하면 $null을 돌려준다 — 호출부(⑤)가 fail-safe 문구로 처리한다.
+    # 빈 해시 테이블(기준선은 있으나 ② 시작 시 더티 파일이 없음)과 $null(기준선 없음)은 다르다.
+    param([string]$TaskId)
+    if ([string]::IsNullOrWhiteSpace($TaskId)) { return $null }
+    $path = Get-ImplCommitBaselinePath -TaskId $TaskId
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    try {
+        $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+        $parsed = $raw | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+    $files = @{}
+    if ($null -ne $parsed.files) {
+        foreach ($prop in @($parsed.files.psobject.Properties)) { $files[$prop.Name] = $prop.Value }
+    }
+    return $files
+}
+
+function Get-DirtyCurrentHashes {
+    # 현재 더티 파일의 내용 SHA256 맵(경로→해시, 없으면 $null). 기준선과 대조해 겹침(c)을 판정한다.
+    $repo = Resolve-RepoPath '.'
+    $map = @{}
+    foreach ($rel in @(Get-DirtyRepoFiles)) {
+        $abs = Join-Path $repo ($rel -replace '/', '\')
+        $facts = Get-FileByteFacts -Path $abs
+        $map[$rel] = if ($facts.Exists) { $facts.Sha256 } else { $null }
+    }
+    return $map
+}
+
 function Get-RouterRowInfo {
     # 라우터 표에서 "작업 행"만 반환한다. 첫 칸을 정규화(영숫자만·대문자)한 뒤 `^[A-Z]+\d+$`에
     # 맞아야 한다 — 팀표 헤더('기본 팀')·구분행(':---')·빈 칸·기타 표는 $null. 정규화가 하이픈
@@ -1264,27 +1332,47 @@ function Dispatch-Stage {
     if ($Stage -eq 'qa' -and [string]::IsNullOrWhiteSpace($PromptOverride)) {
         $PromptOverride = "$($config.DefaultPrompt) 이번 QA verdict JSON의 cycle은 $($cycle.Id)로 기록해."
     }
-    # CFG107: ⑤ Integration이 커밋 범위를 패킷 Scope paths + 하네스 정상 산출물로 한정하도록,
-    # 착수 시점의 작업 트리 변경 중 그 밖의 파일(이번 커밋에서 제외할 대상)을 계산해 프롬프트에 주입한다.
-    # 제외 목록 계산 실패는 단계를 막지 않는다 — 정적 기본 프롬프트의 범위 한정 지시가 남는다.
+    # CFG107/CFG119: ⑤ Integration이 커밋 범위를 패킷 Scope paths + 하네스 정상 산출물로 한정하도록,
+    # 착수 시점의 작업 트리 변경을 (a) 제외 / (b) Scope 이탈 / (c) 겹침으로 분류해 프롬프트에 주입한다.
+    # git 호출은 호출자가 하고 순수 함수(contracts)에는 목록만 넘긴다 — harness-contracts.ps1은
+    # self-contained 모듈이라 Invoke-GitPathList 부재 환경에서도 동작해야 한다(챌린지 #3).
+    # 계산 실패는 단계를 막지 않는다 — fail-safe 문구로 대체한다.
     if ($Stage -eq 'integration' -and [string]::IsNullOrWhiteSpace($PromptOverride)) {
-        $commitScopeNotice = ' [커밋 범위] 패킷 Scope paths와 아래 정상 산출물만 커밋하고 그 밖의 변경 파일은 커밋하지 마.'
+        $commitScopeNotice = $null
         try {
             $commitPacket = $null
             if (Get-Command Find-PacketByTaskId -ErrorAction SilentlyContinue) {
                 $commitPacket = Find-PacketByTaskId -SearchTaskId $TaskId -ProjectPath $RepoRoot
             }
-            if (Get-Command Get-HarnessCommitAllowedArtifacts -ErrorAction SilentlyContinue) {
-                $allowedArtifacts = @(Get-HarnessCommitAllowedArtifacts -TaskId $TaskId)
-                $commitScopeNotice += " 정상 산출물 허용 목록: $($allowedArtifacts -join ', ')."
-            }
-            if (Get-Command Get-IntegrationCommitExclusions -ErrorAction SilentlyContinue) {
-                $exclusions = @(Get-IntegrationCommitExclusions -PacketPath $commitPacket -RepoRoot $RepoRoot -TaskId $TaskId)
-                $exclusionText = if ($exclusions.Count -gt 0) { $exclusions -join ', ' } else { '없음' }
-                $commitScopeNotice += " 이번 커밋에서 제외할 파일: $exclusionText."
+            if (Get-Command Get-IntegrationCommitScopeNotice -ErrorAction SilentlyContinue) {
+                $statusLines = @()
+                if (Get-Command Invoke-GitPathList -ErrorAction SilentlyContinue) {
+                    $statusLines = @(Invoke-GitPathList -RepoRoot $RepoRoot -GitArgs @('status', '--porcelain', '--untracked-files=all'))
+                }
+                $baseline = $null
+                if (Get-Command Read-ImplCommitBaseline -ErrorAction SilentlyContinue) {
+                    $baseline = Read-ImplCommitBaseline -TaskId $TaskId
+                }
+                $currentHashes = @{}
+                if (Get-Command Get-DirtyCurrentHashes -ErrorAction SilentlyContinue) {
+                    $currentHashes = Get-DirtyCurrentHashes
+                }
+                $commitScopeNotice = Get-IntegrationCommitScopeNotice -PacketPath $commitPacket -TaskId $TaskId -StatusLines $statusLines -Baseline $baseline -CurrentHashes $currentHashes
+            } else {
+                # 레거시 폴백(이전 계약 모듈): 제외 목록만 주입한다.
+                $commitScopeNotice = ' [커밋 범위] 패킷 Scope paths와 아래 정상 산출물만 커밋해.'
+                if (Get-Command Get-HarnessCommitAllowedArtifacts -ErrorAction SilentlyContinue) {
+                    $allowedArtifacts = @(Get-HarnessCommitAllowedArtifacts -TaskId $TaskId)
+                    $commitScopeNotice += " 정상 산출물 허용 목록: $($allowedArtifacts -join ', ')."
+                }
+                if (Get-Command Get-IntegrationCommitExclusions -ErrorAction SilentlyContinue) {
+                    $legacyExclusions = @(Get-IntegrationCommitExclusions -PacketPath $commitPacket -RepoRoot $RepoRoot -TaskId $TaskId)
+                    $legacyText = if ($legacyExclusions.Count -gt 0) { $legacyExclusions -join ', ' } else { '없음' }
+                    $commitScopeNotice += " 이번 커밋에서 제외할 파일: $legacyText."
+                }
             }
         } catch {
-            $commitScopeNotice += ' (제외 목록 계산 실패 — Scope paths와 정상 산출물만 커밋하고 그 밖의 변경 파일은 커밋하지 마.)'
+            $commitScopeNotice = ' [커밋 범위] 패킷 Scope paths와 아래 정상 산출물만 커밋해. (제외·이탈 목록 계산 실패 — Scope paths와 정상 산출물만 커밋하고, Scope 밖 변경은 커밋 전 반드시 보고해.)'
         }
         $PromptOverride = "$($config.DefaultPrompt)$commitScopeNotice"
     }
@@ -1309,6 +1397,11 @@ function Dispatch-Stage {
     $implPrestage = $null
     if ($Stage -eq 'impl' -and (Get-Command New-ImplPrestageSnapshot -ErrorAction SilentlyContinue)) {
         $implPrestage = New-ImplPrestageSnapshot -TaskId $TaskId -Cycle $cycle.Id
+    }
+    # CFG119: ② 최초 착수 시점의 더티 파일 기준선(경로+내용 해시)을 리포 밖에 남긴다. 이미 있으면
+    # 덮어쓰지 않는다 — 재시도·QA 반려 후 재진입에도 최초 시작 시점을 가리켜야 한다.
+    if ($Stage -eq 'impl' -and (Get-Command New-ImplCommitBaseline -ErrorAction SilentlyContinue)) {
+        $null = New-ImplCommitBaseline -TaskId $TaskId
     }
     $before = Get-TreeState
     $logicalStartedAt = Get-Date

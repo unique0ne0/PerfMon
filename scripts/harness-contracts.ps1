@@ -162,21 +162,68 @@ function Get-RuntimeRoleBinding {
     return [pscustomobject]$result
 }
 
+# CFG119(BL-114): Scope 경로 표기 정규화 — 백슬래시→슬래시, 앞뒤 공백·따옴표·백틱 제거,
+# `./` 접두 제거, 끝 `/`(디렉터리 접두)와 끝 `/*`(하위 전체) 제거. 매칭 판정은 대소문자 무시.
+function ConvertTo-CommitScopePath {
+    param([string]$ScopePath)
+    if ([string]::IsNullOrWhiteSpace($ScopePath)) { return '' }
+    $p = $ScopePath.Trim().Trim(' ', '"', "'", [char]96)
+    $p = $p -replace '\\', '/'
+    while ($p.StartsWith('./')) { $p = $p.Substring(2) }
+    $p = $p.TrimEnd('/')
+    if ($p.EndsWith('/*')) { $p = $p.Substring(0, $p.Length - 2).TrimEnd('/') }
+    return $p.Trim()
+}
+
+# CFG119(BL-114): 정규화된 저장소 상대 경로가 Scope paths 안에 드는지 판정하는 공용 헬퍼.
+# 디렉터리 접두사(끝 `/`)·`/*` 글롭·대소문자·`./` 표기를 모두 흡수한다. Get-IntegrationCommitExclusions
+# · Get-ScopeDriftWarnings · Get-IntegrationCommitScopeClassification이 공유한다.
+function Test-CommitScopePathMatch {
+    param([string]$NormalizedPath, [string[]]$ScopePaths)
+    if ([string]::IsNullOrWhiteSpace($NormalizedPath) -or $null -eq $ScopePaths) { return $false }
+    $p = ($NormalizedPath -replace '\\', '/').Trim('/').ToLowerInvariant()
+    if ([string]::IsNullOrEmpty($p)) { return $false }
+    foreach ($sp in $ScopePaths) {
+        $s = (ConvertTo-CommitScopePath -ScopePath $sp).ToLowerInvariant()
+        if ([string]::IsNullOrEmpty($s)) { continue }
+        if ($p -eq $s -or $p.StartsWith("$s/") -or $s.StartsWith("$p/")) { return $true }
+    }
+    return $false
+}
+
+# CFG119(BL-114): `git status --porcelain` 한 줄에서 저장소 상대 경로를 뽑아 정규화한다. rename은
+# `old -> new`로 오므로 새 경로를 쓴다. 호출부가 `--untracked-files=all`을 주면 미추적 디렉터리
+# 접약(`?? dir/`)이 파일 단위로 전개된다(끝 `/`는 방어적으로 제거).
+function ConvertFrom-GitStatusPorcelainLine {
+    param([string]$Line)
+    if ([string]::IsNullOrWhiteSpace($Line) -or $Line.Length -le 3) { return $null }
+    $path = $Line.Substring(3).Trim()
+    if ($path -match ' -> ') { $path = @($path -split ' -> ')[-1].Trim() }
+    $path = $path.Trim('"') -replace '\\', '/'
+    $path = $path.TrimEnd('/')
+    if ([string]::IsNullOrWhiteSpace($path)) { return $null }
+    return $path
+}
+
 function Get-PacketScopePaths {
+    # CFG119(BL-114): `## Scope Map` 섹션 안의 `- Scope paths:` 줄만 읽는다. 종전에는 파일 전체의
+    # 첫 `- Scope paths:` 줄을 읽어, 앞쪽 Amendments·배경 인용에 같은 형식의 가짜 줄이 있으면
+    # 오독했다(원인 B 후보). Get-RuntimeRoleBinding과 같은 섹션 한정 방식이다.
     param([string]$PacketPath)
     if (-not $PacketPath -or -not (Test-Path -LiteralPath $PacketPath)) { return $null }
-    foreach ($line in Get-Content -LiteralPath $PacketPath -Encoding UTF8) {
-        if ($line -match '^\s*-\s*Scope paths:\s*(.+)$') {
-            $pathsStr = $Matches[1]
-            $paths = @()
-            $regex = [regex]'`([^`]+)`'
-            foreach ($m in $regex.Matches($pathsStr)) {
-                $paths += $m.Groups[1].Value
-            }
-            return $paths
-        }
+    $text = Get-Content -LiteralPath $PacketPath -Raw -Encoding UTF8
+    $section = [regex]::Match($text, '(?ms)^##\s+Scope Map\s*$\r?\n(.*?)(?=^##\s+|\z)')
+    if (-not $section.Success) { return $null }
+    $line = [regex]::Match($section.Groups[1].Value, '(?m)^\s*-\s*Scope paths:\s*(.+)$')
+    if (-not $line.Success) { return $null }
+    $paths = @()
+    $regex = [regex]'`([^`]+)`'
+    foreach ($m in $regex.Matches($line.Groups[1].Value)) {
+        $norm = ConvertTo-CommitScopePath -ScopePath $m.Groups[1].Value
+        if (-not [string]::IsNullOrEmpty($norm)) { $paths += $norm }
     }
-    return $null
+    if ($paths.Count -eq 0) { return $null }
+    return $paths
 }
 
 # CFG107: ⑤ Integration 완료 커밋의 범위는 패킷 Scope paths + 하네스 정상 산출물로 한정한다.
@@ -214,6 +261,9 @@ function Test-HarnessCommitArtifactPath {
 # CFG107: ⑤ 착수 시점의 작업 트리(`git status --porcelain`)를 패킷 Scope paths·정상 산출물
 # 허용 목록과 대조해 "이번 커밋에서 제외할 파일"을 계산한다. 스냅샷 diff가 아니라 현재 작업
 # 트리 기준이다 — 다른 세션이 남긴 미커밋 변경(예: 출처 불명 README.md)을 그대로 드러낸다.
+# CFG119: 매칭은 공용 헬퍼(Test-CommitScopePathMatch)로 통일하고, 미추적 디렉터리를 파일
+# 단위로 전개한다(--untracked-files=all). 이 함수는 string[] 반환·시그니처를 유지한다(CFG107
+# 테스트 호환). ⑤ 실사용 경로는 Get-IntegrationCommitScopeNotice가 대체한다.
 function Get-IntegrationCommitExclusions {
     param([string]$PacketPath, [string]$RepoRoot, [string]$TaskId)
     $exclusions = @()
@@ -228,29 +278,112 @@ function Get-IntegrationCommitExclusions {
         $scopePaths = @(Get-PacketScopePaths -PacketPath $PacketPath)
     }
     $lines = @()
+    # CFG119: 경로 목록은 가능하면 CFG117의 공용 창구(Invoke-GitPathList)로 받는다. 이 모듈은
+    # self-contained 순수 모듈이라 헬퍼가 없을 수 있으므로(harness-contracts.ps1만 로드) 그때는
+    # 직접 git을 호출하되 -c core.quotepath=false + UTF-8 콘솔 인코딩으로 한글 경로를 보존한다.
     $prevEap = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $lines = @(git -C $RepoRoot -c core.quotepath=false status --porcelain 2>$null)
+        if (Get-Command Invoke-GitPathList -ErrorAction SilentlyContinue) {
+            $lines = @(Invoke-GitPathList -RepoRoot $RepoRoot -GitArgs @('status', '--porcelain', '--untracked-files=all'))
+        } else {
+            $prevEnc = $null; $switchedEnc = $false
+            try {
+                try { $prevEnc = [Console]::OutputEncoding; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); $switchedEnc = $true } catch { }
+                $lines = @(& git -C $RepoRoot -c core.quotepath=false status --porcelain --untracked-files=all 2>$null)
+            } finally {
+                if ($switchedEnc) { try { [Console]::OutputEncoding = $prevEnc } catch { } }
+            }
+        }
     } catch {
         return $exclusions
     } finally {
         $ErrorActionPreference = $prevEap
     }
     foreach ($line in $lines) {
-        if ([string]::IsNullOrWhiteSpace($line) -or $line.Length -le 3) { continue }
-        $path = $line.Substring(3).Trim()
-        if ($path -match ' -> ') { $path = ($path -split ' -> ')[-1].Trim() }
-        $path = $path.Trim('"') -replace '\\', '/'
-        if ([string]::IsNullOrWhiteSpace($path)) { continue }
+        $path = ConvertFrom-GitStatusPorcelainLine -Line $line
+        if ($null -eq $path) { continue }
         if (Test-HarnessCommitArtifactPath -NormalizedPath $path -TaskId $TaskId) { continue }
-        $inScope = $false
-        foreach ($sp in $scopePaths) {
-            $spNorm = $sp -replace '\\', '/'
-            if ($path -eq $spNorm -or $path.StartsWith("$spNorm/") -or $spNorm.StartsWith("$path/")) { $inScope = $true; break }
-        }
-        if (-not $inScope) { $exclusions += $path }
+        if (Test-CommitScopePathMatch -NormalizedPath $path -ScopePaths $scopePaths) { continue }
+        $exclusions += $path
     }
     return @($exclusions | Sort-Object -Unique)
+}
+
+# CFG119(BL-114): ⑤ 커밋 범위 밖 변경을 세 갈래로 분류한다. 종전에는 "②~④ 중 파이프라인이 바꾼
+# Scope 밖 파일"과 "시작 전부터 더티였던 무관 파일"을 구분하지 못해 필요한 파일이 커밋에서 빠졌다.
+#  (a) Exclusions = ② 착수 시점에 이미 더티였고 기준선 대비 내용 해시도 그대로인 Scope 밖 파일(무관한 선행 변경).
+#  (b) Drift      = ② 착수 시점에는 없었는데(또는 깨끗했는데) 파이프라인이 바꾼 Scope 밖 파일 — 제외로 취급하지 않는다.
+#  (c) Overlaps   = ② 착수 시점에 더티였고 기준선 대비 내용 해시가 바뀐 Scope 밖 파일(선행+파이프라인 혼재) — 자동 커밋 금지.
+# 기준선($Baseline)이 $null이면 이탈 여부를 판단할 수 없으므로 전부 (a)로 보수 처리하고
+# BaselineMissing=$true로 알린다(조용히 커밋에서 빠지는 경로를 만들지 않는다 — fail-safe).
+function Get-IntegrationCommitScopeClassification {
+    param(
+        [string]$PacketPath,
+        [string]$TaskId,
+        [string[]]$StatusLines,
+        [hashtable]$Baseline,
+        [hashtable]$CurrentHashes
+    )
+    $exclusions = New-Object System.Collections.Generic.List[string]
+    $drift = New-Object System.Collections.Generic.List[string]
+    $overlaps = New-Object System.Collections.Generic.List[string]
+    $scopePaths = @()
+    if ($PacketPath -and (Test-Path -LiteralPath $PacketPath)) {
+        $scopePaths = @(Get-PacketScopePaths -PacketPath $PacketPath)
+    }
+    $baselineMissing = ($null -eq $Baseline)
+    foreach ($line in @($StatusLines)) {
+        $path = ConvertFrom-GitStatusPorcelainLine -Line $line
+        if ($null -eq $path) { continue }
+        if (Test-HarnessCommitArtifactPath -NormalizedPath $path -TaskId $TaskId) { continue }
+        if (Test-CommitScopePathMatch -NormalizedPath $path -ScopePaths $scopePaths) { continue }
+        if ($baselineMissing) { $exclusions.Add($path); continue }
+        if ($Baseline.ContainsKey($path)) {
+            $baseHash = $Baseline[$path]
+            $curHash = $null
+            if ($CurrentHashes -and $CurrentHashes.ContainsKey($path)) { $curHash = $CurrentHashes[$path] }
+            if ($baseHash -eq $curHash) { $exclusions.Add($path) } else { $overlaps.Add($path) }
+        } else {
+            $drift.Add($path)
+        }
+    }
+    return [pscustomobject]@{
+        Exclusions = @($exclusions | Sort-Object -Unique)
+        Drift = @($drift | Sort-Object -Unique)
+        Overlaps = @($overlaps | Sort-Object -Unique)
+        BaselineMissing = $baselineMissing
+    }
+}
+
+# CFG119(BL-114): ⑤ Integration 프롬프트에 주입할 커밋 범위 안내 문구를 만든다. 순수 함수다 —
+# git 호출·파일 I/O 없이 인자(StatusLines·Baseline·CurrentHashes)만으로 동작한다(호출자가 git/파일
+# 목록을 모아 넘긴다). 종전 도입부의 "그 밖의 변경 파일은 커밋하지 마" 단독 금지는 (a)/(b)/(c)
+# 규칙과 정면 충돌하므로 쓰지 않고, 이탈·겹침 목록이 있을 때만 해당 지시 문구를 덧붙인다.
+function Get-IntegrationCommitScopeNotice {
+    param(
+        [string]$PacketPath,
+        [string]$TaskId,
+        [string[]]$StatusLines,
+        [hashtable]$Baseline,
+        [hashtable]$CurrentHashes
+    )
+    $cls = Get-IntegrationCommitScopeClassification -PacketPath $PacketPath -TaskId $TaskId -StatusLines $StatusLines -Baseline $Baseline -CurrentHashes $CurrentHashes
+    $notice = ' [커밋 범위] 패킷 Scope paths와 아래 정상 산출물만 커밋해.'
+    $allowed = @(Get-HarnessCommitAllowedArtifacts -TaskId $TaskId)
+    $notice += " 정상 산출물 허용 목록: $($allowed -join ', ')."
+    if ($cls.Exclusions.Count -gt 0) {
+        $notice += " 선행 변경으로 이미 더티였던 Scope 밖 파일(무관한 변경 — 커밋 금지): $($cls.Exclusions -join ', ')."
+    }
+    if ($cls.Drift.Count -gt 0) {
+        $notice += " Scope 이탈 변경(② 착수 이후 파이프라인이 Scope 밖에서 바꾼 파일): $($cls.Drift -join ', ') — 각 파일이 커밋 대상 파일이 import/참조하는 파일이면 함께 커밋하고, 참조하지 않으면 커밋하지 말고 경로를 최종 보고에 남겨. 참조 여부를 판단할 수 없으면 커밋하지 말고 중단·보고해."
+    }
+    if ($cls.Overlaps.Count -gt 0) {
+        $notice += " 선행 더티 + 추가 수정 겹침(선행 변경과 파이프라인 변경이 섞임 — 자동 커밋 금지): $($cls.Overlaps -join ', ') — 커밋하지 말고 중단·보고해."
+    }
+    if ($cls.BaselineMissing) {
+        $notice += ' 기준선 없음 — 이탈 여부를 판단할 수 없으니 Scope 밖 변경은 커밋 전 반드시 보고해.'
+    }
+    return $notice
 }
 

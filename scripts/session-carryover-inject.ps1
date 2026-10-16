@@ -236,7 +236,6 @@ function Get-CarryoverCompactList {
             if ($m.Success) { $rest = $line.Substring($m.Index + $m.Length) }
             $rest = ($rest -replace '^\s*[—–-]\s*', '') -replace '(\s*\[[^\]]*\])+\s*$', ''
             $rest = ($rest -replace '`', '').Trim()
-            if ($rest.Length -gt $DescMax) { $rest = $rest.Substring(0, $DescMax).TrimEnd() + '…' }
             if (-not $title) { $title = ($line -replace '^- \[ \]\s*', ''); if ($title.Length -gt 40) { $title = $title.Substring(0, 40) + '…' } }
             [void]$rows.Add(@{ Bucket = $key; Id = $id; Title = $title; Desc = $rest })
         }
@@ -247,8 +246,14 @@ function Get-CarryoverCompactList {
     foreach ($r in $rows) {
         $n++
         $idText = if ($r.Id) { $r.Id } else { '-' }
-        $descText = if ($r.Desc) { " — $($r.Desc)" } else { '' }
-        [void]$out.Add("$n. [$($r.Bucket)] $idText $($r.Title)$descText")
+        # 설명이 길면 자르지 않고 다음 줄(들여쓰기)에 전문을 쓴다 — 잘린 '…'로는 내용을 알 수 없다.
+        if ($r.Desc -and $r.Desc.Length -gt $DescMax) {
+            [void]$out.Add("$n. [$($r.Bucket)] $idText $($r.Title)")
+            [void]$out.Add("    $($r.Desc)")
+        } else {
+            $descText = if ($r.Desc) { " — $($r.Desc)" } else { '' }
+            [void]$out.Add("$n. [$($r.Bucket)] $idText $($r.Title)$descText")
+        }
     }
     return ($out -join "`n")
 }
