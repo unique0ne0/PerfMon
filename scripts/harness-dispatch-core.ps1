@@ -1020,11 +1020,35 @@ function Show-StageDryRun {
     return @{ Success = $true; FailureReason = $null; QaDispatchedAt = $null }
 }
 
+# CFG-BL-116: 디스패처 프로세스 트리가 통째로 강제 종료되면 종료 상태를 쓸 주체가 없어 stage-state가
+# 'running'/'starting'에 방치된다. 다음 디스패치가 시작될 때 이전 상태의 소유 PID가 죽어 있으면
+# 'failed(unexpected-exit)'로 확정 기록해 감사 흔적을 남긴다(PID 재사용은 드물어 감수).
+function Resolve-OrphanedStageState {
+    $statePath = Resolve-RepoPath "$LogDir/$TaskId-stage-state.json"
+    if (-not (Test-Path -LiteralPath $statePath)) { return }
+    try {
+        $prev = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ([string]$prev.state -notmatch '^(starting|running)$') { return }
+        $ownerPid = 0
+        if (-not [int]::TryParse([string]$prev.pid, [ref]$ownerPid) -or $ownerPid -eq $PID) { return }
+        if (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue) { return }
+        $cycleId = 0
+        [void][int]::TryParse([string]$prev.cycle, [ref]$cycleId)
+        $note = if ([string]$prev.stage -eq 'integration') { ' — integration이면 검증·아카이브는 끝나고 커밋/push만 미완일 수 있으니 git status 확인' } else { '' }
+        $reason = "unexpected-exit: 소유 PID $ownerPid 소멸, 마지막 heartbeat $($prev.heartbeatAt)$note"
+        Write-StageState -Stage ([string]$prev.stage) -Cycle $cycleId -State 'failed' -ProcessId $PID -EvidencePaths @($prev.evidencePaths) -Reason $reason -Model ([string]$prev.model)
+        Write-Log "⚠️ 이전 [$($prev.stage)] 단계가 $($prev.state)에서 방치됨 — $reason" WARN
+    } catch {
+        Write-Log "⚠️ 방치된 stage-state 확인 실패(무시): $($_.Exception.Message)" WARN
+    }
+}
+
 function Initialize-StageDispatch {
     param([string]$Stage, [hashtable]$Config, [string]$LogRel)
 
     $logDirAbs = Resolve-RepoPath $LogDir
     if (-not (Test-Path $logDirAbs)) { New-Item -ItemType Directory -Path $logDirAbs -Force | Out-Null }
+    Resolve-OrphanedStageState
     Initialize-WatcherLog -Stage $Stage
     $cycle = New-DispatchCycle -Stage $Stage
     Write-StageState -Stage $Stage -Cycle $cycle.Id -State 'starting' -ProcessId $PID -EvidencePaths @($LogRel) -Reason 'dispatcher accepted stage' -Model $null
