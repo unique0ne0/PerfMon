@@ -27,6 +27,9 @@ function Get-SwitchableFailureClass {
         'No such model',
         'model is not available',
         'invalid api key',
+        # opencode-go 키 만료는 이 문구로만 나온다(2026-10-19 PN024 실측). 누락 시 noop으로만 전환되어
+        # 쿨다운이 남지 않고 매 디스패치가 죽은 go 슬롯을 재시도하다 조용히 big-pickle로 내려간다.
+        'API key has expired',
         '401 Unauthorized',
         '403 Forbidden',
         # 맨 '429'는 쓰지 않는다 — 부분 문자열 매칭이라 스택트레이스 줄번호('line 429')·소요시간
