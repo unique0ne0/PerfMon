@@ -158,104 +158,186 @@ function Get-CarryoverPendingItems {
     return ,$items
 }
 
-function Get-CarryoverPendingMessage {
-    # 미체크 항목을 사용자 화면용 목록(systemMessage)으로 만든다.  항목이 0건이면
-    # $null을 돌려 systemMessage 키 자체를 만들지 않는다.  실패는 호출자가 삼킨다
-    # (세션 시작을 막지 않는다).
-    param([System.IO.FileInfo[]]$Files, [int]$MaxBytes = 4096)
+# ── 처리 대기 목록 단일 모델 (세션 시작 systemMessage · /0 공용) ──────────────────
+# 4개 구역으로 묶고 통번호를 매긴다:  n. id : 제목 / 요약
+#   처리대상패킷 = 라우터 ACTIVE 패킷 + 인계 [지금처리]
+#   사용자결정필요 = [사용자결정대기] [승인대기]
+#   다음순서 = [다음순서] + 도래한 [시간경과] + 태그 없음·기타
+#   관찰/보류 = 미도래·날짜 미상 [시간경과] + 라우터 WAITING·장기보류·기타 상태
+$script:ListSectionOrder = @('처리대상패킷', '사용자결정필요', '다음순서', '관찰/보류')
 
-    $allFiles = @($Files)
-    $items = Get-CarryoverPendingItems -Files $allFiles
-    if ($items.Count -eq 0) { return $null }
-
-    # 3차: 태그별 분류.
-    $buckets = @{}
-    foreach ($key in $script:CarryoverBucketOrder) { $buckets[$key] = New-Object System.Collections.ArrayList }
-    foreach ($item in $items) {
-        $bucket = Get-CarryoverBucket $item
-        if (-not $buckets.ContainsKey($bucket)) { $buckets[$bucket] = New-Object System.Collections.ArrayList }
-        [void]$buckets[$bucket].Add($item)
+function Get-CarryoverSection {
+    param([string]$Bucket)
+    switch ($Bucket) {
+        '지금처리' { return '처리대상패킷' }
+        '사용자결정대기' { return '사용자결정필요' }
+        '승인대기' { return '사용자결정필요' }
+        '시간경과·미도래' { return '관찰/보류' }
+        '시간경과·날짜 미상' { return '관찰/보류' }
+        default { return '다음순서' }
     }
-
-    $allLines = New-Object System.Collections.ArrayList
-    [void]$allLines.Add("== 처리 대기 목록: 인계 파일 $($allFiles.Count)개 · 미체크 $($items.Count)건 ==")
-    foreach ($key in $script:CarryoverBucketOrder) {
-        if ($buckets[$key].Count -eq 0) { continue }
-        [void]$allLines.Add("[$key]")
-        foreach ($l in $buckets[$key]) { [void]$allLines.Add($l) }
-    }
-
-    # 4차: 4096바이트 상한 — 줄 단위로만 자른다(UTF-8 코드포인트·줄 분할 금지).
-    # `…외 N건` 접미 바이트를 예산에 포함한다.
-    $totalItems = $items.Count
-    $reserve = $utf8NoBom.GetByteCount("`r`n…외 ${totalItems}건")
-    $kept = New-Object System.Collections.ArrayList
-    $used = 0
-    $fitsAll = $true
-    foreach ($l in $allLines) {
-        $add = $utf8NoBom.GetByteCount($l)
-        if ($kept.Count -gt 0) { $add += 2 }
-        if (($used + $add) -gt ($MaxBytes - $reserve)) { $fitsAll = $false; break }
-        [void]$kept.Add($l)
-        $used += $add
-    }
-    if ($fitsAll) { return ($kept -join "`r`n") }
-
-    while ($kept.Count -gt 0 -and $kept[$kept.Count - 1] -match '^\[.*\]$') {
-        [void]$kept.RemoveAt($kept.Count - 1)
-    }
-    $keptItems = @($kept | Where-Object { $_ -match '^- ' }).Count
-    $omitted = $totalItems - $keptItems
-    if ($omitted -lt 1) { return ($kept -join "`r`n") }
-    $suffix = "`r`n…외 ${omitted}건"
-    while ($kept.Count -gt 0 -and ($utf8NoBom.GetByteCount((($kept -join "`r`n") + $suffix)) -gt $MaxBytes)) {
-        [void]$kept.RemoveAt($kept.Count - 1)
-        while ($kept.Count -gt 0 -and $kept[$kept.Count - 1] -match '^\[.*\]$') { [void]$kept.RemoveAt($kept.Count - 1) }
-        $keptItems = @($kept | Where-Object { $_ -match '^- ' }).Count
-        $omitted = $totalItems - $keptItems
-        $suffix = "`r`n…외 ${omitted}건"
-    }
-    return (($kept -join "`r`n") + $suffix)
 }
 
-function Get-CarryoverCompactList {
-    # /0 명령용.  한 줄 = 연번. [분류] ID 제목 — 간략설명.  연번은 표시 시점의 순번이고
-    # 안정 식별자는 CO- ID다(세션 간에 연번이 바뀔 수 있다).
-    param([System.IO.FileInfo[]]$Files, [int]$DescMax = 70)
+function Get-PacketTitleFromFile {
+    # 대시보드(task-status.ps1 Get-PacketTitle)와 같은 규칙: 패킷 상단 40줄의 '- Title:' 줄,
+    # 없으면 파일명 slug.  패킷을 못 찾으면 '-'.
+    param([string]$BriefsDir, [string]$TaskId)
+    foreach ($dir in @((Join-Path $BriefsDir 'packets'), (Join-Path $BriefsDir 'archive'))) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        $pk = @(Get-ChildItem -LiteralPath $dir -Filter "$TaskId-*.md" -File -ErrorAction SilentlyContinue)
+        if ($pk.Count -ne 1) { continue }
+        $title = ''
+        try {
+            $head = @(Get-Content -LiteralPath $pk[0].FullName -Encoding UTF8 -TotalCount 40 | Where-Object { $_ -match '^\s*-\s*Title\s*:\s*\S' } | Select-Object -First 1)
+            if ($head.Count -gt 0) { $title = ($head[0] -replace '^\s*-\s*Title\s*:\s*', '').Trim() }
+        } catch { }
+        if (-not $title) { $title = [regex]::Replace([System.IO.Path]::GetFileNameWithoutExtension($pk[0].Name), '^' + [regex]::Escape($TaskId) + '-', '') }
+        return $title
+    }
+    return '-'
+}
+
+function Get-RouterPacketEntries {
+    # handoff-log.md 라우터 표에서 처리 중인 패킷을 뽑는다.  저장소마다 열 구성이 달라
+    # (다음 단계/담당 분리 여부) 헤더 이름으로 열 위치를 찾는다.  DONE·빈 상태는 제외.
+    param([string]$BriefsDir)
+    $path = Join-Path $BriefsDir 'handoff-log.md'
+    $entries = New-Object System.Collections.ArrayList
+    if (-not (Test-Path -LiteralPath $path)) { return ,$entries }
+    $idx = @{}
+    foreach ($line in (Get-Content -LiteralPath $path -Encoding UTF8)) {
+        if ($line -notmatch '^\s*\|') { continue }
+        $cells = @($line.Trim().Trim('|').Split('|') | ForEach-Object { $_.Trim() })
+        if ($idx.Count -eq 0) {
+            for ($i = 0; $i -lt $cells.Count; $i++) {
+                if ($cells[$i] -match '^상태$') { $idx.Status = $i }
+                elseif ($cells[$i] -match '^다음 단계') { $idx.Next = $i }
+                elseif ($cells[$i] -match '^담당$') { $idx.Owner = $i }
+                elseif ($cells[$i] -match '^Blocked') { $idx.Blocked = $i }
+            }
+            if (-not $idx.ContainsKey('Status')) { $idx = @{} }
+            continue
+        }
+        if ($cells.Count -le $idx.Status) { continue }
+        $id = ($cells[0] -replace '[*`]', '')
+        if ($id -match '^\[([^\]]+)\]') { $id = $Matches[1] }
+        if ($id -notmatch '^[A-Za-z]{1,10}-?\d{2,}$') { continue }
+        $status = ($cells[$idx.Status] -replace '[*`]', '').Trim()
+        if (-not $status -or $status -match '^(DONE|[-—])') { continue }
+        $parts = New-Object System.Collections.ArrayList
+        if ($status -notmatch '^ACTIVE\b') { [void]$parts.Add($status) }
+        foreach ($k in 'Next', 'Owner', 'Blocked') {
+            if ($idx.ContainsKey($k) -and $idx[$k] -lt $cells.Count -and $cells[$idx[$k]] -notmatch '^[-—]?$') {
+                $label = @{ Next = '다음'; Owner = '담당'; Blocked = '차단' }[$k]
+                [void]$parts.Add("${label}: $($cells[$idx[$k]])")
+            }
+        }
+        $section = if ($status -match '^ACTIVE\b') { '처리대상패킷' } else { '관찰/보류' }
+        [void]$entries.Add(@{ IsPacket = $true; Section = $section; Id = $id; Title = (Get-PacketTitleFromFile -BriefsDir $BriefsDir -TaskId $id); Desc = ($parts -join ' / ') })
+    }
+    return ,$entries
+}
+
+function Get-PendingEntries {
+    # 인계 미체크 항목 + 라우터 패킷을 구역 순서대로 정렬한 항목 목록.  항목 =
+    # @{ Section; Id; Title; Desc }.  구역 안 순서: 패킷 → 인계(태그 우선순위 순).
+    param([System.IO.FileInfo[]]$Files, [string]$BriefsDir)
+    $all = New-Object System.Collections.ArrayList
+    $packetEntries = Get-RouterPacketEntries -BriefsDir $BriefsDir
+    foreach ($e in $packetEntries) { [void]$all.Add($e) }
     $items = Get-CarryoverPendingItems -Files @($Files)
-    if ($items.Count -eq 0) { return '처리 대기 항목이 없습니다.' }
-    $rows = New-Object System.Collections.ArrayList
     foreach ($key in $script:CarryoverBucketOrder) {
         foreach ($line in $items) {
             if ((Get-CarryoverBucket $line) -ne $key) { continue }
-            $id = Get-CarryoverItemId $line
             $title = ''
             $m = [regex]::Match($line, '\*\*(.+?)\*\*')
             if ($m.Success) { $title = $m.Groups[1].Value }
-            $rest = $line
+            $rest = ''
             if ($m.Success) { $rest = $line.Substring($m.Index + $m.Length) }
             $rest = ($rest -replace '^\s*[—–-]\s*', '') -replace '(\s*\[[^\]]*\])+\s*$', ''
             $rest = ($rest -replace '`', '').Trim()
-            if (-not $title) { $title = ($line -replace '^- \[ \]\s*', ''); if ($title.Length -gt 40) { $title = $title.Substring(0, 40) + '…' } }
-            [void]$rows.Add(@{ Bucket = $key; Id = $id; Title = $title; Desc = $rest })
+            if (-not $title) {
+                # 굵은 제목이 없는 줄: 체크박스·ID·끝 태그를 뺀 본문을 제목으로 쓴다(길면 40자에서 자름).
+                $title = (($line -replace '^- \[ \]\s*', '') -replace 'CO-\d{4}-\d{4}-\d{2}\s*', '') -replace '(\s*\[[^\]]*\])+\s*$', ''
+                $title = $title.Trim()
+                if ($title.Length -gt 40) { $title = $title.Substring(0, 40) + '…' }
+            }
+            $id = Get-CarryoverItemId $line
+            [void]$all.Add(@{ Section = (Get-CarryoverSection $key); Id = $(if ($id) { $id } else { '-' }); Title = $title; Desc = $rest })
         }
     }
-    $out = New-Object System.Collections.ArrayList
-    [void]$out.Add("처리 대기 $($rows.Count)건")
+    $ordered = New-Object System.Collections.ArrayList
+    foreach ($sec in $script:ListSectionOrder) {
+        foreach ($e in $all) { if ($e.Section -eq $sec) { [void]$ordered.Add($e) } }
+    }
+    return ,$ordered
+}
+
+function Format-PendingList {
+    # 항목을 `n. id : 제목 / 요약` 통번호 목록으로 만든다.  요약이 DescMax자를 넘으면 자르지
+    # 않고 다음 줄(4칸 들여쓰기)에 전문을 쓴다.  MaxBytes > 0이면 줄 단위로만 자르고
+    # `…외 N건`을 붙인다(UTF-8 코드포인트·항목 분할 금지).  0건이면 $null.
+    param([object[]]$Entries, [int]$FileCount, [int]$PacketCount, [int]$MaxBytes = 0, [string]$Nl = "`n", [int]$DescMax = 70)
+    $Entries = @($Entries)
+    if ($Entries.Count -eq 0) { return $null }
+    $blocks = New-Object System.Collections.ArrayList   # @{ Text; IsEntry }
+    [void]$blocks.Add(@{ Text = "== 처리 대기 목록: 인계 파일 ${FileCount}개 · 미체크 $($Entries.Count - $PacketCount)건 · 패킷 ${PacketCount}건 =="; IsEntry = $false })
     $n = 0
-    foreach ($r in $rows) {
-        $n++
-        $idText = if ($r.Id) { $r.Id } else { '-' }
-        # 설명이 길면 자르지 않고 다음 줄(들여쓰기)에 전문을 쓴다 — 잘린 '…'로는 내용을 알 수 없다.
-        if ($r.Desc -and $r.Desc.Length -gt $DescMax) {
-            [void]$out.Add("$n. [$($r.Bucket)] $idText $($r.Title)")
-            [void]$out.Add("    $($r.Desc)")
-        } else {
-            $descText = if ($r.Desc) { " — $($r.Desc)" } else { '' }
-            [void]$out.Add("$n. [$($r.Bucket)] $idText $($r.Title)$descText")
+    foreach ($sec in $script:ListSectionOrder) {
+        $inSec = @($Entries | Where-Object { $_.Section -eq $sec })
+        if ($inSec.Count -eq 0) { continue }
+        [void]$blocks.Add(@{ Text = "[$sec]"; IsEntry = $false })
+        foreach ($e in $inSec) {
+            $n++
+            if ($e.Desc -and $e.Desc.Length -gt $DescMax) {
+                $text = "$n. $($e.Id) : $($e.Title)$Nl    $($e.Desc)"
+            } elseif ($e.Desc) {
+                $text = "$n. $($e.Id) : $($e.Title) / $($e.Desc)"
+            } else {
+                $text = "$n. $($e.Id) : $($e.Title)"
+            }
+            [void]$blocks.Add(@{ Text = $text; IsEntry = $true })
         }
     }
-    return ($out -join "`n")
+    if ($MaxBytes -le 0) { return (@($blocks | ForEach-Object { $_.Text }) -join $Nl) }
+
+    $total = $Entries.Count
+    $reserve = $utf8NoBom.GetByteCount("${Nl}…외 ${total}건")
+    $kept = New-Object System.Collections.ArrayList
+    $used = 0
+    $fitsAll = $true
+    foreach ($b in $blocks) {
+        $add = $utf8NoBom.GetByteCount($b.Text)
+        if ($kept.Count -gt 0) { $add += $utf8NoBom.GetByteCount($Nl) }
+        if (($used + $add) -gt ($MaxBytes - $reserve)) { $fitsAll = $false; break }
+        [void]$kept.Add($b)
+        $used += $add
+    }
+    if ($fitsAll) { return (@($kept | ForEach-Object { $_.Text }) -join $Nl) }
+    while ($kept.Count -gt 0 -and -not $kept[$kept.Count - 1].IsEntry) { [void]$kept.RemoveAt($kept.Count - 1) }
+    $keptEntries = @($kept | Where-Object { $_.IsEntry }).Count
+    $omitted = $total - $keptEntries
+    if ($omitted -lt 1) { return (@($kept | ForEach-Object { $_.Text }) -join $Nl) }
+    return ((@($kept | ForEach-Object { $_.Text }) -join $Nl) + "${Nl}…외 ${omitted}건")
+}
+
+function Get-CarryoverPendingMessage {
+    # 사용자 화면용 목록(systemMessage).  항목이 0건이면 $null을 돌려 systemMessage 키 자체를
+    # 만들지 않는다.  실패는 호출자가 삼킨다(세션 시작을 막지 않는다).
+    param([System.IO.FileInfo[]]$Files, [string]$BriefsDir, [int]$MaxBytes = 4096)
+    $entries = Get-PendingEntries -Files $Files -BriefsDir $BriefsDir
+    $packets = @($entries | Where-Object { $_.IsPacket }).Count
+    return (Format-PendingList -Entries $entries -FileCount @($Files).Count -PacketCount $packets -MaxBytes $MaxBytes -Nl "`r`n")
+}
+
+function Get-CarryoverCompactList {
+    # /0 명령용.  상한 없이 전문을 보여 준다.  항목이 없으면 안내 문구.
+    param([System.IO.FileInfo[]]$Files, [string]$BriefsDir)
+    $entries = Get-PendingEntries -Files $Files -BriefsDir $BriefsDir
+    $packets = @($entries | Where-Object { $_.IsPacket }).Count
+    $text = Format-PendingList -Entries $entries -FileCount @($Files).Count -PacketCount $packets
+    if ($null -eq $text) { return '처리 대기 항목이 없습니다.' }
+    return $text
 }
 
 # ── VSCode 확장 첫 응답 표시 지시 (CFG115) ───────────────────────────────────
@@ -415,7 +497,7 @@ try {
     $files = @(Get-ChildItem -LiteralPath $briefsDir -Filter 'session-carryover-*.md' -File -ErrorAction SilentlyContinue)
 
     if ($Event -eq 'List') {
-        [Console]::Out.Write((Get-CarryoverCompactList -Files @($files | Sort-Object -Property @{ Expression = { Get-CarryoverSortTime $_ } })))
+        [Console]::Out.Write((Get-CarryoverCompactList -Files @($files | Sort-Object -Property @{ Expression = { Get-CarryoverSortTime $_ } }) -BriefsDir $briefsDir))
         exit 0
     }
 
@@ -495,7 +577,7 @@ try {
     # to context injection only (never blocks the session).
     $pendingMessage = $null
     if ($Format -eq 'claude') {
-        try { $pendingMessage = Get-CarryoverPendingMessage -Files $sorted } catch { $pendingMessage = $null }
+        try { $pendingMessage = Get-CarryoverPendingMessage -Files $sorted -BriefsDir $briefsDir } catch { $pendingMessage = $null }
     }
     $displayBlock = $null
     if (-not [string]::IsNullOrEmpty($pendingMessage) -and (Test-CarryoverExtensionMode -Event $Event -Format $Format)) {

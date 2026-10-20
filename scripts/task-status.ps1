@@ -851,6 +851,19 @@ function Get-PacketTitle {
     }
     return '-'
 }
+# 백로그 짧은 제목: 행의 <summary>가 '【짧은 제목】 설명'으로 시작하면 그 제목을 쓴다(backlog.md 규칙).
+# 없으면 HTML 태그를 벗기고 첫 절(' — ' 앞)을 40자까지 잘라 쓴다 — 긴 요약 전체보다는 낫지만 알아보기 어렵다.
+function Get-BacklogTitle {
+    param([string]$Content)
+    if ([string]::IsNullOrWhiteSpace($Content)) { return '-' }
+    if ($Content -match '【([^】]+)】') { return $Matches[1].Trim() }
+    $text = $Content
+    if ($text -match '<summary>(.+?)</summary>') { $text = $Matches[1] }
+    $text = ([regex]::Replace($text, '<[^>]+>', ' ') -replace '\s+', ' ').Trim()
+    $head = ($text -split ' — ', 2)[0]
+    if ($head.Length -gt 40) { $head = $head.Substring(0, 40) + '…' }
+    return $head
+}
 function Format-BacklogElapsedDays {
     param([string]$FirstFoundText)
     if ($FirstFoundText -notmatch '(\d{4}-\d{2}-\d{2})') { return '-' }
@@ -1339,7 +1352,7 @@ function Get-TaskStatuses {
             Project = Split-Path -Leaf $hostPath
             ProjectPath = $hostPath
             Task = $task.Id
-            Title = ([string]$task.Content -replace '\s+', ' ').Trim()
+            Title = Get-BacklogTitle -Content ([string]$task.Content)
             Stage = '백로그'
             StageKey = 'backlog'
             Status = '장기보류'
