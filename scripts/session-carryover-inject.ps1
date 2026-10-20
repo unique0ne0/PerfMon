@@ -52,13 +52,13 @@ function Get-FileStamp {
 # ── 처리 대기 목록 (사용자 화면 systemMessage, CFG113) ────────────────────────
 # carry-over 상태 태그(session-carryover SKILL.md).  태그는 미결 줄 끝의 대괄호
 # 토큰이다: [다음순서], [사용자결정대기: …], [시간경과: …], [지금처리], [승인대기].
-$script:CarryoverKnownTags = @('지금처리', '사용자결정대기', '승인대기', '시간경과', '다음순서')
+$script:CarryoverKnownTags = @('지금처리', '사용자결정대기', '승인대기', '시간경과', '다음순서', '관찰대기')
 
 # 버킷 출력 순서(우선순위 높음 → 낮음).  지금처리=즉시 실행 대상이라 최상위,
 # 승인대기는 사용자 응답을 기다리는 점에서 사용자결정대기 바로 뒤에 둔다.
 $script:CarryoverBucketOrder = @(
     '지금처리', '사용자결정대기', '승인대기', '다음순서',
-    '시간경과·도래', '시간경과·미도래', '시간경과·날짜 미상',
+    '시간경과·도래', '시간경과·미도래', '시간경과·날짜 미상', '관찰대기',
     '기타', '태그 없음'
 )
 
@@ -98,6 +98,7 @@ function Get-CarryoverBucket {
     if ($found -contains '승인대기') { return '승인대기' }
     if ($found -contains '다음순서') { return '다음순서' }
     if ($found -contains '시간경과') { return "시간경과·$(Get-CarryoverTimeStatus $Line)" }
+    if ($found -contains '관찰대기') { return '관찰대기' }
     # 기타: CarryoverKnownTags의 모든 태그가 전용 버킷을 가져 현재는 도달 불가.
     # 향후 태그만 추가하고 분기를 빠뜨릴 때를 위한 안전망으로 유지한다.
     if ($found.Count -gt 0) { return '기타' }
@@ -174,6 +175,7 @@ function Get-CarryoverSection {
         '승인대기' { return '사용자결정필요' }
         '시간경과·미도래' { return '관찰/보류' }
         '시간경과·날짜 미상' { return '관찰/보류' }
+        '관찰대기' { return '관찰/보류' }
         default { return '다음순서' }
     }
 }
