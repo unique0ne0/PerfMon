@@ -160,7 +160,7 @@ function Get-CarryoverPendingItems {
 }
 
 # ── 처리 대기 목록 단일 모델 (세션 시작 systemMessage · /0 공용) ──────────────────
-# 4개 구역으로 묶고 통번호를 매긴다:  n. id : 제목 / 요약
+# 4개 구역으로 묶고 통번호를 매긴다:  n. 제목 (id) + 다음 줄 요약
 #   처리대상패킷 = 라우터 ACTIVE 패킷 + 인계 [지금처리]
 #   사용자결정필요 = [사용자결정대기] [승인대기]
 #   다음순서 = [다음순서] + 도래한 [시간경과] + 태그 없음·기타
@@ -259,10 +259,22 @@ function Get-PendingEntries {
             $rest = ($rest -replace '^\s*[—–-]\s*', '') -replace '(\s*\[[^\]]*\])+\s*$', ''
             $rest = ($rest -replace '`', '').Trim()
             if (-not $title) {
-                # 굵은 제목이 없는 줄: 체크박스·ID·끝 태그를 뺀 본문을 제목으로 쓴다(길면 40자에서 자름).
+                # 굵은 제목이 없는 줄: 체크박스·ID·끝 태그를 뺀 본문을 제목으로 쓴다(아래에서 길이 정리).
                 $title = (($line -replace '^- \[ \]\s*', '') -replace 'CO-\d{4}-\d{4}-\d{2}\s*', '') -replace '(\s*\[[^\]]*\])+\s*$', ''
                 $title = $title.Trim()
-                if ($title.Length -gt 40) { $title = $title.Substring(0, 40) + '…' }
+            }
+            # 긴 제목(30자 초과)은 첫 구분자(' — '·':'·'(')까지만 제목으로 쓰고 나머지는 요약 앞으로 넘긴다.
+            if ($title.Length -gt 30) {
+                $cut = [regex]::Match($title, '\s+[—–]\s+|\s*[:：]\s*|\s*[(（]')
+                if ($cut.Success -and $cut.Index -ge 4 -and $cut.Index -le 30) {
+                    $tail = $title.Substring($cut.Index + $cut.Length).Trim()
+                    if ($cut.Value.Trim() -match '^[(（]') { $tail = '(' + $tail }
+                    $title = $title.Substring(0, $cut.Index).Trim()
+                } else {
+                    $tail = $title.Substring(30).Trim()
+                    $title = $title.Substring(0, 30).Trim() + '…'
+                }
+                $rest = (($tail + ' ' + $rest).Trim())
             }
             $id = Get-CarryoverItemId $line
             [void]$all.Add(@{ Section = (Get-CarryoverSection $key); Id = $(if ($id) { $id } else { '-' }); Title = $title; Desc = $rest })
@@ -276,8 +288,7 @@ function Get-PendingEntries {
 }
 
 function Format-PendingList {
-    # 항목을 `n. id : 제목 / 요약` 통번호 목록으로 만든다.  요약이 DescMax자를 넘으면 자르지
-    # 않고 다음 줄(4칸 들여쓰기)에 전문을 쓴다.  MaxBytes > 0이면 줄 단위로만 자르고
+    # 항목을 `n. 제목 (id)` + 다음 줄(4칸) 요약 통번호 목록으로 만든다.  요약은 자르지 않는다.  MaxBytes > 0이면 줄 단위로만 자르고
     # `…외 N건`을 붙인다(UTF-8 코드포인트·항목 분할 금지).  0건이면 $null.
     param([object[]]$Entries, [int]$FileCount, [int]$PacketCount, [int]$MaxBytes = 0, [string]$Nl = "`n", [int]$DescMax = 70)
     $Entries = @($Entries)
@@ -291,12 +302,10 @@ function Format-PendingList {
         [void]$blocks.Add(@{ Text = "[$sec]"; IsEntry = $false })
         foreach ($e in $inSec) {
             $n++
-            if ($e.Desc -and $e.Desc.Length -gt $DescMax) {
-                $text = "$n. $($e.Id) : $($e.Title)$Nl    $($e.Desc)"
-            } elseif ($e.Desc) {
-                $text = "$n. $($e.Id) : $($e.Title) / $($e.Desc)"
+            if ($e.Desc) {
+                $text = "$n. $($e.Title) ($($e.Id))$Nl    $($e.Desc)"
             } else {
-                $text = "$n. $($e.Id) : $($e.Title)"
+                $text = "$n. $($e.Title) ($($e.Id))"
             }
             [void]$blocks.Add(@{ Text = $text; IsEntry = $true })
         }
