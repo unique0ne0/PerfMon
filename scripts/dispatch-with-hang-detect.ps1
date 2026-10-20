@@ -534,8 +534,16 @@ function Get-TreeState {
         # Git writes core.autocrlf conversion advice to stderr with exit code 0. Stderr is
         # intentionally excluded from this content stream; only a non-zero Git exit means
         # the fingerprint is invalid.
-        & git diff --binary HEAD -- . 2>$null | ForEach-Object { & $hashText ($_ + "`n") }
-        if ($LASTEXITCODE -ne 0) { throw 'git diff failed' }
+        # CFG-BL-121: 파이프로 받은 git 출력은 [Console]::OutputEncoding으로 해석되므로 셸마다(사용자 터미널 cp949 vs
+        # 에이전트 셸 65001) 한글 diff의 지문이 갈렸다. 이 구간만 UTF-8로 고정하고 복원한다.
+        $prevOutEnc = [Console]::OutputEncoding
+        try {
+            [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+            & git diff --binary HEAD -- . 2>$null | ForEach-Object { & $hashText ($_ + "`n") }
+            $diffExit = $LASTEXITCODE
+        }
+        finally { [Console]::OutputEncoding = $prevOutEnc }
+        if ($diffExit -ne 0) { throw 'git diff failed' }
         $untracked = @(Invoke-GitPathList -RepoRoot $RepoRoot -GitArgs @('ls-files', '--others', '--exclude-standard') -NullDelimited |
             Where-Object {
                 $untrackedPath = $_.Replace('\','/')
