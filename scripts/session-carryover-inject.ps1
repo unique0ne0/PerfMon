@@ -303,7 +303,8 @@ function Format-PendingList {
         foreach ($e in $inSec) {
             $n++
             if ($e.Desc) {
-                $text = "$n. $($e.Title) ($($e.Id))$Nl    $($e.Desc)"
+                # 제목 줄 끝 공백 2칸 = 마크다운 강제 줄바꿈(없으면 VSCode가 요약을 제목 줄에 이어 붙여 렌더링한다)
+                $text = "$n. $($e.Title) ($($e.Id))  $Nl    $($e.Desc)"
             } else {
                 $text = "$n. $($e.Title) ($($e.Id))"
             }
@@ -380,7 +381,7 @@ function Get-CarryoverDisplayInstruction {
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.Append($nl)
     [void]$sb.Append('=== 처리 대기 목록 표시 지시 ==='); [void]$sb.Append($nl)
-    [void]$sb.Append('이 클라이언트(VSCode 확장)는 SessionStart의 사용자 표시 메시지를 보여 주지 못한다. 세션 첫 응답에서 반드시, 아래 처리 대기 목록을 요약·변형 없이 원문 그대로 사용자에게 보여 준 뒤 사용자의 요청에 답한다. 전역 지침(응답 시각 접두, 한국어 존댓말)은 그대로 적용하고, 시각 접두는 응답 맨 앞에 둔다.'); [void]$sb.Append($nl)
+    [void]$sb.Append('이 클라이언트(VSCode 확장)는 SessionStart의 사용자 표시 메시지를 보여 주지 못한다. 세션 첫 응답에서 반드시, 아래 처리 대기 목록을 요약·변형 없이 원문 그대로(각 제목 줄 끝의 공백 2칸 포함 — 요약이 다음 줄로 내려가게 하는 줄바꿈이다) 사용자에게 보여 준 뒤 사용자의 요청에 답한다. 전역 지침(응답 시각 접두, 한국어 존댓말)은 그대로 적용하고, 시각 접두는 응답 맨 앞에 둔다.'); [void]$sb.Append($nl)
     [void]$sb.Append($PendingMessage); [void]$sb.Append($nl)
     [void]$sb.Append('=== End 처리 대기 목록 표시 지시 ==='); [void]$sb.Append($nl)
     return $sb.ToString()
