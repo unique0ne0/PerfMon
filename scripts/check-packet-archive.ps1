@@ -9,7 +9,7 @@ $router = Join-Path $briefs 'handoff-log.md'
 $packets = Join-Path $briefs 'packets'
 if (-not (Test-Path -LiteralPath $router) -or -not (Test-Path -LiteralPath $packets)) { exit 0 }
 
-# 라우터 표의 섹션 제목은 저장소마다 다르다(ai-agents-config·claude-zen-fallback은 '## Router',
+# 라우터 표의 섹션 제목은 저장소마다 다르다(bluharness·claude-zen-fallback은 '## Router',
 # AIStaff·AC-II·WorldScheduler·PerfMon은 '## Packets'). 상태 열 위치도 표마다 달라질 수 있으므로
 # 헤더 행에서 '상태' 열 인덱스를 직접 찾는다. ID는 항상 첫 열이다.
 $doneIds = @()

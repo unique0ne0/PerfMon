@@ -86,7 +86,7 @@ function Invoke-GitQuiet {
 # pathspec 으로 잡아 그 변경이 영원히 미커밋으로 남았다(CFG-BL-065). 아래 상수는
 # sync-configs.ps1 의 $beginMarker/$endMarker 와 반드시 같아야 한다(공유 모듈이 없어
 # 상호 참조 주석으로 묶는다 — sync-configs.ps1 도 이 위치를 주석으로 가리킨다).
-$HarnessBeginMarker = '# BEGIN harness-generated (managed-by: ai-agents-config sync-configs.ps1 — do not edit by hand)'
+$HarnessBeginMarker = '# BEGIN harness-generated (managed-by: bluharness sync-configs.ps1 — do not edit by hand)'
 $HarnessEndMarker = '# END harness-generated'
 
 # 줄바꿈·BOM을 정규화하고 EOF 뒤쪽 빈 줄을 제거한 줄 배열을 돌려준다.
@@ -398,7 +398,7 @@ foreach ($proj in $targets) {
         $commitMsg = if (-not [string]::IsNullOrWhiteSpace($CommitMessage)) {
             $CommitMessage
         } else {
-            "chore(harness): sync harness assets from ai-agents-config`n`nAssets: $($commitPaths -join ', ')"
+            "chore(harness): sync harness assets from bluharness`n`nAssets: $($commitPaths -join ', ')"
         }
         $commitArgs = @('commit', '-m', $commitMsg, '--') + $commitPaths
         Invoke-GitQuiet -ProjRoot $proj -GitArgs $commitArgs | Out-Null

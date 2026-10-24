@@ -1,4 +1,4 @@
-﻿# BEGIN harness-generated (managed-by: ai-agents-config sync-configs.ps1 — do not edit by hand)
+﻿# BEGIN harness-generated (managed-by: bluharness sync-configs.ps1 — do not edit by hand)
 scripts/dispatch-with-hang-detect.ps1 linguist-generated=true
 scripts/check-packet-archive.ps1 linguist-generated=true
 scripts/allow-concurrent-packet-work.ps1 linguist-generated=true
