@@ -165,7 +165,8 @@ function Get-CarryoverPendingItems {
 #   사용자결정필요 = [사용자결정대기] [승인대기]
 #   다음순서 = [다음순서] + 도래한 [시간경과] + 태그 없음·기타
 #   관찰/보류 = 미도래·날짜 미상 [시간경과] + 라우터 WAITING·장기보류·기타 상태
-$script:ListSectionOrder = @('처리대상패킷', '사용자결정필요', '다음순서', '관찰/보류')
+#   개선후보 = backlog.md 미해결 표에서 summary가 `[개선]`으로 시작하는 행.  번호 대신 a1, a2…
+$script:ListSectionOrder = @('처리대상패킷', '사용자결정필요', '개선후보', '다음순서', '관찰/보류')
 
 function Get-CarryoverSection {
     param([string]$Bucket)
@@ -240,13 +241,37 @@ function Get-RouterPacketEntries {
     return ,$entries
 }
 
+function Get-ImprovementBacklogEntries {
+    # backlog.md `## 미해결` 표에서 summary가 `[개선]`으로 시작하는 행만 개선후보로 뽑는다.
+    # 관찰 항목(태그 없음)은 대상이 아니다.  해결·승격된 행은 다른 표로 옮겨지므로 자연히 빠진다.
+    param([string]$BriefsDir)
+    $path = Join-Path $BriefsDir 'backlog.md'
+    $entries = New-Object System.Collections.ArrayList
+    if (-not (Test-Path -LiteralPath $path)) { return ,$entries }
+    $inOpen = $false
+    foreach ($line in (Get-Content -LiteralPath $path -Encoding UTF8)) {
+        if ($line -match '^##\s') { $inOpen = ($line -match '^##\s*미해결'); continue }
+        if (-not $inOpen -or $line -notmatch '^\|\s*([A-Za-z]+-BL-\d+)\s*\|') { continue }
+        $blId = $Matches[1]
+        $s = [regex]::Match($line, '<summary>\s*\[개선\]\s*(.*?)</summary>')
+        if (-not $s.Success) { continue }
+        $text = $s.Groups[1].Value.Trim()
+        $t = [regex]::Match($text, '^【(.+?)】\s*(.*)$')
+        if ($t.Success) { $title = $t.Groups[1].Value; $desc = $t.Groups[2].Value.Trim() }
+        else { $title = $text; $desc = '' }
+        [void]$entries.Add(@{ IsImprovement = $true; Section = '개선후보'; Prefix = 'a'; Id = $blId; Title = $title; Desc = $desc })
+    }
+    return ,$entries
+}
+
 function Get-PendingEntries {
-    # 인계 미체크 항목 + 라우터 패킷을 구역 순서대로 정렬한 항목 목록.  항목 =
+    # 인계 미체크 항목 + 라우터 패킷 + 개선후보 백로그를 구역 순서대로 정렬한 항목 목록.  항목 =
     # @{ Section; Id; Title; Desc }.  구역 안 순서: 패킷 → 인계(태그 우선순위 순).
     param([System.IO.FileInfo[]]$Files, [string]$BriefsDir)
     $all = New-Object System.Collections.ArrayList
     $packetEntries = Get-RouterPacketEntries -BriefsDir $BriefsDir
     foreach ($e in $packetEntries) { [void]$all.Add($e) }
+    foreach ($e in (Get-ImprovementBacklogEntries -BriefsDir $BriefsDir)) { [void]$all.Add($e) }
     $items = Get-CarryoverPendingItems -Files @($Files)
     foreach ($key in $script:CarryoverBucketOrder) {
         foreach ($line in $items) {
@@ -294,19 +319,23 @@ function Format-PendingList {
     $Entries = @($Entries)
     if ($Entries.Count -eq 0) { return $null }
     $blocks = New-Object System.Collections.ArrayList   # @{ Text; IsEntry }
-    [void]$blocks.Add(@{ Text = "== 처리 대기 목록: 인계 파일 ${FileCount}개 · 미체크 $($Entries.Count - $PacketCount)건 · 패킷 ${PacketCount}건 =="; IsEntry = $false })
+    $impCount = @($Entries | Where-Object { $_.IsImprovement }).Count
+    $impNote = if ($impCount -gt 0) { " · 개선후보 ${impCount}건" } else { '' }
+    [void]$blocks.Add(@{ Text = "== 처리 대기 목록: 인계 파일 ${FileCount}개 · 미체크 $($Entries.Count - $PacketCount - $impCount)건 · 패킷 ${PacketCount}건${impNote} =="; IsEntry = $false })
     $n = 0
+    $a = 0
     foreach ($sec in $script:ListSectionOrder) {
         $inSec = @($Entries | Where-Object { $_.Section -eq $sec })
         if ($inSec.Count -eq 0) { continue }
         [void]$blocks.Add(@{ Text = "[$sec]"; IsEntry = $false })
         foreach ($e in $inSec) {
-            $n++
+            # 개선후보는 미결 목록 번호와 섞이지 않게 a1, a2… 로 따로 센다.
+            if ($e.IsImprovement) { $a++; $label = "a$a" } else { $n++; $label = "$n" }
             if ($e.Desc) {
                 # 제목 줄 끝 공백 2칸 = 마크다운 강제 줄바꿈(없으면 VSCode가 요약을 제목 줄에 이어 붙여 렌더링한다)
-                $text = "$n. $($e.Title) ($($e.Id))  $Nl    $($e.Desc)"
+                $text = "$label. $($e.Title) ($($e.Id))  $Nl    $($e.Desc)"
             } else {
-                $text = "$n. $($e.Title) ($($e.Id))"
+                $text = "$label. $($e.Title) ($($e.Id))"
             }
             [void]$blocks.Add(@{ Text = $text; IsEntry = $true })
         }
