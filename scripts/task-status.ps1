@@ -892,6 +892,20 @@ function Get-BacklogRelatedTask {
     }
     return $null
 }
+# OWNER 칸 표기. 방향을 구분한다: '← X'는 X 작업에서 보고된 항목(내용의 최초 발견·보고 출처),
+# '→ X'는 X 작업이 처리·관찰 대상(관찰 조건에 적힌 작업). 둘 다 있으면 '← X → Y'. 둘 다 없으면 '-'.
+function Get-BacklogOwnerText {
+    param([string]$ObserveCondition, [string]$Content)
+    $target = $null
+    $origin = $null
+    if ($ObserveCondition -match '\b([A-Z]{2,6}\d{3,})\b') { $target = $Matches[1] }
+    if ($Content -match '\b([A-Z]{2,6}\d{3,})\b') { $origin = $Matches[1] }
+    $parts = @()
+    if ($origin) { $parts += "← $origin" }
+    if ($target -and $target -ne $origin) { $parts += "→ $target" }
+    if ($parts.Count -eq 0) { return '-' }
+    return ($parts -join ' ')
+}
 function Get-DashboardStageKey {
     param([string]$Stage)
     if ([string]::IsNullOrWhiteSpace($Stage)) { return '' }
@@ -1347,7 +1361,7 @@ function Get-TaskStatuses {
     foreach ($bl in $raw.BacklogItems) {
         $hostPath = $bl.HostPath
         $task = $bl.Item
-        $relatedTask = Get-BacklogRelatedTask -ObserveCondition $task.ObserveCondition -Content $task.Content
+        $ownerText = Get-BacklogOwnerText -ObserveCondition $task.ObserveCondition -Content ([string]$task.Content)
         $rows += [pscustomobject]@{
             Project = Split-Path -Leaf $hostPath
             ProjectPath = $hostPath
@@ -1362,7 +1376,7 @@ function Get-TaskStatuses {
             LastActivity = Get-BacklogObserveSummary -ObserveCondition $task.ObserveCondition
             LastActivityFull = $task.ObserveCondition
             StageFull = $task.Content
-            Owner = if ($relatedTask) { "→ $relatedTask" } else { '-' }
+            Owner = $ownerText
             Model = '-'
         }
     }
