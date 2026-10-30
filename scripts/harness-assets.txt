@@ -34,4 +34,5 @@ harness-model-chain.ps1
 harness-session-continuation.ps1
 harness-dispatch-core.ps1
 agy-models.txt
+invoke-image-gen.ps1
 harness-assets.txt
