@@ -932,10 +932,10 @@ function Get-RawTaskStates {
         if ($ShowAll) {
             $tasks = $nonClosedTasks
         } else {
-            $tasks = @($nonClosedTasks | Where-Object { $_.Status -eq 'ACTIVE' })
+            $tasks = @($nonClosedTasks | Where-Object { $_.Status -eq 'ACTIVE' -or $_.Status -eq 'WAITING' })
             # ACTIVE만은 정상적인 다음 단계 대기는 숨기되, 만료된 시작/실행 lease는 라우터가 WAITING이어도
             # 조치가 필요한 실제 정지 증거다. 이 경우를 숨기면 CFG021처럼 사용자가 멈춘 작업을 알 수 없다.
-            foreach ($task in @($nonClosedTasks | Where-Object { $_.Status -ne 'ACTIVE' })) {
+            foreach ($task in @($nonClosedTasks | Where-Object { $_.Status -ne 'ACTIVE' -and $_.Status -ne 'WAITING' })) {
                 $lease = $leases[(Get-NormalizedTaskId -TaskId $task.TaskId)]
                 if ($lease -and -not $lease.Fresh -and ([string]$lease.Lease.state -match '^(starting|running)$')) {
                     $tasks += $task
@@ -1646,7 +1646,7 @@ function Update-Dashboard {
         $savedScrollIndex = $Grid.FirstDisplayedScrollingRowIndex
     }
     $Grid.Rows.Clear()
-    $EmptyLabel.Text = if ($ShowAll) { '표시할 패킷 없음 (DONE·폐기 제외)' } else { '현재 ACTIVE 패킷 없음' }
+    $EmptyLabel.Text = if ($ShowAll) { '표시할 패킷 없음 (DONE·폐기 제외)' } else { '현재 진행중(ACTIVE·WAITING) 패킷 없음' }
     $EmptyLabel.Visible = $rows.Count -eq 0
     foreach ($row in $rows) {
         $style = $statusStyles[$row.Status]
@@ -2022,35 +2022,35 @@ $controlPanel.Height = 32
 $controlPanel.Padding = New-Object System.Windows.Forms.Padding(4, 2, 4, 2)
 $controlPanel.AccessibleName = '대시보드 제어 및 시간 정보'
 $radioActive = New-Object System.Windows.Forms.RadioButton
-$radioActive.Text = 'ACTIVE만'
+$radioActive.Text = '진행중만 (ACTIVE·WAITING)'
 $radioActive.AutoSize = $true
 $radioActive.Location = New-Object System.Drawing.Point(6, 6)
 $radioActive.Checked = $false
-$radioActive.AccessibleName = 'ACTIVE만 표시'
+$radioActive.AccessibleName = '진행중만 표시'
 $radioAll = New-Object System.Windows.Forms.RadioButton
 $radioAll.Text = '전부 표시 (DONE·폐기 제외)'
 $radioAll.AutoSize = $true
-$radioAll.Location = New-Object System.Drawing.Point(88, 6)
+$radioAll.Location = New-Object System.Drawing.Point(190, 6)
 $radioAll.AccessibleName = '전부 표시'
 $refreshButton = New-Object System.Windows.Forms.Button
 $refreshButton.Text = '지금 갱신 (F5)'
 $refreshButton.Size = New-Object System.Drawing.Size(95, 25)
-$refreshButton.Location = New-Object System.Drawing.Point(270, 3)
+$refreshButton.Location = New-Object System.Drawing.Point(372, 3)
 $refreshButton.AccessibleName = '강제 새로고침'
 $refreshButton.AccessibleDescription = '대시보드를 즉시 다시 읽어옵니다'
 $restartDashButton = New-Object System.Windows.Forms.Button
 $restartDashButton.Text = '↺ 대시보드 재시작'
 $restartDashButton.Size = New-Object System.Drawing.Size(125, 25)
-$restartDashButton.Location = New-Object System.Drawing.Point(370, 3)
+$restartDashButton.Location = New-Object System.Drawing.Point(472, 3)
 $restartDashButton.AccessibleName = '대시보드 재시작'
 $restartDashButton.AccessibleDescription = '대시보드 창을 닫고 새 프로세스로 다시 실행합니다'
 $updatedLabel = New-Object System.Windows.Forms.Label
 $updatedLabel.AutoSize = $true
-$updatedLabel.Location = New-Object System.Drawing.Point(505, 8)
+$updatedLabel.Location = New-Object System.Drawing.Point(607, 8)
 $updatedLabel.AccessibleName = '데이터 갱신 시각'
 $clockLabel = New-Object System.Windows.Forms.Label
 $clockLabel.AutoSize = $true
-$clockLabel.Location = New-Object System.Drawing.Point(640, 8)
+$clockLabel.Location = New-Object System.Drawing.Point(742, 8)
 $clockLabel.AccessibleName = '현재 시각'
 $controlPanel.Controls.Add($radioActive)
 $controlPanel.Controls.Add($radioAll)
