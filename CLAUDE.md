@@ -55,3 +55,7 @@ ai-agents-config 공용 정책 상속 (`global/harness/orchestration-runbook.md`
 - 라우팅: `.agents/briefs/handoff-log.md` 라우터 표 → 패킷 파일(`packets/PMxxx-<slug>.md`)의 Pipeline Status 첫 미체크 항목이 역할.
 
 <!-- orchestration:end -->
+
+## 항목 나열 구분자 (하네스 공통, 2026-11-09)
+
+사용자에게 항목을 나열할 때는 범주별 접두 구분자를 붙인다 — 예: 우선순위 `p1, p2…`, 사용자 결정사항 `d1, d2…`, 안내·질문 `q1, q2…`. 한 응답 안에서 `1, 2, 3` 번호가 반복되거나 원형 불릿만 쓰지 않는다(사용자가 답변·지시 때 항목을 지목할 수 있도록). 원문 그대로 표시하라는 블록(예: 처리 대기 목록)은 예외.
