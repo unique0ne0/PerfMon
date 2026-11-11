@@ -24,5 +24,6 @@ scripts/harness-session-continuation.ps1 linguist-generated=true
 scripts/harness-dispatch-core.ps1 linguist-generated=true
 scripts/agy-models.txt linguist-generated=true
 scripts/invoke-image-gen.ps1 linguist-generated=true
+scripts/run-packet-queue.ps1 linguist-generated=true
 scripts/harness-assets.txt linguist-generated=true
 # END harness-generated

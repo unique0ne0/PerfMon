@@ -35,4 +35,5 @@ harness-session-continuation.ps1
 harness-dispatch-core.ps1
 agy-models.txt
 invoke-image-gen.ps1
+run-packet-queue.ps1
 harness-assets.txt
