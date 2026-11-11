@@ -319,6 +319,36 @@ function Test-FileEncodingPollution {
     return @{ Polluted = ($reasons.Count -gt 0); Reasons = @($reasons) }
 }
 
+function Test-BomOnlyEncodingPollution {
+    # CFG121(A-0): "BOM 추가" 사유 하나뿐인 정규화 대상 판정 헬퍼 — 라우터·자기 패킷·기존 .md/.json
+    # 소스 3곳에서 공통 사용한다. U+FFFD·한글 급감(모지바케) 사유가 섞이면 대상이 아니며, .ps1은
+    # BOM 필수 규칙이 달라 이 분기에서 제외한다(Scope 불변식 vi). BOM 결손(제거)은 대상이 아니다.
+    param([string]$RelPath, $Pollution)
+    if (-not $Pollution -or -not $Pollution.Polluted) { return $false }
+    if ([System.IO.Path]::GetExtension([string]$RelPath).ToLowerInvariant() -eq '.ps1') { return $false }
+    $reasons = @($Pollution.Reasons | Where-Object { $_ })
+    if ($reasons.Count -ne 1) { return $false }
+    return ([string]$reasons[0] -like 'BOM 추가*')
+}
+
+function Remove-FileUtf8Bom {
+    # CFG121(A-1): 파일 앞 3바이트의 UTF-8 BOM만 제거한다. 나머지 바이트(CRLF/LF 포함)는
+    # 1바이트도 건드리지 않는다. 파일 잠금 등으로 실패하면 예외를 삼키지 않고 $false를 돌려주고,
+    # 호출부가 fail-closed(차단성 복원)로 처리한다.
+    param([string]$Path)
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) { return $false }
+        $newLen = $bytes.Length - 3
+        $out = New-Object byte[] $newLen
+        if ($newLen -gt 0) { [System.Array]::Copy($bytes, 3, $out, 0, $newLen) }
+        [System.IO.File]::WriteAllBytes($Path, $out)
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Copy-ImplFileToQuarantine {
     param([string]$SourceAbs, [string]$RelPath, [string]$TaskId, [int]$Cycle)
     if (-not (Test-Path -LiteralPath $SourceAbs -PathType Leaf)) { return $null }
@@ -571,8 +601,17 @@ function Test-PlanningCreatedPacketRow {
 }
 
 function Invoke-ImplPollutionRestore {
-    # impl 단계 직후 1회 호출. prestage 스냅샷과 현재 바이트를 대조해 오염을 판정하고 복원한다.
-    # 반환: Polluted / Reason / Kind / Restored / Quarantined / Exempted / EvidencePath.
+    # impl 단계 직후 1회 호출. prestage 스냅샷과 현재 바이트를 대조해 오염을 판정하고 정규화·복원한다.
+    # 반환: Polluted / Reason / Kind / Restored / Quarantined / Exempted / EvidencePath / Normalized / RetryFiles.
+    # CFG121(A): "복원 후 재디스패치"를 "현장 정규화·계속"으로 전환한다.
+    #  - A-1 BOM 전용 오염(라우터·자기 패킷·신규가 아닌 .md/.json): BOM 3바이트만 제거하고
+    #    Polluted=$false로 둔다(재디스패치 없음 — 구현자의 Pipeline Status 체크가 사라지지 않는다).
+    #  - A-2 라우터 타 작업 행 변경: 선별 복원 후 자기 행·자기 패킷이 온전하면 Polluted=$false.
+    #  - A-3 소스 인코딩 오염(U+FFFD 등): 오염 파일만 복원(깨끗한 변경은 유지, 삭제된 파일은 복원 대상) + Polluted=$true 재디스패치.
+    #  - A-4 타 패킷 변조·신규 패킷 quarantine·패킷 삭제 복원은 현행 그대로(차단성).
+    # 차단성 사유는 $blockingReasons에만 모아 Polluted를 판정하고, 정규화·행 복원 내역은 fileDetails에만
+    # 남긴다(챌린지 f3). RetryFiles는 재시도 프롬프트에 실을 차단성 복원 파일 — 라우터 행 복원·BOM 제거
+    # 파일은 제외한다(소스 분기 복원분만 포함).
     param(
         [string]$TaskId,
         [int]$Cycle,
@@ -584,6 +623,7 @@ function Invoke-ImplPollutionRestore {
     $result = [ordered]@{
         Polluted = $false; Reason = $null; Kind = 'none'
         Restored = @(); Quarantined = @(); Exempted = @(); EvidencePath = $null
+        Normalized = @(); RetryFiles = @()
     }
     if ($null -eq $Prestage -or -not $Prestage.Root) { return [pscustomobject]$result }
 
@@ -592,26 +632,48 @@ function Invoke-ImplPollutionRestore {
     $packetPrefix = '.agents/briefs/packets/'
     $normSelf = Get-NormalizedTaskId -TaskId $TaskId
     $allowlist = @(Get-ProtocolPollutionAllowlist)
-    $reasons = New-Object System.Collections.Generic.List[string]
+    $blockingReasons = New-Object System.Collections.Generic.List[string]
     $kinds = New-Object System.Collections.Generic.List[string]
     $restored = New-Object System.Collections.Generic.List[string]
     $quarantined = New-Object System.Collections.Generic.List[string]
     $exempted = New-Object System.Collections.Generic.List[string]
+    $normalized = New-Object System.Collections.Generic.List[string]
+    $sourceRetry = New-Object System.Collections.Generic.List[string]
     $fileDetails = New-Object System.Collections.Generic.List[object]
+    $routerRowTasks = $null
+    $selfPacketIntact = $true
 
-    # ── 라우터: 바이트 무변경이면 검사 생략, 인코딩 오염은 전체 복원, 그 외는 행 선별 복원 ──
+    # ── 라우터: 바이트 무변경이면 검사 생략, BOM 전용은 현장 정규화, 그 외 인코딩 오염은 전체 복원,
+    #    내용 차이는 행 선별 복원(타 작업 행만) ──
     $routerAbs = Join-Path $repo ($routerRel -replace '/', '\')
     $routerBaseAbs = Join-Path $Prestage.Root ($routerRel -replace '/', '\')
     $curRouter = Get-FileByteFacts -Path $routerAbs
     $baseRouter = Get-FileByteFacts -Path $routerBaseAbs
+    $routerBlocking = $false
     if ($curRouter.Exists -and $baseRouter.Exists -and $curRouter.Sha256 -ne $baseRouter.Sha256) {
         $routerEnc = Test-FileEncodingPollution -RelPath $routerRel -Current $curRouter -Baseline $baseRouter
         if ($routerEnc.Polluted) {
-            Restore-ImplFileFromPrestage -RelPath $routerRel -Prestage $Prestage -TaskId $TaskId -Cycle $Cycle
-            $restored.Add($routerRel); $quarantined.Add($routerRel); $kinds.Add('router')
-            $reasons.Add("라우터 인코딩 오염: $($routerEnc.Reasons -join ', ')")
-            $fileDetails.Add([ordered]@{ path = $routerRel; kind = 'router'; change = 'encoding'; reasons = @($routerEnc.Reasons) })
-        } else {
+            if ((Test-BomOnlyEncodingPollution -RelPath $routerRel -Pollution $routerEnc) -and -not $baseRouter.HasBom) {
+                if (Remove-FileUtf8Bom -Path $routerAbs) {
+                    $normalized.Add($routerRel)
+                    $fileDetails.Add([ordered]@{ path = $routerRel; kind = 'router'; change = 'bom-stripped' })
+                    Write-Log "⚠️ 라우터 BOM 전용 오염 — 현장 정규화(BOM 제거, 재디스패치 없음): $routerRel" WARN
+                } else {
+                    Restore-ImplFileFromPrestage -RelPath $routerRel -Prestage $Prestage -TaskId $TaskId -Cycle $Cycle
+                    $restored.Add($routerRel); $quarantined.Add($routerRel); $kinds.Add('router')
+                    $blockingReasons.Add("라우터 인코딩 오염 — BOM 제거 실패(파일 잠김): $routerRel")
+                    $fileDetails.Add([ordered]@{ path = $routerRel; kind = 'router'; change = 'encoding'; reasons = @($routerEnc.Reasons) })
+                    $routerBlocking = $true
+                }
+            } else {
+                Restore-ImplFileFromPrestage -RelPath $routerRel -Prestage $Prestage -TaskId $TaskId -Cycle $Cycle
+                $restored.Add($routerRel); $quarantined.Add($routerRel); $kinds.Add('router')
+                $blockingReasons.Add("라우터 인코딩 오염: $($routerEnc.Reasons -join ', ')")
+                $fileDetails.Add([ordered]@{ path = $routerRel; kind = 'router'; change = 'encoding'; reasons = @($routerEnc.Reasons) })
+                $routerBlocking = $true
+            }
+        }
+        if (-not $routerBlocking) {
             $exemptTasks = New-Object System.Collections.Generic.List[string]
             $baseRowIds = @()
             foreach ($bl in @(Get-Content -LiteralPath $routerBaseAbs -Encoding UTF8)) {
@@ -636,14 +698,14 @@ function Invoke-ImplPollutionRestore {
             if ($sel.Changed) {
                 $null = Copy-ImplFileToQuarantine -SourceAbs $routerAbs -RelPath $routerRel -TaskId $TaskId -Cycle $Cycle
                 [System.IO.File]::WriteAllLines($routerAbs, $sel.OutputLines, (New-Object System.Text.UTF8Encoding($false)))
-                $restored.Add($routerRel); $quarantined.Add($routerRel); $kinds.Add('router')
-                $reasons.Add("라우터 타 작업 행 변경: $($sel.Tasks -join ', ')")
+                $restored.Add($routerRel); $quarantined.Add($routerRel)
+                $routerRowTasks = @($sel.Tasks)
                 $fileDetails.Add([ordered]@{ path = $routerRel; kind = 'router'; change = 'out-of-scope-row'; tasks = @($sel.Tasks) })
             }
         }
     }
 
-    # ── 패킷: 신규는 면제(기획팀) 아니면 quarantine, 기존은 변조 시 복원(자기 패킷은 인코딩만) ──
+    # ── 패킷: 신규는 면제(기획팀) 아니면 quarantine, 기존은 변조 시 복원(자기 패킷은 BOM 전용 정규화) ──
     $packetDirAbs = Join-Path $repo ($packetPrefix.TrimEnd('/') -replace '/', '\')
     $basePacketDir = Join-Path $Prestage.Root ($packetPrefix.TrimEnd('/') -replace '/', '\')
     if (Test-Path -LiteralPath $packetDirAbs) {
@@ -660,7 +722,7 @@ function Invoke-ImplPollutionRestore {
                 }
                 $null = Move-ImplFileToQuarantine -SourceAbs $f.FullName -RelPath $rel -TaskId $TaskId -Cycle $Cycle
                 $quarantined.Add($rel); $kinds.Add('packet')
-                $reasons.Add("신규 패킷 생성 ($($f.Name))")
+                $blockingReasons.Add("신규 패킷 생성 ($($f.Name))")
                 $fileDetails.Add([ordered]@{ path = $rel; kind = 'packet'; change = 'new'; exempted = $false })
                 continue
             }
@@ -669,16 +731,32 @@ function Invoke-ImplPollutionRestore {
             if ($cur.Sha256 -eq $base.Sha256) { continue }
             $enc = Test-FileEncodingPollution -RelPath $rel -Current $cur -Baseline $base
             if ($isSelf) {
+                # 자기 패킷의 내용 변경(체크박스 ②③ 등)은 정상 수백 — 인코딩 오염이 있을 때만 개입한다(불변식 i).
                 if ($enc.Polluted) {
-                    Restore-ImplFileFromPrestage -RelPath $rel -Prestage $Prestage -TaskId $TaskId -Cycle $Cycle
-                    $restored.Add($rel); $quarantined.Add($rel); $kinds.Add('packet')
-                    $reasons.Add("자기 패킷 인코딩 오염 ($($f.Name)): $($enc.Reasons -join ', ')")
-                    $fileDetails.Add([ordered]@{ path = $rel; kind = 'packet'; change = 'encoding'; reasons = @($enc.Reasons) })
+                    if ((Test-BomOnlyEncodingPollution -RelPath $rel -Pollution $enc) -and -not $base.HasBom) {
+                        if (Remove-FileUtf8Bom -Path $f.FullName) {
+                            $normalized.Add($rel)
+                            $fileDetails.Add([ordered]@{ path = $rel; kind = 'packet'; change = 'bom-stripped' })
+                            Write-Log "⚠️ 자기 패킷 BOM 전용 오염 — 현장 정규화(BOM 제거, 재디스패치 없음): $rel" WARN
+                        } else {
+                            Restore-ImplFileFromPrestage -RelPath $rel -Prestage $Prestage -TaskId $TaskId -Cycle $Cycle
+                            $restored.Add($rel); $quarantined.Add($rel); $kinds.Add('packet')
+                            $blockingReasons.Add("자기 패킷 인코딩 오염 — BOM 제거 실패(파일 잠김) ($($f.Name))")
+                            $fileDetails.Add([ordered]@{ path = $rel; kind = 'packet'; change = 'encoding'; reasons = @($enc.Reasons) })
+                            $selfPacketIntact = $false
+                        }
+                    } else {
+                        Restore-ImplFileFromPrestage -RelPath $rel -Prestage $Prestage -TaskId $TaskId -Cycle $Cycle
+                        $restored.Add($rel); $quarantined.Add($rel); $kinds.Add('packet')
+                        $blockingReasons.Add("자기 패킷 인코딩 오염 ($($f.Name)): $($enc.Reasons -join ', ')")
+                        $fileDetails.Add([ordered]@{ path = $rel; kind = 'packet'; change = 'encoding'; reasons = @($enc.Reasons) })
+                        $selfPacketIntact = $false
+                    }
                 }
             } else {
                 Restore-ImplFileFromPrestage -RelPath $rel -Prestage $Prestage -TaskId $TaskId -Cycle $Cycle
                 $restored.Add($rel); $quarantined.Add($rel); $kinds.Add('packet')
-                $reasons.Add("타 패킷 변조 ($($f.Name))")
+                $blockingReasons.Add("타 패킷 변조 ($($f.Name))")
                 $fileDetails.Add([ordered]@{ path = $rel; kind = 'packet'; change = 'modified' })
             }
         }
@@ -691,16 +769,18 @@ function Invoke-ImplPollutionRestore {
             $dest = Join-Path $repo ($rel -replace '/', '\')
             Copy-Item -LiteralPath $bf.FullName -Destination $dest -Force
             $restored.Add($rel); $kinds.Add('packet')
-            $reasons.Add("패킷 삭제 복원 ($($bf.Name))")
+            $blockingReasons.Add("패킷 삭제 복원 ($($bf.Name))")
             $fileDetails.Add([ordered]@{ path = $rel; kind = 'packet'; change = 'deleted-restored' })
+            if ((Get-NormalizedTaskId -TaskId (($bf.BaseName -split '-')[0])) -eq $normSelf) { $selfPacketIntact = $false }
         }
     }
 
-    # ── 소스(작업 트리): 인코딩 오염이 하나라도 있으면 이번 시도 변경분 전체를 일괄 롤백 ──
+    # ── 소스(작업 트리): 차단성 인코딩 오염 파일만 복원(정규화·계속) — 깨끗한 변경은 유지한다 ──
     $dirtyNow = @(Get-DirtyRepoFiles)
     $candidates = @($Prestage.Files.Keys + $dirtyNow | Sort-Object -Unique)
     $changed = New-Object System.Collections.Generic.List[string]
     $pollutedSources = New-Object System.Collections.Generic.List[string]
+    $deletedSources = New-Object System.Collections.Generic.List[string]
     $sourceDetails = @{}
     $existedBefore = @{}
     foreach ($rel in $candidates) {
@@ -714,7 +794,7 @@ function Invoke-ImplPollutionRestore {
             # CFG117(BL-113): prestage는 시작 시 더티였던 파일만 담는다. 시작 시 깨끗했던 추적 파일은
             # prestage baseline이 없으므로 HEAD 바이트를 baseline으로 삼는다 — 그래야 HEAD에 원래
             # 있던 U+FFFD를 신규 오염으로 오판하지 않고, 시작 시 깨끗했던 추적 파일을 삭제한 경우도
-            # differs=true가 되어 롤백 시 HEAD 바이트로 되살아난다. $differs 판정 이전에 대체한다.
+            # differs=true가 되어 복원 시 HEAD 바이트로 되살아난다. $differs 판정 이전에 대체한다.
             $headFacts = Get-HeadFileByteFacts -RelPath $rel
             if ($headFacts.Exists) { $base = $headFacts }
         }
@@ -726,39 +806,82 @@ function Invoke-ImplPollutionRestore {
         $changed.Add($rel)
         if ($cur.Exists) {
             $enc = Test-FileEncodingPollution -RelPath $rel -Current $cur -Baseline $base
-            if ($enc.Polluted) { $pollutedSources.Add($rel); $sourceDetails[$rel] = $enc }
+            if ($enc.Polluted) {
+                if ((Test-BomOnlyEncodingPollution -RelPath $rel -Pollution $enc) -and $base.Exists -and -not $base.HasBom -and ([IO.Path]::GetExtension($rel).ToLowerInvariant() -in @('.md', '.json'))) {
+                    # A-1: 기존 파일의 BOM 전용 오염 — 현장 정규화. 신규 파일은 대상이 아니다(면제 없이 복원).
+                    if (Remove-FileUtf8Bom -Path $abs) {
+                        $normalized.Add($rel)
+                        $fileDetails.Add([ordered]@{ path = $rel; kind = 'source'; change = 'bom-stripped' })
+                        Write-Log "⚠️ 소스 BOM 전용 오염 — 현장 정규화(BOM 제거, 재디스패치 없음): $rel" WARN
+                    } else {
+                        $pollutedSources.Add($rel)
+                        $sourceDetails[$rel] = @{ Reasons = @(@($enc.Reasons) + 'BOM 제거 실패(파일 잠김 — 복원으로 처리)') }
+                    }
+                } else {
+                    $pollutedSources.Add($rel); $sourceDetails[$rel] = $enc
+                }
+            }
+        } else {
+            # 시도 중 삭제된 파일: 차단성 복원이 발생하는 경우에 한해 되살린다(CFG117 (f) 계약 유지).
+            $deletedSources.Add($rel)
         }
     }
     if ($pollutedSources.Count -gt 0) {
-        foreach ($rel in $changed) {
+        $sourceRestoredAll = New-Object System.Collections.Generic.List[string]
+        foreach ($rel in $pollutedSources) {
             Restore-ImplFileFromPrestage -RelPath $rel -Prestage $Prestage -TaskId $TaskId -Cycle $Cycle
-            $restored.Add($rel); $quarantined.Add($rel)
+            $restored.Add($rel); $quarantined.Add($rel); $sourceRetry.Add($rel); $sourceRestoredAll.Add($rel)
         }
-        # CFG117 설계3(롤백 후 트리 불변식): 롤백 전에 존재하던(추적/prestage) 파일이 롤백 후
-        # 트리에서 사라지면 안 된다. 결손이 있으면 HEAD 바이트로 재복원하고 WARN을 남긴다.
-        $missingAfterRollback = @($changed | Where-Object {
+        foreach ($rel in $deletedSources) {
+            Restore-ImplFileFromPrestage -RelPath $rel -Prestage $Prestage -TaskId $TaskId -Cycle $Cycle
+            $restored.Add($rel); $sourceRetry.Add($rel); $sourceRestoredAll.Add($rel)
+        }
+        # CFG117 설계3(복원 후 트리 불변식): 복원 대상이었던 파일이 복원 후 트리에서 사라지면 안 된다.
+        # 결손이 있으면 HEAD 바이트로 재복원하고 WARN을 남긴다.
+        $missingAfterRestore = @($sourceRestoredAll | Where-Object {
                 $existedBefore[$_] -and -not (Test-Path -LiteralPath (Join-Path $repo ($_ -replace '/', '\')) -PathType Leaf)
             })
-        if ($missingAfterRollback.Count -gt 0) {
-            Write-Log "⚠️ 롤백 후 소스 파일 결손 감지 — HEAD 바이트로 재복원: $($missingAfterRollback -join ', ')" WARN
-            foreach ($rel in $missingAfterRollback) {
+        if ($missingAfterRestore.Count -gt 0) {
+            Write-Log "⚠️ 복원 후 소스 파일 결손 감지 — HEAD 바이트로 재복원: $($missingAfterRestore -join ', ')" WARN
+            foreach ($rel in $missingAfterRestore) {
                 Restore-ImplFileFromPrestage -RelPath $rel -Prestage $Prestage -TaskId $TaskId -Cycle $Cycle
             }
         }
         $kinds.Add('source')
-        $reasons.Add("소스 인코딩 오염 — 시도 전체 일괄 롤백: $($pollutedSources -join ', ')")
+        $blockingReasons.Add("소스 인코딩 오염 — 오염 파일만 복원(깨끗한 변경 유지): $($pollutedSources -join ', ')")
+        if ($deletedSources.Count -gt 0) {
+            $blockingReasons.Add("삭제 파일 복원: $($deletedSources -join ', ')")
+        }
         foreach ($rel in $pollutedSources) {
             $fileDetails.Add([ordered]@{ path = $rel; kind = 'source'; change = 'encoding'; reasons = @($sourceDetails[$rel].Reasons) })
         }
+        foreach ($rel in $deletedSources) {
+            $fileDetails.Add([ordered]@{ path = $rel; kind = 'source'; change = 'deleted-restored' })
+        }
     }
 
-    $result.Polluted = ($reasons.Count -gt 0)
+    # ── 라우터 행 복원의 차단성 판정은 자기 패킷 검사 뒤에 확정한다(챌린지 f3 — 판정 순서 역전 방지) ──
+    if ($null -ne $routerRowTasks) {
+        $selfRowIntact = $false
+        foreach ($rl in @(Get-Content -LiteralPath $routerAbs -Encoding UTF8)) {
+            $ri = Get-RouterRowInfo -Line $rl
+            if ($ri -and (Get-NormalizedTaskId -TaskId $ri.TaskId) -eq $normSelf) { $selfRowIntact = $true; break }
+        }
+        if (-not ($selfRowIntact -and $selfPacketIntact)) {
+            $blockingReasons.Add("라우터 타 작업 행 변경(자기 행/자기 패킷 손상 동반): $($routerRowTasks -join ', ')")
+            $kinds.Add('router')
+        }
+    }
+
+    $result.Polluted = ($blockingReasons.Count -gt 0)
     $result.Kind = if ($kinds.Count -gt 0) { [string]$kinds[0] } else { 'none' }
     $result.Restored = @($restored | Sort-Object -Unique)
     $result.Quarantined = @($quarantined | Sort-Object -Unique)
     $result.Exempted = @($exempted | Sort-Object -Unique)
-    $result.Reason = if ($result.Polluted) { ($reasons -join '; ') } else { $null }
-    if ($result.Polluted -or $exempted.Count -gt 0) {
+    $result.Normalized = @($normalized | Sort-Object -Unique)
+    $result.RetryFiles = @($sourceRetry | Sort-Object -Unique)
+    $result.Reason = if ($result.Polluted) { ($blockingReasons -join '; ') } else { $null }
+    if ($result.Polluted -or $exempted.Count -gt 0 -or $fileDetails.Count -gt 0) {
         $evidence = [ordered]@{
             schemaVersion = 1
             timestamp = [datetime]::UtcNow.ToString('o')
@@ -772,6 +895,7 @@ function Invoke-ImplPollutionRestore {
             restored = @($result.Restored)
             quarantined = @($result.Quarantined)
             exemptedPlanning = @($result.Exempted)
+            normalized = @($result.Normalized)
             files = [object[]]$fileDetails
         }
         $evidenceAbs = Resolve-RepoPath ("$(Get-ImplLogRel)/$TaskId-pollution.json")
@@ -1514,8 +1638,15 @@ function Dispatch-Stage {
                         $modelIndex = $models.Count
                         break
                     }
-                    if ($pollutionSameModel -le 2) {
-                        $pollutionRetryNotice = "직전 시도가 인코딩 오염으로 복원됐다 — BOM 유지, 파일 전체 재작성 금지, 편집은 부분 치환만 해라."
+                    # CFG121(A-3): 재시도 안내 문구 — "BOM 유지" 대신 기존 파일의 BOM 유무 보존 규칙을 명시한다.
+                    # 복원 파일 목록은 차단성 복원(소스 분기)만 실는다 — 라우터 행 복원·BOM 정규화 파일 제외.
+                    $pollutionRetryNotice = '직전 시도가 인코딩 오염으로 복원됐다 — 기존 파일 BOM 유무 보존(.ps1만 BOM, .md/.json은 No-BOM), 파일 전체 재작성 금지, 편집은 부분 치환만 해라.'
+                    $pollutionRetryFiles = @($pollutionResult.RetryFiles | Where-Object { $_ })
+                    if ($pollutionRetryFiles.Count -gt 0) {
+                        $pollutionRetryNotice = "$pollutionRetryNotice 다음 파일만 인코딩 오염으로 되돌렸다: $($pollutionRetryFiles -join ', ') — 이 파일만 부분 치환으로 다시 고쳐라."
+                    }
+                    if ($pollutionSameModel -lt 2) {
+                        # 같은 모델 최대 2회 시도 후 다음 모델로 1회 폴백(총 3회 상한은 위 pollutionTotal 검사).
                         # inner loop의 continue는 outer loop의 toolCmd 재조립을 거치지 않으므로 여기서 직접 다시 만든다.
                         $toolCmd = Build-ToolCommand -Config $config -Stage $Stage -PromptOverride "$basePrompt`n`n$pollutionRetryNotice" -Model $model -BypassToolPermissions:$BypassToolPermissions
                         $suppressLeftoverNotice = $true
@@ -1523,7 +1654,6 @@ function Dispatch-Stage {
                         continue
                     }
                     $pollutionSameModel = 0
-                    $pollutionRetryNotice = "직전 시도가 인코딩 오염으로 복원됐다 — BOM 유지, 파일 전체 재작성 금지, 편집은 부분 치환만 해라."
                     $suppressLeftoverNotice = $true
                     break
                 }
@@ -1840,6 +1970,9 @@ function Resolve-DispatchPlan {
         [Parameter(Mandatory=$false)][switch]$Chain,
         [Parameter(Mandatory=$false)][switch]$DryRun,
         [Parameter(Mandatory=$false)][switch]$SkipVerdictGate,
+        # CFG121(B-3): 체인 프리플라이트 verify 생략 — 환경성 verify 실패를 이미 해소·재검증한 뒤
+        # 이번 실행만 건너뛸 때 사용한다(기본 off). standalone 단일 Stage 디스패치는 영향이 없다.
+        [Parameter(Mandatory=$false)][switch]$SkipPreflightVerify,
         [Parameter(Mandatory=$false)][switch]$ForceFreeModel,
         [Parameter(Mandatory=$false)][switch]$ResetStageLedger,
         [Parameter(Mandatory=$false)][string]$ResetReason,
@@ -2057,7 +2190,14 @@ function Resolve-DispatchPlan {
     if ($ProfileModule -and (Test-Path -LiteralPath $ProfileModule)) {
         . $ProfileModule
     }
-    $profileConfig = Read-ModelProfileConfig -CentralPath $ProfileConfigPath -LocalPath (Join-Path $RepoRoot 'model-profiles.local.json')
+    # CFG121(C): model-profiles.local.json 오버레이 적용 사실을 로그·chain-summary에 드러낸다.
+    $localOverrideList = @()
+    $localOverrideRef = [ref]$localOverrideList
+    $profileConfig = Read-ModelProfileConfig -CentralPath $ProfileConfigPath -LocalPath (Join-Path $RepoRoot 'model-profiles.local.json') -LocalOverrides $localOverrideRef
+    $localOverrideList = @($localOverrideRef.Value | Where-Object { $_ })
+    if ($localOverrideList.Count -gt 0) {
+        Write-Log "[profile] 로컬 오버레이 적용 $($localOverrideList.Count)개: $($localOverrideList -join ', ')" INFO
+    }
     $configuredPlanning = Resolve-RoleProfile -Role planning -Config $profileConfig
     $planningProfile = $configuredPlanning.Name
     $planningAdapter = $configuredPlanning.Adapter
@@ -2208,8 +2348,10 @@ function Resolve-DispatchPlan {
         Chain = [bool]$Chain
         DryRun = [bool]$DryRun
         SkipVerdictGate = [bool]$SkipVerdictGate
+        SkipPreflightVerify = [bool]$SkipPreflightVerify
         ResealQaVerdict = [bool]$ResealQaVerdict
         CheckPipelinePacket = $checkPipelinePacket
+        LocalOverrides = @($localOverrideList)
         ProfileConfig = $profileConfig
         RuntimeRoleBinding = $runtimeRoleBinding
         PipelineRouting = $pipelineRouting
@@ -2292,7 +2434,7 @@ function Invoke-DispatchChain {
         if ($liveActivity) {
             Write-Log "⛔ 자동 연쇄/재개 중단 — 살아 있는 단계 실행이 있어 재개하지 않습니다: $liveActivity" ERROR
             Write-Log '살아 있는 lease·락·승인 대기를 보존한 채 종료합니다. 실행이 끝난 뒤 다시 재개하세요.' ERROR
-            Write-ChainSummary -State 'blocked' -Stages @() -Warnings @("살아 있는 실행으로 인한 재개 보류 — $liveActivity") -StartedAt (Get-Date) -PipelineBefore $chainPipelineBefore -PipelineAfter $chainPipelineBefore -TreeBefore (Get-TreeState) -TreeAfter (Get-TreeState) -QaVerdict @{ verdict = $null; fresh = $false } | Out-Null
+            Write-ChainSummary -State 'blocked' -Stages @() -Warnings @("살아 있는 실행으로 인한 재개 보류 — $liveActivity") -StartedAt (Get-Date) -PipelineBefore $chainPipelineBefore -PipelineAfter $chainPipelineBefore -TreeBefore (Get-TreeState) -TreeAfter (Get-TreeState) -QaVerdict @{ verdict = $null; fresh = $false } -LocalOverrides @($Plan.LocalOverrides) | Out-Null
             return 1
         }
         $chainStartedAt = Get-Date
@@ -2316,13 +2458,45 @@ function Invoke-DispatchChain {
             }
         }
         if ($effectiveIndex -lt 0) {
-            Write-ChainSummary -State 'completed' -Stages @() -Warnings @('packet has no incomplete executable stage') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter $chainPipelineBefore -TreeBefore $chainTreeBefore -TreeAfter $chainTreeBefore -QaVerdict $chainQaVerdict | Out-Null
+            Write-ChainSummary -State 'completed' -Stages @() -Warnings @('packet has no incomplete executable stage') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter $chainPipelineBefore -TreeBefore $chainTreeBefore -TreeAfter $chainTreeBefore -QaVerdict $chainQaVerdict -LocalOverrides @($Plan.LocalOverrides) | Out-Null
             Write-Log '✅ 패킷에 미완료 실행 단계가 없습니다 — 재디스패치 없이 종료' SUCCESS
             if (Get-Command Remove-ImplPrestage -ErrorAction SilentlyContinue) { Remove-ImplPrestage -TaskId $TaskId }
             return 0
         }
         $stagesToRun = @($allStages[$effectiveIndex..($allStages.Count - 1)])
         Write-Log "유효 시작 단계: $effectiveStage (완료 단계 재디스패치 금지)" INFO
+        # ── CFG121(B): 체인 프리플라이트 verify — 환경성 실패(하류 사본 드리프트 등)를 ② 스폰 전에
+        # 차단한다. -Chain에서만 동작하며 -DryRun·-SkipPreflightVerify면 생략한다. 기본(캐시) 모드로
+        # 1회 실행하고 단계 원장(ledger)·attempt 번호를 소비하지 않는다. 실패 마커는 $effectiveStage에
+        # 남겨 재기동 시 자동 정리되게 한다(preflight 스테이지 금지 — 챌린지 f4).
+        if (-not $DryRun -and -not $Plan.SkipPreflightVerify) {
+            Write-Log "🔍 [preflight] 체인 시작 전 verify 프리플라이트 실행 (scripts/verify.ps1, 캐시 모드)" INFO
+            $preflightResult = Invoke-VerifyGateCore -Stage 'preflight' -AttemptLabel ''
+            if (-not $preflightResult.Success) {
+                $preflightFailLines = @($preflightResult.Output | Where-Object { $_ -match '\[FAIL\]' })
+                $preflightSteps = New-Object System.Collections.Generic.List[string]
+                foreach ($pfLine in $preflightFailLines) {
+                    $pfMatch = [regex]::Match([string]$pfLine, '\[FAIL\]\s+(.+?)\s+\(\d+(?:\.\d+)?s\)')
+                    if ($pfMatch.Success -and -not $preflightSteps.Contains($pfMatch.Groups[1].Value)) {
+                        $preflightSteps.Add($pfMatch.Groups[1].Value)
+                    }
+                }
+                if ($preflightSteps.Count -gt 0) {
+                    $preflightReason = "preflight verify 실패: $($preflightFailLines -join '; ')"
+                } elseif ($preflightResult.FailureReason) {
+                    $preflightReason = "preflight verify 실패: $($preflightResult.FailureReason)"
+                } else {
+                    $preflightReason = 'preflight verify 실패: 원인 미상(verify 출력 없음)'
+                }
+                $preflightWarnings = if ($preflightFailLines.Count -gt 0) { $preflightFailLines } else { @([string]$preflightResult.FailureReason) }
+                Write-Log "❌ [preflight] $preflightReason" ERROR
+                Write-FailureMarker -Stage $effectiveStage -Reason $preflightReason
+                try { [System.Console]::Beep() } catch { }
+                Write-ChainSummary -State 'failed' -Stages @() -Warnings $preflightWarnings -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter $chainPipelineBefore -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict -Reason $preflightReason -LocalOverrides @($Plan.LocalOverrides) | Out-Null
+                return 1
+            }
+            Write-Log "✅ [preflight] 프리플라이트 verify 통과 — 체인 진행" SUCCESS
+        }
         # A task can resume at QA or Integration after a prior chain invocation.
         # Preserve its per-stage runtime identities: resetting here would erase
         # the logical predecessor before the adjacency check runs.
@@ -2347,7 +2521,7 @@ function Invoke-DispatchChain {
                         'model-profiles.local.json의 roles 항목을 편집해 쿼터가 남은 프로필로 재배정'
                     )
                     try { [System.Console]::Beep(1000, 2000); [System.Console]::Beep(800, 2000) } catch { }
-                    Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @($adjReason) -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
+                    Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @($adjReason) -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict -LocalOverrides @($Plan.LocalOverrides) | Out-Null
                     return 1
                 }
             }
@@ -2355,7 +2529,7 @@ function Invoke-DispatchChain {
                 Write-Log 'ℹ️ 경량 게이트 등급(패킷 선언) — QA verdict 게이트 생략, ⑤ 그대로 진행' INFO
             } elseif ($stage -eq 'integration' -and -not $DryRun -and -not (Test-QaVerdict -QaDispatchedAt $null)) {
                 Write-FailureMarker -Stage 'integration' -Reason 'QA verdict 미통과 — ⑤ 진행 중단'
-                Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @('QA verdict 미통과 — ⑤ 진행 중단') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
+                Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @('QA verdict 미통과 — ⑤ 진행 중단') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict -LocalOverrides @($Plan.LocalOverrides) | Out-Null
                 return 1
             }
             if ($stage -eq 'integration' -and -not $DryRun) {
@@ -2380,7 +2554,7 @@ function Invoke-DispatchChain {
                         }
                     } catch { }
                 }
-                Write-ChainSummary -State $chainState -Stages $chainStages -Warnings $chainWarnings -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
+                Write-ChainSummary -State $chainState -Stages $chainStages -Warnings $chainWarnings -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict -LocalOverrides @($Plan.LocalOverrides) | Out-Null
                 Write-Log "❌ [$stage] 파이프라인 중단 (상태: $chainState, 로그: $($StageConfig[$stage].LogFile))" ERROR
                 return 1
             }
@@ -2395,7 +2569,7 @@ function Invoke-DispatchChain {
                 } catch { }
                 if ($actualQaVerdict) { $chainQaVerdict = $actualQaVerdict }
                 Write-FailureMarker -Stage 'qa' -Reason 'QA verdict 미통과 — ⑤ 진행 중단'
-                Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @('QA verdict 미통과 — ⑤ 진행 중단') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
+                Write-ChainSummary -State 'blocked' -Stages $chainStages -Warnings @('QA verdict 미통과 — ⑤ 진행 중단') -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict -LocalOverrides @($Plan.LocalOverrides) | Out-Null
                 return 1
             }
             if ($stage -eq 'qa') {
@@ -2412,7 +2586,7 @@ function Invoke-DispatchChain {
             if ($stage -eq 'qa' -and -not $DryRun -and $result.CycleId) { Resolve-ApprovalRecords -Stage 'qa' -ResolvingCycle $result.CycleId }
             Start-Sleep -Seconds 2
         }
-        Write-ChainSummary -State 'completed' -Stages $chainStages -Warnings @() -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict | Out-Null
+        Write-ChainSummary -State 'completed' -Stages $chainStages -Warnings @() -StartedAt $chainStartedAt -PipelineBefore $chainPipelineBefore -PipelineAfter (Get-PacketPipelineStatus $checkPipelinePacket) -TreeBefore $chainTreeBefore -TreeAfter (Get-TreeState) -QaVerdict $chainQaVerdict -LocalOverrides @($Plan.LocalOverrides) | Out-Null
         Write-Log "🎉 파이프라인 완료 — impl/qa/integration 로그는 $LogDir 참조" SUCCESS
         # CFG105 Done When 2: integration 성공 종료 후 DONE 패킷이 packets/에 남았는지 관찰 경고(비차단).
         if (Get-Command Write-PostChainArchiveWarning -ErrorAction SilentlyContinue) {

@@ -135,12 +135,15 @@ function Test-ProfileGraph {
 }
 
 function Read-ModelProfileConfig {
-    param([string]$CentralPath, [string]$LocalPath)
+    # CFG121(C): -LocalOverrides([ref])로 로컬 오버레이 적용 내역("roles.qa=gemini-qa" 등)을 돌려준다.
+    # 호출부가 로그·chain-summary에 오버레이 적용 사실을 드러내기 위한 단일 출처다.
+    param([string]$CentralPath, [string]$LocalPath, [ref]$LocalOverrides)
     $config = Read-JsonFile -Path $CentralPath
     $graphWarnings = [System.Collections.ArrayList]@()
     Test-ProfileGraph -Config $config -Warnings $graphWarnings
     foreach ($w in $graphWarnings) { Write-Warning $w }
     $graphWarnings.Clear()
+    $overrides = New-Object System.Collections.Generic.List[string]
     $local = Read-JsonFile -Path $LocalPath
     if ($null -ne $local) {
         $unexpectedTopLevel = @($local.psobject.Properties.Name | Where-Object { $_ -notin @('roles', 'plannerRouting', 'preferCost') })
@@ -153,6 +156,7 @@ function Read-ModelProfileConfig {
             $costVal = [string]$local.preferCost
             if ($costVal -ne 'free') { throw "Unsupported preferCost value '$costVal'. Only 'free' is supported." }
             $config | Add-Member -NotePropertyName preferCost -NotePropertyValue $costVal -Force
+            $overrides.Add("preferCost=$costVal")
         }
         if ($null -ne $local.roles) {
             $unexpectedRoles = @($local.roles.psobject.Properties.Name | Where-Object { $_ -notin @('planning', 'orchestration', 'impl', 'qa', 'integration') })
@@ -160,6 +164,7 @@ function Read-ModelProfileConfig {
             foreach ($role in @('planning', 'orchestration', 'impl', 'qa', 'integration')) {
                 if ($null -ne $local.roles.$role) {
                     $config.roles | Add-Member -NotePropertyName $role -NotePropertyValue ([string]$local.roles.$role) -Force
+                    $overrides.Add("roles.$role=$([string]$local.roles.$role)")
                 }
             }
         }
@@ -167,8 +172,18 @@ function Read-ModelProfileConfig {
             foreach ($adapter in @($local.plannerRouting.psobject.Properties)) {
                 if ($null -eq $config.plannerRouting) { $config.plannerRouting = [pscustomobject]@{} }
                 $centralRoute = $config.plannerRouting.($adapter.Name)
-                if ($null -eq $centralRoute) { $config.plannerRouting | Add-Member -NotePropertyName $adapter.Name -NotePropertyValue $adapter.Value }
-                else { foreach ($prop in @($adapter.Value.psobject.Properties)) { $centralRoute | Add-Member -NotePropertyName $prop.Name -NotePropertyValue $prop.Value -Force } }
+                if ($null -eq $centralRoute) {
+                    $config.plannerRouting | Add-Member -NotePropertyName $adapter.Name -NotePropertyValue $adapter.Value
+                    foreach ($prop in @($adapter.Value.psobject.Properties)) {
+                        $overrides.Add("plannerRouting.$($adapter.Name).$($prop.Name)=$([string]$prop.Value)")
+                    }
+                }
+                else {
+                    foreach ($prop in @($adapter.Value.psobject.Properties)) {
+                        $centralRoute | Add-Member -NotePropertyName $prop.Name -NotePropertyValue $prop.Value -Force
+                        $overrides.Add("plannerRouting.$($adapter.Name).$($prop.Name)=$([string]$prop.Value)")
+                    }
+                }
             }
             foreach ($adapter in @($local.plannerRouting.psobject.Properties)) {
                 if ($null -ne $adapter.Value) {
@@ -181,6 +196,7 @@ function Read-ModelProfileConfig {
         Test-ProfileGraph -Config $config -Warnings $graphWarnings
         foreach ($w in $graphWarnings) { Write-Warning $w }
     }
+    if ($null -ne $LocalOverrides) { $LocalOverrides.Value = @($overrides) }
     return $config
 }
 

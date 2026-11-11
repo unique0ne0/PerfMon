@@ -358,7 +358,11 @@ function Write-ChainSummary {
         [object]$PipelineAfter,
         [object]$TreeBefore,
         [object]$TreeAfter,
-        [object]$QaVerdict
+        [object]$QaVerdict,
+        # CFG121: reason(선택) — 프리플라이트 verify 실패 등 단계 시작 전 중단 사유 문자열.
+        # localOverrides(추가 필드, 없으면 빈 배열) — model-profiles.local.json 오버레이 적용 내역.
+        [string]$Reason,
+        [string[]]$LocalOverrides
     )
     $summaryPath = Resolve-RepoPath "$LogDir/$TaskId-chain-summary.json"
     $parent = Split-Path -Parent $summaryPath
@@ -376,9 +380,11 @@ function Write-ChainSummary {
         pipelineStatus = @{ before = $PipelineBefore; after = $PipelineAfter }
         tree = @{ before = $TreeBefore; after = $TreeAfter; changedFileCount = if ($TreeAfter -and $TreeAfter.Dirty) { @(($TreeAfter.Dirty -split "`r?`n") | Where-Object { $_ }).Count } else { 0 }; fingerprintComparable = [bool]($TreeBefore -and $TreeAfter -and $TreeBefore.FingerprintOk -and $TreeAfter.FingerprintOk) }
         warnings = @($Warnings)
+        localOverrides = @($LocalOverrides)
         runtimeRoleBinding = $script:RuntimeRoleBinding
         logDirectory = $LogDir
     }
+    if (-not [string]::IsNullOrWhiteSpace($Reason)) { $value.reason = [string]$Reason }
     Write-AtomicJson -Path $summaryPath -Value $value -Depth 8
     return $summaryPath
 }
