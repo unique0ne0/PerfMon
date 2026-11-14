@@ -345,7 +345,6 @@ function Get-AdapterInvocationArgv {
         'antigravity' {
             if ([string]::IsNullOrWhiteSpace($ProjectId)) { throw 'Antigravity ProjectId is required.' }
             $argv = @('--project', $ProjectId, '--model', $Model)
-            if ($Model -eq 'gemini-3.8-flash') { $argv += @('--effort', 'medium') }
             $argv += @('--mode', 'accept-edits', '--dangerously-skip-permissions', '--output-format', 'stream-json', '--print-timeout', $PrintTimeout, '--print', '<PROMPT>')
             return @($argv)
         }

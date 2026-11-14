@@ -179,11 +179,12 @@ $script:CleanupStarted = $false
 # ── 단계별 설정 (모델·프롬프트는 CLAUDE.md verbatim) ─────────────────────────
 # model-profiles.json의 modelCatalog + routes가 체인의 정본이다.
 # 아래 ModelFallback은 JSON 로드 실패 시의 비상 기본값으로만 쓰인다.
-# 비상 4슬롯 체인: opencode-go/deepseek-v4.1-flash → mimo-v2.6-pro → mimo-v2.6-flash → big-pickle
+# 비상 6슬롯 체인: go 3단 → free 2단 → big-pickle 최종 폴백 (CFG123).
+# Routes.independent-planned/claude-planned와 같은 순서를 유지한다.
 $StageConfig = @{
     'impl' = @{
         Command = 'opencode run --pure --auto -m {MODEL} --variant medium'
-        ModelFallback = @('opencode-go/deepseek-v4.1-flash', 'opencode-go/mimo-v2.6-pro', 'opencode-go/mimo-v2.6-flash', 'opencode/big-pickle')
+        ModelFallback = @('opencode-go/deepseek-v4.1-flash', 'opencode-go/glm-5.3-flash', 'opencode-go/mimo-v2.6-flash', 'opencode/deepseek-v4.1-flash-free', 'opencode/glm-5.3-flash-free', 'opencode/big-pickle')
         DefaultPrompt = "작업 $TaskId — [②구현] handoff 확인하고 패킷의 Done When과 Amendments를 충실히 따라 다음 단계 구현을 진행해. 구현 완료 후 [③자체리뷰] 제로베이스에서 개발 의도·계획 반영 여부와 로직·코드 품질을 점검하고 필요시 수정해. 이어서 scripts/verify.ps1 게이트를 통과시키고 Pipeline Status ②③을 갱신해. Required Reading에 절·줄 범위가 지정된 항목은 그 범위를 먼저 읽고, 범위 밖은 필요할 때만 읽어"
         LogFile = "$TaskLogPrefix-impl.log"
         # codex 어댑터가 구현 슬롯에 배정될 때 `codex exec -o`가 쓸 보고서 경로다(다른 어댑터는 무시).
