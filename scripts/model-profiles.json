@@ -11,7 +11,7 @@
     "openai/gpt-6.1-terra":            { "family": "codex",    "principal": "codex",         "cost": "paid", "adapter": "codex",       "invokeModel": "gpt-6.1-terra" }
   },
   "roles": {
-    "planning": "claude-planning",
+    "planning": "codex-planning",
     "orchestration": "gemini-driver"
   },
   "profiles": {
