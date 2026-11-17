@@ -246,3 +246,15 @@ function Invoke-GitPathList {
     }
     return @($lines)
 }
+
+# BH-BL-130: Get-FileHash cmdlet은 숨김/백그라운드 기동 큐에서 모듈 자동 로드가 안 돼 인식되지
+# 않은 사례가 있다(WorldSaju 2026-11-17, treeHash 누락으로 QA 봉인 실패). cmdlet 의존을 없앤다.
+function Get-Sha256FileHex {
+    param([string]$LiteralPath)
+    $hashAlg = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::Open($LiteralPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try { return ([BitConverter]::ToString($hashAlg.ComputeHash($stream))).Replace('-', '') }
+        finally { $stream.Dispose() }
+    } finally { $hashAlg.Dispose() }
+}

@@ -563,7 +563,7 @@ function Get-TreeState {
             & $hashText "`nuntracked:$rel`n"
             $abs = Join-Path $RepoRoot $rel
             if (Test-Path -LiteralPath $abs -PathType Leaf) {
-                & $hashText (Get-FileHash -LiteralPath $abs -Algorithm SHA256).Hash
+                & $hashText (Get-Sha256FileHex -LiteralPath $abs)
             }
         }
         try {
@@ -618,7 +618,7 @@ function Get-ChangedFileSnapshot {
         }
         foreach ($file in ($files | Sort-Object -Unique)) {
             $path = Join-Path $repo $file
-            $snapshot.Files[$file -replace '\\', '/'] = if (Test-Path -LiteralPath $path -PathType Leaf) { (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash } else { $null }
+            $snapshot.Files[$file -replace '\\', '/'] = if (Test-Path -LiteralPath $path -PathType Leaf) { (Get-Sha256FileHex -LiteralPath $path) } else { $null }
         }
     } catch { }
     return $snapshot
