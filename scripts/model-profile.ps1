@@ -200,12 +200,198 @@ function Read-ModelProfileConfig {
     return $config
 }
 
+function Get-QuotaTelemetryPath {
+    # CFG124: 주간 쿼터 텔레메트리(계정 전역) 기본 경로. statusline.js가 원자적으로 기록한다.
+    # 주의: $home은 PowerShell 자동 변수($HOME)라 쓸 수 없다.
+    $userHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $env:HOME }
+    if ([string]::IsNullOrWhiteSpace($userHome)) { return $null }
+    return (Join-Path $userHome '.agents\harness\logs\claude-quota.json')
+}
+
+function ConvertTo-QuotaLocalTime {
+    # CFG124 R4: 판정 기준 시각 정규화. ISO 'Z'(UTC)는 로컬로 변환하고 Kind=Unspecified는
+    # 로컬 시각으로 간주한다(문자열이면 invariant + RoundtripKind로 파싱).
+    param([object]$Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [DateTime]) {
+        $dt = [DateTime]$Value
+    } else {
+        $text = [string]$Value
+        if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+        $parsed = [DateTime]::MinValue
+        if (-not [DateTime]::TryParse($text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) { return $null }
+        $dt = $parsed
+    }
+    if ($dt.Kind -eq [DateTimeKind]::Utc) { return $dt.ToLocalTime() }
+    if ($dt.Kind -eq [DateTimeKind]::Unspecified) { return [DateTime]::SpecifyKind($dt, [DateTimeKind]::Local) }
+    return $dt
+}
+
+function ConvertTo-QuotaPercent {
+    param([object]$Value)
+    if ($null -eq $Value) { return $null }
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $parsed = 0.0
+    if ([double]::TryParse($text, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) { return $parsed }
+    return $null
+}
+
+function Get-QuotaPlanningDecision {
+    # CFG124 P1/R4: 주간 쿼터 → 기획 담당 무상태 판정. 순수 함수다 — 시각을 인자로만 받는다
+    # (내부에서 Get-Date 호출 금지). 반환 프로퍼티: Profile / Source / Cap / WindowDay / Percent / Reason.
+    # Source='quota-policy'만 실제 전환 판정이고, 'config-fallback'은 호출부가 roles.planning을 쓰라는 뜻이다.
+    param([object]$Policy, [object]$SevenDayPercent, [object]$ObservedAt, [object]$Now)
+    $decision = [pscustomobject]@{
+        Profile   = $null
+        Source    = 'config-fallback'
+        Cap       = $null
+        WindowDay = $null
+        Percent   = $null
+        Reason    = $null
+    }
+    if ($null -eq $Policy -or $Policy.enabled -ne $true) { $decision.Reason = 'policy-disabled'; return $decision }
+
+    $nowLocal = ConvertTo-QuotaLocalTime -Value $Now
+    if ($null -eq $nowLocal) { $decision.Reason = 'invalid-now'; return $decision }
+
+    $boundaryHour = 17
+    $parsedBoundary = ConvertTo-QuotaPercent -Value $Policy.boundaryHour
+    if ($null -ne $parsedBoundary) { $boundaryHour = [int]$parsedBoundary }
+
+    # 창 판정(P1): 경계 시각 이후면 창 끝 = 다음날 경계, 이전이면 당일 경계.
+    # 상한은 "창이 끝나는 날"의 요일 값이다 — 17:00 정각은 다음 창에 속한다.
+    $windowEnd = if ($nowLocal.TimeOfDay -ge [TimeSpan]::FromHours($boundaryHour)) { $nowLocal.Date.AddDays(1).AddHours($boundaryHour) } else { $nowLocal.Date.AddHours($boundaryHour) }
+    $windowDay = $windowEnd.DayOfWeek.ToString()
+    $decision.WindowDay = $windowDay
+
+    $hardCap = 95
+    $parsedHardCap = ConvertTo-QuotaPercent -Value $Policy.hardCapPercent
+    if ($null -ne $parsedHardCap) { $hardCap = $parsedHardCap }
+
+    $cap = $null
+    if ($null -ne $Policy.dailyCapPercent) { $cap = ConvertTo-QuotaPercent -Value $Policy.dailyCapPercent.$windowDay }
+    if ($null -eq $cap) {
+        # 상한표에 없는 요일은 추측 전환하지 않는다(P4) — 판정 불가로 돌려준다.
+        $decision.Reason = 'missing-cap'
+        return $decision
+    }
+    $decision.Cap = $cap
+
+    # 주간 리셋 = Now 이전(포함)의 가장 최근 "일요일 경계 시각". 관측값이 그 이전이면 지난 주 값이다.
+    $daysSinceSunday = [int]$nowLocal.DayOfWeek
+    $lastReset = $nowLocal.Date.AddDays(-$daysSinceSunday).AddHours($boundaryHour)
+    if ($lastReset -gt $nowLocal) { $lastReset = $lastReset.AddDays(-7) }
+
+    $weeklyPercent = ConvertTo-QuotaPercent -Value $SevenDayPercent
+    if ($null -eq $weeklyPercent -or [double]::IsNaN($weeklyPercent) -or [double]::IsInfinity($weeklyPercent) -or $weeklyPercent -lt 0 -or $weeklyPercent -gt 100) { $decision.Reason = 'no-telemetry'; return $decision }
+
+    $observedLocal = ConvertTo-QuotaLocalTime -Value $ObservedAt
+    if ($null -eq $observedLocal) { $decision.Reason = 'no-telemetry'; return $decision }
+
+    if ($observedLocal -lt $lastReset) { $decision.Reason = 'stale-telemetry'; return $decision }
+    if ($observedLocal -gt $nowLocal.AddMinutes(5)) { $decision.Reason = 'future-telemetry'; return $decision }
+
+    $maxAgeMinutes = 360
+    $parsedMaxAge = ConvertTo-QuotaPercent -Value $Policy.telemetryMaxAgeMinutes
+    if ($null -ne $parsedMaxAge) { $maxAgeMinutes = $parsedMaxAge }
+    if (($nowLocal - $observedLocal).TotalMinutes -gt $maxAgeMinutes) { $decision.Reason = 'stale-telemetry'; return $decision }
+
+    $overCapProfile = if ($Policy.overCapProfile) { [string]$Policy.overCapProfile } else { 'codex-planning' }
+    $underCapProfile = if ($Policy.underCapProfile) { [string]$Policy.underCapProfile } else { 'claude-planning' }
+
+    $decision.Percent = $weeklyPercent
+    $decision.Source = 'quota-policy'
+    $decision.Reason = if ($weeklyPercent -ge $hardCap) { 'hard-cap' } elseif ($weeklyPercent -ge $cap) { 'over-cap' } else { 'under-cap' }
+    $decision.Profile = if ($weeklyPercent -ge $hardCap -or $weeklyPercent -ge $cap) { $overCapProfile } else { $underCapProfile }
+    return $decision
+}
+
+function Read-QuotaTelemetry {
+    # CFG124 P3/P4: statusline.js가 남긴 계정 전역 주간 쿼터 스냅샷. 없거나 깨졌으면 $null.
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    try { $telemetry = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
+    if ($null -eq $telemetry) { return $null }
+    return [pscustomobject]@{
+        SevenDayPercent = $telemetry.sevenDayUsedPercentage
+        ObservedAt      = $telemetry.observedAt
+    }
+}
+
+function Format-PlanningQuotaSource {
+    # CFG124 P6/R2: 기획 담당 판정 출처 1줄. 포맷은 계약이다 —
+    # quota-policy: [source: quota-policy weekly=<p>% cap=<c>% window=<Day>]
+    # config-fallback: [source: config-fallback reason=<Reason>]
+    param([object]$Resolution)
+    if ($null -eq $Resolution) { return '[source: config]' }
+    $culture = [Globalization.CultureInfo]::InvariantCulture
+    switch ([string]$Resolution.Source) {
+        'quota-policy' {
+            $decision = $Resolution.QuotaDecision
+            $percentText = if ($decision -and $null -ne $decision.Percent) { ([double]$decision.Percent).ToString('0.####', $culture) } else { 'unknown' }
+            $capText = if ($decision -and $null -ne $decision.Cap) { ([double]$decision.Cap).ToString('0.####', $culture) } else { 'unknown' }
+            $dayText = if ($decision -and $decision.WindowDay) { [string]$decision.WindowDay } else { 'unknown' }
+            return "[source: quota-policy weekly=${percentText}% cap=${capText}% window=${dayText}]"
+        }
+        'config-fallback' {
+            $reason = if ($Resolution.QuotaDecision -and $Resolution.QuotaDecision.Reason) { [string]$Resolution.QuotaDecision.Reason } else { 'unknown' }
+            return "[source: config-fallback reason=${reason}]"
+        }
+        'local-override' { return '[source: local-override]' }
+        'explicit' { return '[source: explicit]' }
+        default { return '[source: config]' }
+    }
+}
+
 function Resolve-RoleProfile {
-    param([ValidateSet('planning','orchestration','qa','integration')][string]$Role, [object]$Config, [string]$ExplicitProfile)
+    # CFG124 R1/R2: -Role planning 경로에서만 주간 쿼터 정책을 적용한다.
+    # 우선순위: ExplicitProfile > 로컬 오버레이 roles.planning > 쿼터 정책 > 정본 roles.planning.
+    # 패킷 Runtime Role Binding 우선은 호출부(디스패처) 몫이며 Source='packet'을 여기서 만들지 않는다.
+    param(
+        [ValidateSet('planning','orchestration','qa','integration')][string]$Role,
+        [object]$Config,
+        [string]$ExplicitProfile,
+        [string[]]$LocalOverrides,
+        [DateTime]$Now = (Get-Date),
+        [string]$QuotaTelemetryPath
+    )
     $name = if ($ExplicitProfile) { $ExplicitProfile } else { [string]$Config.roles.$Role }
+    $source = if ($ExplicitProfile) { 'explicit' } else { 'config' }
+    $quotaDecision = $null
+    if (-not $ExplicitProfile -and $Role -eq 'planning') {
+        $policy = $Config.planningQuotaPolicy
+        if ($null -ne $policy -and $policy.enabled -eq $true) {
+            $hasLocalOverride = @($LocalOverrides | Where-Object { $_ -like 'roles.planning=*' }).Count -gt 0
+            if ($hasLocalOverride) {
+                # 명시적 수동 지정은 정책보다 우선한다(P5).
+                $source = 'local-override'
+            } else {
+                if ([string]::IsNullOrWhiteSpace($QuotaTelemetryPath)) { $QuotaTelemetryPath = Get-QuotaTelemetryPath }
+                $telemetry = Read-QuotaTelemetry -Path $QuotaTelemetryPath
+                $percent = if ($telemetry) { $telemetry.SevenDayPercent } else { $null }
+                $observedAt = if ($telemetry) { $telemetry.ObservedAt } else { $null }
+                $quotaDecision = Get-QuotaPlanningDecision -Policy $policy -SevenDayPercent $percent -ObservedAt $observedAt -Now $Now
+                if ($quotaDecision.Source -eq 'quota-policy' -and $quotaDecision.Profile) {
+                    $source = 'quota-policy'
+                    $name = [string]$quotaDecision.Profile
+                } else {
+                    $source = 'config-fallback'
+                }
+            }
+        }
+    }
     $profile = $Config.profiles.$name
     if ($null -eq $profile) { throw "Unknown profile: $name" }
-    return [pscustomobject]@{ Name = $name; Adapter = [string]$profile.adapter; Family = [string]$profile.family; Model = [string]$profile.model; FallbackProfiles = @($profile.fallbackProfiles) }
+    return [pscustomobject]@{
+        Name             = $name
+        Adapter          = [string]$profile.adapter
+        Family           = [string]$profile.family
+        Model            = [string]$profile.model
+        FallbackProfiles = @($profile.fallbackProfiles)
+        Source           = $source
+        QuotaDecision    = $quotaDecision
+    }
 }
 
 function Resolve-ProfileChain {

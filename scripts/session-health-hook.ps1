@@ -601,10 +601,43 @@ if ($null -ne $lastContextTokens -and $lastContextTokens -gt 0) {
     }
 }
 
+# CFG124 (DW8): 주간 Claude 쿼터가 warnAtPercent 이상이면 세션 시작 시 1줄 경고.
+# 정책·텔레메트리가 없거나 stale/손상이면 아무 말도 하지 않는다(추측 경고 금지).
+try {
+    $quotaModulePath = Join-Path $PSScriptRoot 'model-profile.ps1'
+    $quotaConfigPath = Join-Path $PSScriptRoot 'model-profiles.json'
+    if ((Test-Path -LiteralPath $quotaModulePath) -and (Test-Path -LiteralPath $quotaConfigPath)) {
+        . $quotaModulePath
+        $quotaPolicyConfig = Read-JsonFile -Path $quotaConfigPath
+        $quotaPolicy = if ($quotaPolicyConfig) { $quotaPolicyConfig.planningQuotaPolicy } else { $null }
+        if ($null -ne $quotaPolicy -and $quotaPolicy.enabled -eq $true -and $null -ne $quotaPolicy.warnAtPercent) {
+            $warnAtPercent = [double]$quotaPolicy.warnAtPercent
+            $quotaTelemetry = Read-QuotaTelemetry -Path (Get-QuotaTelemetryPath)
+            if ($null -ne $quotaTelemetry) {
+                $quotaDecision = Get-QuotaPlanningDecision -Policy $quotaPolicy -SevenDayPercent $quotaTelemetry.SevenDayPercent -ObservedAt $quotaTelemetry.ObservedAt -Now $now
+                if ($quotaDecision.Source -eq 'quota-policy' -and $null -ne $quotaDecision.Percent -and [double]$quotaDecision.Percent -ge $warnAtPercent) {
+                    $quotaWarningKey = "${sessionKey}-weekly-quota"
+                    $quotaWarnDue = $true
+                    if ($issued.ContainsKey($quotaWarningKey)) {
+                        [datetime]$quotaLastIssued = [datetime]::MinValue
+                        if ([datetime]::TryParse([string]$issued[$quotaWarningKey], [ref]$quotaLastIssued)) {
+                            if (($now - $quotaLastIssued.ToUniversalTime()).TotalMinutes -lt 360) { $quotaWarnDue = $false }
+                        }
+                    }
+                    if ($quotaWarnDue) {
+                        $quotaPercentText = ([double]$quotaDecision.Percent).ToString('0.#', [Globalization.CultureInfo]::InvariantCulture)
+                        [void]$warnings.Add("Weekly Claude quota is at ${quotaPercentText}% (>=${warnAtPercent}%). 기획 담당은 다음 단계 경계부터 `planningQuotaPolicy` 판정(현재 창 상한 $($quotaDecision.Cap)%)에 따라 자동 전환됩니다. 진행 중인 단계는 기존 모델로 마무리하세요.")
+                        $issued[$quotaWarningKey] = $now.ToString('o')
+                    }
+                }
+            }
+        }
+    }
+} catch { }
+
 if ($firstTimestamp) {
     $hookSessions[$sessionKey] = $firstTimestamp.ToString('o')
 }
-
 $updatedHookSessions = [ordered]@{}
 foreach ($k in $hookSessions.Keys) { $updatedHookSessions[$k] = $hookSessions[$k] }
 $updatedIssued = [ordered]@{}

@@ -50,6 +50,16 @@
     "opencode": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "claude-integration" },
     "gemini": { "implementationRoute": "gemini-implementation", "qaProfile": "codex-qa", "integrationProfile": "gemini-integration" }
   },
+  "planningQuotaPolicy": {
+    "enabled": true,
+    "boundaryHour": 17,
+    "hardCapPercent": 95,
+    "dailyCapPercent": { "Monday": 16, "Tuesday": 32, "Wednesday": 46, "Thursday": 60, "Friday": 72, "Saturday": 84, "Sunday": 95 },
+    "underCapProfile": "claude-planning",
+    "overCapProfile": "codex-planning",
+    "telemetryMaxAgeMinutes": 360,
+    "warnAtPercent": 93
+  },
   "fallbackOn": ["provider_unavailable", "authentication", "quota"],
   "providerCooldown": { "quotaDefaultHours": 5, "repeatedQuotaHours": 24 },
   "rateLimit": { "opencode-free": { "maxCallsPerHour": 80 } }

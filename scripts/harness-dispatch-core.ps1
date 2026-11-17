@@ -2198,8 +2198,11 @@ function Resolve-DispatchPlan {
     if ($localOverrideList.Count -gt 0) {
         Write-Log "[profile] 로컬 오버레이 적용 $($localOverrideList.Count)개: $($localOverrideList -join ', ')" INFO
     }
-    $configuredPlanning = Resolve-RoleProfile -Role planning -Config $profileConfig
+    # CFG124: 설정 기반 기획 담당 해석의 단일 지점. 유효한 패킷 Runtime Role Binding이 있으면
+    # 아래에서 그 값이 우선한다(단계 경계 원칙 — 이미 작성된 패킷의 라우팅은 바뀌지 않는다).
+    $configuredPlanning = Resolve-RoleProfile -Role planning -Config $profileConfig -LocalOverrides $localOverrideList -Now (Get-Date)
     $planningProfile = $configuredPlanning.Name
+    Write-Log ("Planning profile: {0} {1}" -f $configuredPlanning.Name, (Format-PlanningQuotaSource -Resolution $configuredPlanning)) INFO
     $planningAdapter = $configuredPlanning.Adapter
     $runtimeRoleBinding = [pscustomobject]@{
         source = 'config'
@@ -2238,6 +2241,7 @@ function Resolve-DispatchPlan {
                 implementationRoute = $packetImplRoute
                 roleContentionAck = $packetRoleContentionAck
             }
+            Write-Log ("Planning profile: {0} [source: packet Runtime Role Binding]" -f $planningProfile) INFO
         } elseif ($runtimeBinding.Error) {
             throw $runtimeBinding.Error
         } else {
