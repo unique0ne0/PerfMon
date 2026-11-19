@@ -58,6 +58,8 @@
     "underCapProfile": "claude-planning",
     "overCapProfile": "codex-planning",
     "telemetryMaxAgeMinutes": 360,
+    "probeEnabled": true,
+    "probeMaxAgeMinutes": 10,
     "warnAtPercent": 93
   },
   "fallbackOn": ["provider_unavailable", "authentication", "quota"],

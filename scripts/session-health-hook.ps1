@@ -610,6 +610,11 @@ try {
         . $quotaModulePath
         $quotaPolicyConfig = Read-JsonFile -Path $quotaConfigPath
         $quotaPolicy = if ($quotaPolicyConfig) { $quotaPolicyConfig.planningQuotaPolicy } else { $null }
+        if ($null -ne $quotaPolicy -and $quotaPolicy.enabled -eq $true -and $quotaPolicy.probeEnabled -eq $true) {
+            # CFG125 R1(b): 경고 판정 직전에 스냅샷을 갱신한다. 훅 타임아웃(5초)에 맞춰 짧게 끊고,
+            # 실패는 무시한다 — 훅은 어떤 경우에도 exit 0·무출력 원칙을 유지한다.
+            $null = Update-ClaudeQuotaTelemetry -Path (Get-QuotaTelemetryPath) -Policy $quotaPolicy -Now $now -TimeoutSec 5
+        }
         if ($null -ne $quotaPolicy -and $quotaPolicy.enabled -eq $true -and $null -ne $quotaPolicy.warnAtPercent) {
             $warnAtPercent = [double]$quotaPolicy.warnAtPercent
             $quotaTelemetry = Read-QuotaTelemetry -Path (Get-QuotaTelemetryPath)

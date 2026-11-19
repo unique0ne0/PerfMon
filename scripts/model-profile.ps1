@@ -319,6 +319,200 @@ function Read-QuotaTelemetry {
     }
 }
 
+function Get-ClaudeQuotaHeaderValue {
+    # CFG125 P1/R2: IDictionary·WebHeaderCollection 공통 조회. 값이 배열이면 첫 원소를 쓴다.
+    # $Headers[$name]은 두 타입 모두 지원하고 대소문자도 구분하지 않는다(PS 해시테이블 기본).
+    param([object]$Headers, [string]$Name)
+    if ($null -eq $Headers -or [string]::IsNullOrWhiteSpace($Name)) { return $null }
+    $value = $null
+    try { $value = $Headers[$Name] } catch { $value = $null }
+    if ($value -is [array]) {
+        if ($value.Count -eq 0) { return $null }
+        $value = $value[0]
+    }
+    if ($null -eq $value) { return $null }
+    $text = [string]$value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    return $text.Trim()
+}
+
+function ConvertTo-ClaudeQuotaUtilizationPercent {
+    # CFG125 P1: unified-*-utilization은 0~1 비율이다. 범위 밖·파싱 실패는 $null.
+    param([object]$Value)
+    $ratio = ConvertTo-QuotaPercent -Value $Value
+    if ($null -eq $ratio -or [double]::IsNaN($ratio) -or [double]::IsInfinity($ratio)) { return $null }
+    if ($ratio -lt 0 -or $ratio -gt 1) { return $null }
+    return [math]::Round($ratio * 100, 4)
+}
+
+function ConvertFrom-ClaudeQuotaHeaders {
+    # CFG125 P1: Claude OAuth 요청 응답 헤더 → 주간/5시간 쿼터 퍼센트.
+    # 7d-utilization 헤더 자체가 없으면 $null이다(비200 응답 포함 — 있으면 기록한다).
+    # 반환 프로퍼티: SevenDayPercent / FiveHourPercent / SevenDayReset(epoch 초).
+    param([object]$Headers)
+    $sevenDayRaw = Get-ClaudeQuotaHeaderValue -Headers $Headers -Name 'anthropic-ratelimit-unified-7d-utilization'
+    if ($null -eq $sevenDayRaw) { return $null }
+    $fiveHourRaw = Get-ClaudeQuotaHeaderValue -Headers $Headers -Name 'anthropic-ratelimit-unified-5h-utilization'
+    $resetRaw = Get-ClaudeQuotaHeaderValue -Headers $Headers -Name 'anthropic-ratelimit-unified-7d-reset'
+    $sevenDayReset = $null
+    if ($null -ne $resetRaw) {
+        $epochSeconds = 0L
+        if ([long]::TryParse($resetRaw, [ref]$epochSeconds)) { $sevenDayReset = $epochSeconds }
+    }
+    return [pscustomobject]@{
+        SevenDayPercent = ConvertTo-ClaudeQuotaUtilizationPercent -Value $sevenDayRaw
+        FiveHourPercent = ConvertTo-ClaudeQuotaUtilizationPercent -Value $fiveHourRaw
+        SevenDayReset   = $sevenDayReset
+    }
+}
+
+function ConvertTo-ClaudeQuotaHeaderTable {
+    # CFG125 P2: 응답 헤더를 해시테이블로 복사한다 — HttpWebResponse를 Dispose한 뒤에도
+    # 값을 안전하게 읽기 위해서다(대소문자 무시 비교도 유지된다).
+    param([object]$Headers)
+    $table = @{}
+    if ($null -eq $Headers) { return $table }
+    if ($Headers -is [System.Net.WebHeaderCollection]) {
+        foreach ($key in @($Headers.AllKeys)) {
+            if ([string]::IsNullOrWhiteSpace($key)) { continue }
+            $table[$key] = $Headers[$key]
+        }
+        return $table
+    }
+    if ($Headers -is [System.Collections.IDictionary]) {
+        foreach ($key in @($Headers.Keys)) { $table[[string]$key] = $Headers[$key] }
+        return $table
+    }
+    foreach ($prop in @($Headers.PSObject.Properties)) { $table[$prop.Name] = $prop.Value }
+    return $table
+}
+
+function Get-ClaudeQuotaCredentialsPath {
+    # CFG125 P2: 자격 증명 기본 경로. $home은 PowerShell 자동 변수($HOME)라 쓸 수 없다.
+    $userHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $env:HOME }
+    if ([string]::IsNullOrWhiteSpace($userHome)) { return $null }
+    return (Join-Path $userHome '.claude\.credentials.json')
+}
+
+function Invoke-ClaudeQuotaProbeRequest {
+    # CFG125 P2/R2: 실제 OAuth 1토큰 요청. 보안 — 토큰·Authorization 헤더·요청 객체를
+    # 로그·예외 메시지에 절대 남기지 않는다. 상태 코드만 Verbose로 허용한다.
+    # 비200(429 등)도 응답 헤더에 7d가 있으면 기록 대상이므로 헤더를 돌려준다.
+    param([string]$Token, [int]$TimeoutSec = 10)
+    if ([string]::IsNullOrWhiteSpace($Token)) { return $null }
+    $body = '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"."}]}'
+    $requestHeaders = @{
+        'anthropic-version' = '2023-06-01'
+        'authorization'     = "Bearer $Token"
+    }
+    $response = $null
+    try {
+        # 보안(P5): -Verbose:$false로 전역 VerbosePreference가 켜져 있어도 요청 헤더(토큰)가
+        # Verbose 스트림에 찍히지 않게 한다.
+        $response = Invoke-WebRequest -UseBasicParsing -Verbose:$false -ErrorAction Stop -Method Post -Uri 'https://api.anthropic.com/v1/messages' -ContentType 'application/json' -Headers $requestHeaders -Body $body -TimeoutSec $TimeoutSec
+        $collected = ConvertTo-ClaudeQuotaHeaderTable -Headers $response.Headers
+        Write-Verbose "Claude quota probe status: $([int]$response.StatusCode)"
+        return $collected
+    } catch [System.Net.WebException] {
+        $webResponse = $_.Exception.Response
+        if ($null -eq $webResponse) { return $null }
+        try {
+            $collected = ConvertTo-ClaudeQuotaHeaderTable -Headers $webResponse.Headers
+            Write-Verbose "Claude quota probe status: $([int]$webResponse.StatusCode)"
+            return $collected
+        } finally {
+            $webResponse.Dispose()
+        }
+    } catch {
+        Write-Verbose 'Claude quota probe failed before a response was received.'
+        return $null
+    } finally {
+        if ($null -ne $response) {
+            try { $response.Dispose() } catch { }
+        }
+    }
+}
+
+function Update-ClaudeQuotaTelemetry {
+    # CFG125 P2/R3/R6: OAuth 1토큰 요청의 응답 헤더로 CFG124와 같은 형식의 스냅샷을 갱신한다.
+    # 반환값: 캐시 스킵/기록 성공 $true, 그 외(자격 증명 없음·만료·헤더 없음·쓰기 실패) $false.
+    # 모든 실패는 예외를 삼킨다 — 호출부의 기존 fallback 경로가 그대로 동작해야 한다.
+    # -Invoker는 param($Token,$TimeoutSec)을 받아 헤더 객체(또는 $null)를 돌려주는 스크립트블록이다.
+    param(
+        [string]$Path,
+        [object]$Policy,
+        [DateTime]$Now = (Get-Date),
+        [string]$CredentialsPath,
+        [scriptblock]$Invoker,
+        [int]$TimeoutSec = 10
+    )
+    try {
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+
+        $maxAgeMinutes = 10
+        if ($null -ne $Policy) {
+            $parsedMaxAge = ConvertTo-QuotaPercent -Value $Policy.probeMaxAgeMinutes
+            if ($null -ne $parsedMaxAge) { $maxAgeMinutes = $parsedMaxAge }
+        }
+
+        # (a) 캐시: 7d가 0~100이고 관측 시각이 미래(+5분)가 아니며 maxAge 이내면 네트워크 0회.
+        $existing = Read-QuotaTelemetry -Path $Path
+        if ($null -ne $existing) {
+            $existingPercent = ConvertTo-QuotaPercent -Value $existing.SevenDayPercent
+            $observedLocal = ConvertTo-QuotaLocalTime -Value $existing.ObservedAt
+            $nowLocal = ConvertTo-QuotaLocalTime -Value $Now
+            if ($null -ne $existingPercent -and $existingPercent -ge 0 -and $existingPercent -le 100 -and $null -ne $observedLocal -and $null -ne $nowLocal) {
+                if ($observedLocal -le $nowLocal.AddMinutes(5) -and ($nowLocal - $observedLocal).TotalMinutes -lt $maxAgeMinutes) { return $true }
+            }
+        }
+
+        # (b) 자격 증명: 없거나 만료면 중단한다(만료 판정은 UTC 기준).
+        if ([string]::IsNullOrWhiteSpace($CredentialsPath)) { $CredentialsPath = Get-ClaudeQuotaCredentialsPath }
+        if ([string]::IsNullOrWhiteSpace($CredentialsPath) -or -not (Test-Path -LiteralPath $CredentialsPath)) { return $false }
+        $credentials = $null
+        try { $credentials = Get-Content -LiteralPath $CredentialsPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { return $false }
+        if ($null -eq $credentials -or $null -eq $credentials.claudeAiOauth) { return $false }
+        $oauth = $credentials.claudeAiOauth
+        $token = [string]$oauth.accessToken
+        if ([string]::IsNullOrWhiteSpace($token)) { return $false }
+        $expiresAtMilliseconds = 0L
+        if ($null -ne $oauth.expiresAt -and [long]::TryParse([string]$oauth.expiresAt, [ref]$expiresAtMilliseconds) -and $expiresAtMilliseconds -gt 0) {
+            $expiresUtc = [DateTimeOffset]::FromUnixTimeMilliseconds($expiresAtMilliseconds).UtcDateTime
+            if ($expiresUtc -le $Now.ToUniversalTime()) { return $false }
+        }
+
+        # (c) 프로브 → 헤더 파싱. 7d 값이 없거나 파싱 불가면 기존 파일을 건드리지 않는다.
+        $headers = $null
+        if ($null -eq $Invoker) {
+            $headers = Invoke-ClaudeQuotaProbeRequest -Token $token -TimeoutSec $TimeoutSec
+        } else {
+            try { $headers = & $Invoker $token $TimeoutSec } catch { $headers = $null }
+        }
+        $parsed = ConvertFrom-ClaudeQuotaHeaders -Headers $headers
+        if ($null -eq $parsed -or $null -eq $parsed.SevenDayPercent) { return $false }
+
+        # (d) CFG124와 같은 형식 + UTF-8 무BOM + temp→Move 원자 쓰기.
+        $telemetry = [ordered]@{
+            sevenDayUsedPercentage = $parsed.SevenDayPercent
+            fiveHourUsedPercentage = $parsed.FiveHourPercent
+            observedAt             = $Now.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+        }
+        $parent = Split-Path -Parent $Path
+        if (-not [string]::IsNullOrWhiteSpace($parent)) { New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null }
+        $tempPath = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+        try {
+            [System.IO.File]::WriteAllText($tempPath, ($telemetry | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+            Move-Item -LiteralPath $tempPath -Destination $Path -Force -ErrorAction Stop
+        } catch {
+            if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue }
+            return $false
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Format-PlanningQuotaSource {
     # CFG124 P6/R2: 기획 담당 판정 출처 1줄. 포맷은 계약이다 —
     # quota-policy: [source: quota-policy weekly=<p>% cap=<c>% window=<Day>]
