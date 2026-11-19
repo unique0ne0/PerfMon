@@ -25,8 +25,8 @@
     "codex-driver": { "adapter": "codex", "family": "codex", "model": "gpt-6.1-terra", "fallbackProfiles": [] },
     "codex-qa": { "adapter": "codex", "family": "codex", "model": "gpt-6.1-sol", "fallbackProfiles": [] },
     "codex-qa-terra": { "adapter": "codex", "family": "codex", "model": "gpt-6.1-terra", "fallbackProfiles": [] },
-    "gemini-qa": { "adapter": "antigravity", "family": "gemini", "model": "gemini-4-hydrogen-high", "fallbackProfiles": ["gemini-qa-opencode"] },
-    "gemini-qa-opencode": { "adapter": "opencode", "family": "gemini", "model": "google/gemini-4-hydrogen", "fallbackProfiles": [] },
+    "gemini-qa": { "adapter": "antigravity", "family": "gemini", "model": "gemini-4-neon-high", "fallbackProfiles": ["gemini-qa-hydrogen"] },
+    "gemini-qa-hydrogen": { "adapter": "antigravity", "family": "gemini", "model": "gemini-4-hydrogen-high", "fallbackProfiles": [] },
     "claude-integration": { "adapter": "claude", "family": "claude", "model": "claude-sonnet-5-5", "fallbackProfiles": [] },
     "claude-integration-opus": { "adapter": "claude", "family": "claude", "model": "claude-opus-5-5", "fallbackProfiles": ["claude-integration"] },
     "codex-integration": { "adapter": "codex", "family": "codex", "model": "gpt-6.1-terra", "fallbackProfiles": [] },
@@ -44,10 +44,10 @@
     "codex-implementation":  ["openai/gpt-6.1-terra"]
   },
   "plannerRouting": {
-    "claude": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "claude-integration" },
+    "claude": { "implementationRoute": "independent-planned", "qaProfile": "gemini-qa", "integrationProfile": "claude-integration" },
     "codex": { "implementationRoute": "independent-planned", "qaProfile": "gemini-qa", "integrationProfile": "codex-integration" },
     "antigravity": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "gemini-integration" },
-    "opencode": { "implementationRoute": "independent-planned", "qaProfile": "codex-qa", "integrationProfile": "claude-integration" },
+    "opencode": { "implementationRoute": "independent-planned", "qaProfile": "gemini-qa", "integrationProfile": "claude-integration" },
     "gemini": { "implementationRoute": "gemini-implementation", "qaProfile": "codex-qa", "integrationProfile": "gemini-integration" }
   },
   "planningQuotaPolicy": {

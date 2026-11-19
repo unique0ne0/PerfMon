@@ -12,7 +12,12 @@
 #             정책: 토큰 사용량 때문에 gemini-3.8-flash 계열만 허용(argon·claude·gpt-oss는 제공되지만 제외).
 # 2026-11-14(CFG123): gemini-4-hydrogen 계열로 교체. effort는 접미사 ID로 지정하고 --effort를 덧붙이지 않는다.
 #             정책: gemini-4-hydrogen 계열만 허용(argon·3.8-flash·claude·gpt-oss는 제공되지만 제외).
+# 2026-11-19: gemini-4-neon 계열 추가(출시 확인, agy 실호출 OK). 정책: hydrogen·neon 계열만 허용.
 gemini-4-hydrogen-low
 gemini-4-hydrogen-medium
 gemini-4-hydrogen-high
 gemini-4-hydrogen-xhigh
+gemini-4-neon-low
+gemini-4-neon-medium
+gemini-4-neon-high
+gemini-4-neon-xhigh
